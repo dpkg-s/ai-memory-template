@@ -107,7 +107,8 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 
 ### 一键安装
 
-```ai助手帮忙
+```bash
+#ai助手帮忙
 请帮我部署 ai-memory-template 这个 MCP 项目。项目地址是 https://github.com/dpkg-s/ai-memory-template
 步骤：
 1、克隆或下载这个项目到我本地

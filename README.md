@@ -51,13 +51,13 @@
 ```
 Obsidian 图谱视图效果（文本示意）:
 
-         运维_h29k路由器DHCP绑定
+               运维a
                 ↑
-    ┌── 项目_ai-plant-care ──┐
+    ┌──—————— 项目a  ———————──┐
     │         ↑              │
     │    用户画像 ←──── 记忆索引
     │         ↓              │
-    └── 项目_waas-aigate逆向 ─┘
+    └──———————— 项目b ———————─┘
                 ↓
           近期工作动态
 ```
@@ -98,7 +98,97 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 多 AI 同时写入时，文件锁防止数据覆盖。15 秒超时自动接管过期锁。
 
 ---
+---
+## 快速开始
 
+### 环境要求
+
+- Python 3.10+
+- 安装 `mcp` 包：`pip install mcp`
+
+### 一键安装
+
+```bash
+# macOS / Linux
+curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.sh | bash
+
+# Windows PowerShell
+irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.ps1 | iex
+```
+
+安装脚本会：
+1. 安装 `mcp` Python 包
+2. 在 `~/ai-memory/` 创建记忆库目录
+3. 复制初始模板文件
+4. 打印各平台的 MCP 配置
+
+### 手动安装
+
+```bash
+git clone https://github.com/dpkg-s/ai-memory-template.git
+cd ai-memory-template
+pip install mcp
+bash install.sh    # Linux/macOS
+.\install.ps1     # Windows
+```
+
+### 配置 AI 工具
+
+将安装脚本输出的配置添加到对应 AI 工具的 MCP 配置中：
+
+**Codex CLI** — `~/.codex/config.toml`
+```toml
+[mcp_servers]
+[mcp_servers.ai-memory]
+command = "/usr/bin/python3"
+args = ["/home/you/ai-memory/server.py"]
+```
+
+**Claude Desktop** — `claude_desktop_config.json`
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "/usr/bin/python3",
+      "args": ["/home/you/ai-memory/server.py"]
+    }
+  }
+}
+```
+
+**WorkBuddy** — `~/.workbuddy/mcp.json`
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "stdio",
+      "command": "/usr/bin/python3",
+      "args": ["/home/you/ai-memory/server.py"]
+    }
+  }
+}
+```
+
+> 完整的配置模板见 [`setup/`](setup/) 目录。
+
+---
+
+## 自定义
+
+### 修改记忆库路径
+
+设置环境变量即可：
+
+```bash
+export AI_MEMORY_DIR=/path/to/your/memory
+python server.py
+```
+
+### 自定义自动标签规则
+
+编辑 `server.py` 中的 `_TAG_AUTO_MAP` 字典，约 30 条关键词 → 标签映射。按需增删。
+---
+---
 ## 技术栈
 
 | 层级 | 技术 | 说明 |
@@ -196,97 +286,6 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 |------|------|
 | `memory_audit()` | 全库扫描，按类型分组汇总，建议整理 |
 | `memory_index_draft()` | 自动生成记忆索引草稿 |
-
----
-
-## 快速开始
-
-### 环境要求
-
-- Python 3.10+
-- 安装 `mcp` 包：`pip install mcp`
-
-### 一键安装
-
-```bash
-# macOS / Linux
-curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.sh | bash
-
-# Windows PowerShell
-irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.ps1 | iex
-```
-
-安装脚本会：
-1. 安装 `mcp` Python 包
-2. 在 `~/ai-memory/` 创建记忆库目录
-3. 复制初始模板文件
-4. 打印各平台的 MCP 配置
-
-### 手动安装
-
-```bash
-git clone https://github.com/dpkg-s/ai-memory-template.git
-cd ai-memory-template
-pip install mcp
-bash install.sh    # Linux/macOS
-.\install.ps1     # Windows
-```
-
-### 配置 AI 工具
-
-将安装脚本输出的配置添加到对应 AI 工具的 MCP 配置中：
-
-**Codex CLI** — `~/.codex/config.toml`
-```toml
-[mcp_servers]
-[mcp_servers.ai-memory]
-command = "/usr/bin/python3"
-args = ["/home/you/ai-memory/server.py"]
-```
-
-**Claude Desktop** — `claude_desktop_config.json`
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "command": "/usr/bin/python3",
-      "args": ["/home/you/ai-memory/server.py"]
-    }
-  }
-}
-```
-
-**WorkBuddy** — `~/.workbuddy/mcp.json`
-```json
-{
-  "mcpServers": {
-    "ai-memory": {
-      "type": "stdio",
-      "command": "/usr/bin/python3",
-      "args": ["/home/you/ai-memory/server.py"]
-    }
-  }
-}
-```
-
-> 完整的配置模板见 [`setup/`](setup/) 目录。
-
----
-
-## 自定义
-
-### 修改记忆库路径
-
-设置环境变量即可：
-
-```bash
-export AI_MEMORY_DIR=/path/to/your/memory
-python server.py
-```
-
-### 自定义自动标签规则
-
-编辑 `server.py` 中的 `_TAG_AUTO_MAP` 字典，约 30 条关键词 → 标签映射。按需增删。
 
 ---
 

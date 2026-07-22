@@ -31,16 +31,16 @@ Codex ──────┘                              │
 
 ```bash
 # macOS / Linux
-curl -sSL https://raw.githubusercontent.com/your-name/ai-memory-template/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.sh | bash
 
 # Windows PowerShell
-irm https://raw.githubusercontent.com/your-name/ai-memory-template/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.ps1 | iex
 ```
 
 ### 手动安装
 
 ```bash
-git clone https://github.com/your-name/ai-memory-template.git
+git clone https://github.com/dpkg-s/ai-memory-template.git
 cd ai-memory-template
 pip install mcp
 bash install.sh    # Linux/macOS
@@ -103,3 +103,4 @@ ai-memory-template/
 ## License
 
 MIT
+

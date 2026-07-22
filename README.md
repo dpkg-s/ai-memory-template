@@ -1,6 +1,6 @@
-﻿# ai-memory-template
+﻿# 多平台AI融合记忆库
 
-> 跨 AI 工具共享长期记忆 — 让你的 WorkBuddy、Claude Code、Codex CLI 共用同一个大脑
+> 跨 AI 工具共享长期记忆 — 让你的ai工具共用同一个大脑
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)

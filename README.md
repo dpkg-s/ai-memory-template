@@ -305,6 +305,64 @@ python server.py
 
 ---
 
+
+## Git 版本控制 + 多设备同步（推荐）
+
+> 给记忆库加上 git 版本控制，每次写入自动 commit + push，多台电脑无缝同步。
+
+### 给 AI 助手的规范
+
+> ⚠️ 以下规则应写入你的记忆库规则中，让所有 AI 自动遵守。
+
+**每次 `memory_write` 完成后，必须自动执行：**
+
+```bash
+cd ~/ai-memory
+git add -A
+git commit -m "{source}: {动作} - {简要说明}"
+git push
+```
+
+| 约定 | 说明 |
+|------|------|
+| commit 格式 | `{source}: {动作} - {简要说明}`，例如 `codex: 更新项目状态 - 完成TS合并工具v4` |
+| source 标识 | 每个 AI 用自己的标识：`codex`、`claude`、`workbuddy` |
+| push | commit 后立即 push，确保远程始终最新 |
+
+**每次对话开始时，先拉取最新：**
+
+```bash
+cd ~/ai-memory && git pull
+```
+
+### 手动设置（首次）
+
+```bash
+# 1. 初始化本地 git
+cd ~/ai-memory
+git init
+git add -A
+git commit -m "chore: 初始化记忆库"
+
+# 2. 在 GitHub 创建私有仓库（不要勾选 README）
+
+# 3. 关联远程并推送
+git remote add origin https://github.com/你的用户名/ai-memory.git
+git branch -M master
+git push -u origin master
+```
+
+### 多台电脑使用
+
+在其他电脑上：
+
+```bash
+git clone https://github.com/你的用户名/ai-memory.git ~/ai-memory
+```
+
+clone 完成即可使用，所有 AI 的记忆自动同步。
+
+---
 ## 项目结构
 
 ```

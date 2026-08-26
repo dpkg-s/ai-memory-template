@@ -192,10 +192,17 @@ args = ["/home/you/ai-memory/server.py"]
 
 ### 修改记忆库路径
 
-设置环境变量即可：
+默认记忆库目录为 `~/ai-memory`（`install.sh` / `install.ps1` 自动创建）。如需自定义，设置环境变量即可：
 
 ```bash
 export AI_MEMORY_DIR=/path/to/your/memory
+python server.py
+```
+
+Windows PowerShell 下：
+
+```powershell
+$env:AI_MEMORY_DIR = "D:\my-memory"
 python server.py
 ```
 
@@ -211,7 +218,7 @@ python server.py
 |------|------|------|
 | 协议 | **MCP (Model Context Protocol)** | 开放标准，stdio 传输，JSON-RPC 2.0 |
 | 框架 | **FastMCP (Python SDK)** | MCP 服务器框架，自动处理协议层 |
-| 存储 | **Markdown + JSON Frontmatter** | 每个记忆一个 .md 文件，元数据存 frontmatter |
+| 存储 | **Markdown + YAML Frontmatter** | 每个记忆一个 .md 文件，元数据存 frontmatter（Obsidian 原生识别，兼容旧 JSON） |
 | 缓存 | **Python dict（内存）** | 条目缓存 + 访问计数缓存，写入时失效 |
 | 锁 | **文件锁（PID + 时间戳）** | 跨进程互斥，15 秒超时 |
 | 搜索 | **关键词匹配 + 多字段打分** | 标题/标签/摘要/正文加权排序 |
@@ -265,16 +272,18 @@ python server.py
 
 ---
 
-## 16 个工具完整说明
+## 20 个工具完整说明
 
 ### 读写操作
 
 | 工具 | 签名 | 功能 |
 |------|------|------|
-| `memory_write` | `(title, content, tags?, source?, summary?, tier?)` | 写入或更新记忆。自动标签 + 自动链接 + 自动归档 |
-| `memory_read` | `(title)` | 按标题读取。访问计数缓存在内存，攒够 10 次批量写回 |
-| `memory_search` | `(keyword, tag?)` | 关键词搜索，可指定标签过滤 |
-| `memory_delete` | `(title)` | 删除记忆（硬删除） |
+| `memory_write` | `(title, content, tags?, source?, summary?, tier?, expected_version?)` | 写入或更新记忆。自动标签 + 自动链接 + 自动归档；拒绝空内容；同标题自动 upsert 覆盖；支持乐观锁 |
+| `memory_read` | `(title)` | 按标题精确读取（含文件名回退，命中 `.archive`）。访问计数缓存在内存，攒够 10 次批量写回 |
+| `memory_search` | `(keyword, tag?, limit?)` | 关键词搜索（标题/标签/正文），命中处 `**` 高亮，可指定标签过滤 |
+| `memory_delete` | `(title, trash=True, purge=False)` | 删除记忆（默认软删到 `.trash` 可恢复；`purge=True` 永久删） |
+| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?)` | 仅更新 frontmatter 元数据，不重写正文 |
+| `memory_recent` | `(days=7, limit?)` | 列出近 N 天更新的记忆（最新优先） |
 
 ### 高级查询
 
@@ -292,16 +301,18 @@ python server.py
 |------|------|
 | `memory_archive(title)` | 归档：正文移入 `.archive/`，原位置留摘要 stub |
 | `memory_archive_old(days=90)` | 批量归档 N 天未更新的条目（跳过核心页） |
+| `memory_restore(title)` | 从 `.archive/` 恢复归档笔记回根目录，tier 回 warm |
 | `memory_batch_tag(old_tag, new_tag)` | 全库标签重命名 |
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
-| `memory_heat_suggest()` | 扫描全库，给出 tier 升降建议 |
+| `memory_heat_suggest()` | 扫描全库，按访问频次与陈旧度给出 tier 升降建议 |
+| `memory_rebuild_links()` | 重扫所有笔记正文，刷新 frontmatter 的 `links` 字段（修复历史笔记脱节） |
 
 ### 审计工具
 
 | 工具 | 功能 |
 |------|------|
-| `memory_audit()` | 全库扫描，按类型分组汇总，建议整理 |
-| `memory_index_draft()` | 自动生成记忆索引草稿 |
+| `memory_audit()` | 全库扫描：空壳检测 / 死链检测（跳过代码块）/ 命名漂移 / 缺 source·tags 汇总，建议整理 |
+| `memory_index_draft()` | 自动生成记忆索引草稿（不回写，需人工确认） |
 
 ---
 

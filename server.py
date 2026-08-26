@@ -1,13 +1,18 @@
-﻿"""
-Local shared memory MCP server.
+"""
+Local shared memory MCP server (ai-memory).
 
 Storage:
-- Markdown files under D:/ai记忆
+- Markdown files under a configurable vault directory (default: D:/ai记忆,
+  override with the AI_MEMORY_DIR environment variable)
 - One file per memory entry
-- Frontmatter may be JSON or YAML for backward compatibility
+- Frontmatter written as YAML (Obsidian-native), legacy JSON still readable
 
-The server now normalizes reads so legacy files with a UTF-8 BOM or YAML
-frontmatter remain readable while new writes always use JSON frontmatter.
+Features:
+- 20 MCP tools: read/write/search/list/recent/graph/orphans/stats, batch tag &
+  tier, heat-based tier suggestions, archive/restore, audit, rebuild_links,
+  auto-generated MOC index (记忆索引.md)
+- YAML frontmatter, Obsidian wikilinks, automatic link extraction,
+  title-based dedup upsert, file locking, cross-process cache invalidation
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import os
 import time
 import logging
 import sys
+import threading
+import functools
 
 logger = logging.getLogger("ai-memory")
 _log_handler = logging.StreamHandler(sys.stderr)
@@ -34,18 +41,47 @@ HEAT_DECAY_LAMBDA = 0.2
 
 from mcp.server.fastmcp import FastMCP
 
-MEMORY_DIR = Path(os.environ.get("AI_MEMORY_DIR", "./memory")).resolve()
+# Vault location. Defaults to ~/ai-memory (as created by install.sh /
+# install.ps1). Override with the AI_MEMORY_DIR env var to point at your own
+# vault, e.g.  AI_MEMORY_DIR=D:/ai记忆 python server.py
+MEMORY_DIR = Path(os.environ.get("AI_MEMORY_DIR", "~/ai-memory")).expanduser().resolve()
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 MEMORY_LOCK = MEMORY_DIR / ".memory.lock"
 LOCK_TIMEOUT = 15
 
 
-mcp = FastMCP("ai-memory", instructions="Shared Markdown memory vault for cross-AI tools")
+mcp = FastMCP("ai-memory", instructions="本地共享 Markdown 记忆库，支持多个 AI 工具读写")
 
 def _safe_filename(title: str) -> str:
     safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("._")
     safe = safe[:80] or "memory"
     return f"{safe}.md"
+
+def _resolve_unique_path(directory: Path, title: str) -> Path:
+    """Pick a filename for a new entry, avoiding collisions with files that
+    belong to a different title (P0-4).
+
+    ``_safe_filename`` truncates at 80 chars, so two distinct titles can map to
+    the same filename and silently overwrite each other. If the target already
+    exists on disk AND its frontmatter title differs from ours, append _2/_3/...
+    until free. If it exists and the title matches (e.g. a stale stub), reuse it.
+    """
+    base = _safe_filename(title)
+    candidate = directory / base
+    if not candidate.exists():
+        return candidate
+    try:
+        meta, _ = _load_memory(candidate)
+        if _entry_title(meta, candidate) == title or candidate.stem == title:
+            return candidate
+    except Exception:
+        pass
+    n = 2
+    while True:
+        alt = directory / f"{candidate.stem}_{n}{candidate.suffix}"
+        if not alt.exists():
+            return alt
+        n += 1
 
 def _extract_wiki_links(body: str) -> list[str]:
     """Extract [[wiki link]] page names from body text, deduplicated."""
@@ -59,15 +95,51 @@ def _extract_wiki_links(body: str) -> list[str]:
             result.append(normalized)
     return result
 
+def _parse_dt_utc(value: Any) -> datetime | None:
+    """Parse an ISO datetime string, treating naive (tzinfo-less) values as UTC.
+
+    Legacy files may store ``updated``/``created`` without a timezone; comparing
+    those against ``datetime.now(timezone.utc)`` raises TypeError and is silently
+    swallowed by callers, making the entry appear stale or invisible. This helper
+    normalizes naive timestamps to UTC so all downstream comparisons work.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def _days_since_utc(value: Any) -> int:
+    """Whole days between an ISO timestamp and now (UTC); 999 if unparseable."""
+    dt = _parse_dt_utc(value)
+    if dt is None:
+        return 999
+    return (datetime.now(timezone.utc) - dt).days
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text atomically: temp file in the same dir, then os.replace.
+
+    Plain ``write_text`` truncates the target first; a crash or a concurrent
+    reader can observe an empty or half-written file. Writing to a sibling
+    temp file and atomically replacing avoids partial reads (fixes P0-1).
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
 def _heat_score(reads: int, updated_str: str) -> float:
     """Heat score with time decay. Higher = more actively used."""
     if not updated_str:
         return float(reads)
-    try:
-        updated_dt = datetime.fromisoformat(str(updated_str))
-        days_since = (datetime.now(timezone.utc) - updated_dt).days
-    except (ValueError, TypeError):
-        days_since = 999
+    days_since = _days_since_utc(updated_str)
     return reads / (1 + HEAT_DECAY_LAMBDA * max(days_since, 0))
 
 def _strip_bom(text: str) -> str:
@@ -233,6 +305,7 @@ _ACCESS_CACHE: dict[str, int] = {}  # title -> pending access_count increments
 _ACCESS_FLUSH_THRESHOLD = 10
 _ENTRY_CACHE: dict[str, tuple] = {}  # title -> (path, meta, body)
 _CACHE_VALID = False
+_DIR_MTIME = 0.0  # last seen MEMORY_DIR mtime, for cross-process cache invalidation
 _TAG_AUTO_MAP: dict[str, str] = {
     "python": "python", "py": "python", "flask": "python", "django": "python", "fastapi": "python",
     "javascript": "javascript", "js": "javascript", "typescript": "typescript", "ts": "typescript",
@@ -275,13 +348,24 @@ def _maybe_auto_archive(title: str, path: Path) -> None:
     except Exception as e:
         logger.warning("_maybe_auto_archive(%s): %s", title, e)
 
+_lock_state = threading.local()  # re-entrancy depth per thread
+
 def _acquire_lock() -> bool:
-    """Cross-process file lock with staleness check."""
+    """Cross-process file lock with staleness check.
+
+    Re-entrant within the same thread: nested acquisitions (e.g. memory_write
+    -> _maybe_auto_archive -> memory_archive) only bump a depth counter instead
+    of re-creating the lock file, which would deadlock the current design.
+    """
+    if getattr(_lock_state, "depth", 0) > 0:
+        _lock_state.depth += 1
+        return True
     start = time.time()
     while True:
         try:
             with open(MEMORY_LOCK, "x", encoding="utf-8") as f:
                 json.dump({"pid": os.getpid(), "time": time.time()}, f)
+            _lock_state.depth = 1
             return True
         except FileExistsError:
             try:
@@ -299,6 +383,11 @@ def _acquire_lock() -> bool:
     return False
 
 def _release_lock() -> None:
+    depth = getattr(_lock_state, "depth", 0)
+    if depth > 1:
+        _lock_state.depth = depth - 1
+        return
+    _lock_state.depth = 0
     try:
         MEMORY_LOCK.unlink(missing_ok=True)
     except OSError:
@@ -330,8 +419,8 @@ def _flush_access_counts() -> int:
                     old_count = 0
                 meta["access_count"] = old_count + _ACCESS_CACHE.pop(title)
                 meta["updated"] = datetime.now(timezone.utc).isoformat()
-                new_fm = json.dumps(meta, ensure_ascii=False, indent=2)
-                f.write_text(f"---\n{new_fm}\n---\n\n{body}", encoding="utf-8")
+                new_fm = _dump_yaml_frontmatter(meta)
+                _atomic_write_text(f, f"---\n{new_fm}\n---\n\n{body}")
                 flushed += 1
         except Exception as e:
             logger.debug("_flush_access_counts: skipped %s: %s", f.name, e)
@@ -353,16 +442,28 @@ def _auto_link_titles(content: str, links: list[str]) -> list[str]:
     global _KNOWN_TITLES
     if not _KNOWN_TITLES:
         _rebuild_title_index()
-    """Detect known page titles in body and add as wiki links."""
+    """Detect known page titles in body and add as wiki links.
+
+    Skip titles shorter than 3 chars (e.g. "AI", "X") to avoid polluting
+    `links` with accidental substring matches in the body.
+    """
     result = set(links)
     content_lower = content.lower()
     for t in _KNOWN_TITLES:
+        if len(t.strip()) < 3:
+            continue
         if t.lower() in content_lower and t not in result:
             result.add(t)
     return sorted(result)
 
 def _locked_write(fn):
-    """Decorator to wrap write operations with lock."""
+    """Decorator to wrap write operations with lock.
+
+    Uses functools.wraps so FastMCP registers the tool under the original
+    function name (not "wrapper"); otherwise @mcp.tool() would register every
+    locked tool as a single "wrapper" tool that overwrites the previous one.
+    """
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         locked = _acquire_lock()
         try:
@@ -459,9 +560,16 @@ def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
     global _KNOWN_TITLES
     if not _KNOWN_TITLES:
         _rebuild_title_index()
-    global _CACHE_VALID, _ENTRY_CACHE
-    if _CACHE_VALID and _ENTRY_CACHE:
+    global _CACHE_VALID, _ENTRY_CACHE, _DIR_MTIME
+    # Cross-process invalidation: if another process (Obsidian edit, other MCP
+    # client, git operation) changed the directory since we cached, rebuild.
+    try:
+        dir_mtime = MEMORY_DIR.stat().st_mtime
+    except OSError:
+        dir_mtime = 0.0
+    if _CACHE_VALID and _ENTRY_CACHE and dir_mtime == _DIR_MTIME:
         return list(_ENTRY_CACHE.values())
+    _DIR_MTIME = dir_mtime
     _ENTRY_CACHE.clear()
     entries: list[tuple[Path, dict[str, Any], str]] = []
     for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
@@ -476,9 +584,48 @@ def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
     _CACHE_VALID = True
     return entries
 
+def _yaml_quote_scalar(value: Any) -> str:
+    """Quote a scalar for YAML safety (handles colons, #, brackets, quotes, leading/trailing space)."""
+    s = str(value)
+    needs_quote = (
+        s == ""
+        or s.strip() != s
+        or re.search(r'[:#\[\]\{\},&*?|<>=!%@`"\']', s) is not None
+    )
+    if needs_quote:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return '"' + escaped + '"'
+    return s
+
+
+def _dump_yaml_frontmatter(meta: dict[str, Any]) -> str:
+    """Serialize frontmatter as YAML (Obsidian-native) instead of JSON.
+
+    Improves on the old JSON frontmatter so Obsidian property/tag/dataview
+    panels recognize the metadata (improvement #1).
+    """
+    lines: list[str] = []
+    for key, value in meta.items():
+        if isinstance(value, bool):
+            lines.append(f"{key}: {'true' if value else 'false'}")
+        elif isinstance(value, (int, float)):
+            lines.append(f"{key}: {value}")
+        elif value is None:
+            lines.append(f"{key}: null")
+        elif isinstance(value, list):
+            if not value:
+                lines.append(f"{key}: []")
+            else:
+                items = [_yaml_quote_scalar(v) for v in value]
+                lines.append(f"{key}: [{', '.join(items)}]")
+        else:
+            lines.append(f"{key}: {_yaml_quote_scalar(value)}")
+    return "\n".join(lines)
+
+
 def _build_frontmatter(title: str, tags: list[str], source: str | None, created: str | None = None,
                        summary: str | None = None, tier: str | None = None, access_count: int = 0,
-                       links: list[str] | None = None) -> str:
+                       links: list[str] | None = None, version: int | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     meta: dict[str, Any] = {
         "title": title,
@@ -494,25 +641,89 @@ def _build_frontmatter(title: str, tags: list[str], source: str | None, created:
         meta["summary"] = summary
     if links:
         meta["links"] = links
-    return json.dumps(meta, ensure_ascii=False, indent=2)
+    if version is not None:
+        meta["version"] = version
+    return _dump_yaml_frontmatter(meta)
 
 def _write_memory(path: Path, title: str, tags: list[str], source: str | None, content: str,
                   created: str | None = None, summary: str | None = None,
                   tier: str | None = None, access_count: int = 0,
-                  links: list[str] | None = None) -> None:
+                  links: list[str] | None = None, version: int | None = None) -> None:
     # Merge cached access_count increments into the written count
     cached = _ACCESS_CACHE.pop(title, 0)
     if cached:
         access_count += cached
+    # 若未显式传入 version，尝试保留已有 version（避免批量/刷新操作清掉，改进#10）
+    if version is None:
+        try:
+            em, _ = _load_memory(path)
+            version = em.get("version")
+        except Exception:
+            version = None
     frontmatter = _build_frontmatter(title, tags, source, created=created, summary=summary,
-                                     tier=tier, access_count=access_count, links=links)
-    path.write_text(f"---\n{frontmatter}\n---\n\n{content}", encoding="utf-8")
+                                     tier=tier, access_count=access_count, links=links, version=version)
+    _atomic_write_text(path, f"---\n{frontmatter}\n---\n\n{content}")
+
+def _clean_link_name(link: str) -> str:
+    """Normalize a wiki link name: strip whitespace and stray backslashes (improvement #2)."""
+    return link.strip().replace("\\", "")
+
+
+def _refresh_index() -> None:
+    """Rebuild 记忆索引.md body from current entries (direct write, no recursion).
+
+    Called after every successful memory_write so the index stays in sync
+    without manual maintenance (improvement #7).
+    """
+    try:
+        entries = _iter_entries()
+        order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复",
+                 "时间线", "模板", "AI相关", "其他"]
+        groups: dict[str, list[str]] = {b: [] for b in order}
+        for path, meta, _body in entries:
+            title = _entry_title(meta, path)
+            bucket, _reason = _entry_bucket(meta, path)
+            groups.setdefault(bucket, []).append(title)
+        lines = ["# 记忆索引（自动维护）", "",
+                 "> 本索引由 ai-memory MCP 在每次写入后自动更新。如确需手工调整，请改各笔记自身而非此处。", ""]
+        for bucket in order:
+            items = groups.get(bucket, [])
+            if not items:
+                continue
+            lines.append(f"## {bucket}")
+            for title in sorted(set(items), key=lambda x: x.lower()):
+                lines.append(f"- [[{title}]]")
+            lines.append("")
+        body = "\n".join(lines).rstrip()
+        idx_path = MEMORY_DIR / "记忆索引.md"
+        if idx_path.exists():
+            meta, _ = _load_memory(idx_path)
+        else:
+            meta = {"title": "记忆索引", "tags": ["index", "moc", "navigation"],
+                    "tier": "warm", "source": "ai-memory-server"}
+        meta["updated"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write_text(idx_path, f"---\n{_dump_yaml_frontmatter(meta)}\n---\n\n{body}")
+    except Exception as e:
+        logger.warning("_refresh_index failed: %s", e)
+
 
 @mcp.tool()
 def memory_write(title: str, content: str, tags: list[str] | None = None, source: str | None = None,
-                 summary: str | None = None, tier: str | None = None) -> str:
-    """Write a memory entry, updating an existing one with the same title if found."""
+                 summary: str | None = None, tier: str | None = None,
+                 expected_version: int | None = None) -> str:
+    """Write a memory entry, updating an existing one with the same title if found.
+
+    expected_version (optional): optimistic concurrency check. If provided and the
+    entry's current on-disk version does not match, the write is rejected to prevent
+    one client silently overwriting another's concurrent edit. Omit for normal upsert.
+    """
     tags = tags or []
+
+    # 第三轮 P0-6：拒绝空壳与空标题
+    if not title or not title.strip():
+        return "错误：标题为空，已拒绝写入。"
+    if not content or not content.strip():
+        return "错误：内容为空，已拒绝创建空壳记忆（改进#5）。如为更新且需保留正文，请勿传空 content。"
 
     # auto-generate summary from first 100 chars of content if not provided
     if not summary:
@@ -520,22 +731,47 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         summary = clean[:100] + ("..." if len(clean) > 100 else "")
 
     links = _extract_wiki_links(content)
+    links = [_clean_link_name(l) for l in links]  # 改进#2
     tags = _auto_suggest_tags(content, tags)
     links = _auto_link_titles(content, links)
 
     existing_path: Path | None = None
     existing_meta: dict[str, Any] = {}
+    existing_body: str = ""
 
-    for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
-        meta, _ = _load_memory(f)
-        if _entry_title(meta, f) == title:
+    # 写入只匹配根目录条目；.archive 是只读归档（不参与写入匹配）。
+    # 若根目录无此标题而归档中有，视为"归档后重建"——在根目录新建条目，
+    # 归档保持原样。要修改归档内容请先 memory_restore。
+    for f in list(MEMORY_DIR.glob("*.md")):
+        meta, body = _load_memory(f)
+        if _entry_title(meta, f) == title or f.stem == title:
             existing_path = f
             existing_meta = meta
+            existing_body = body
             break
 
     _invalidate_cache()
     locked = _acquire_lock()
     try:
+        # 第三轮 P0-2：乐观锁必须在锁内校验，且基于锁内重新读取的磁盘状态，
+        # 避免"检查与写入非原子"的 TOCTOU 竞态（上一轮修复不彻底）。
+        if existing_path is not None:
+            fresh_meta, fresh_body = _load_memory(existing_path)
+            existing_meta, existing_body = fresh_meta, fresh_body
+            if expected_version is not None:
+                current_version = existing_meta.get("version", 0)
+                if isinstance(current_version, int) and current_version != expected_version:
+                    return (f"错误：版本冲突（期望 version={expected_version}，"
+                            f"实际 version={current_version}）。记忆可能已被其他端修改，"
+                            f"请重新读取后再写入。")
+        elif expected_version is not None:
+            return f"错误：版本冲突（记忆 '{title}' 不存在，期望 version={expected_version}）。"
+
+        # 改进#6：source 默认值；改进#10：version 递增（基于锁内最新值）
+        effective_source = source or (existing_meta.get("source") if existing_path else None) or "unknown"
+        old_version = existing_meta.get("version", 0)
+        new_version = (old_version + 1) if isinstance(old_version, int) else 1
+
         if existing_path:
             old_count = existing_meta.get("access_count", 0)
             old_tier = tier or existing_meta.get("tier", "warm")
@@ -543,24 +779,29 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                 existing_path,
                 title=title,
                 tags=tags,
-                source=source or existing_meta.get("source"),
+                source=effective_source,
                 content=content,
                 created=str(existing_meta.get("created")) if existing_meta.get("created") else None,
                 links=links,
-            summary=summary,
-            tier=old_tier,
-            access_count=old_count if isinstance(old_count, int) else 0,
-        )
+                summary=summary,
+                tier=old_tier,
+                access_count=old_count if isinstance(old_count, int) else 0,
+                version=new_version,
+            )
             # Auto-archive: if tier is cold or very-low-heat, move to archive
             _maybe_auto_archive(title, existing_path)
             logger.info("UPDATE  title=%s tags=%s source=%s", title, tags, source)
-            return f"已更新记忆: {title} ({existing_path.name})"
-
-        filepath = MEMORY_DIR / _safe_filename(title)
-        _write_memory(filepath, title=title, tags=tags, source=source, content=content,
-                      summary=summary, tier=tier or "warm", links=links)
-        logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
-        return f"已创建记忆: {title} ({filepath.name})"
+            result_msg = f"已更新记忆: {title} ({existing_path.name})"
+        else:
+            filepath = _resolve_unique_path(MEMORY_DIR, title)
+            _write_memory(filepath, title=title, tags=tags, source=effective_source, content=content,
+                          summary=summary, tier=tier or "warm", links=links, version=new_version)
+            logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
+            result_msg = f"已创建记忆: {title} ({filepath.name})"
+        # 改进#7：写入后自动维护索引（跳过索引自身，直接写文件防递归）
+        if title != "记忆索引":
+            _refresh_index()
+        return result_msg
     finally:
         _flush_access_counts()
         _release_lock()
@@ -570,18 +811,47 @@ def memory_read(title: str) -> str:
     """Read a memory entry by exact title, with filename fallback for legacy files."""
     for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
         meta, body = _load_memory(f)
-        if _entry_title(meta, f) == title:
+        if _entry_title(meta, f) == title or f.stem == title:
             # increment access_count in memory cache (lazy write-back)
             _ACCESS_CACHE[title] = _ACCESS_CACHE.get(title, 0) + 1
             if len(_ACCESS_CACHE) >= _ACCESS_FLUSH_THRESHOLD:
                 _flush_access_counts()
 
-            meta_str = " | ".join(f"{k}={v}" for k, v in meta.items())
+            meta_str = " | ".join(f"{k}={str(v).replace(chr(10), '\\\\n')}" for k, v in meta.items())
             return f"[{meta_str}]\n\n{body}"
     return f"未找到标题为 '{title}' 的记忆"
 @mcp.tool()
-def memory_search(keyword: str, tag: str | None = None) -> str:
-    """Search memories by keyword across title, tags, and body."""
+@_locked_write
+def memory_rebuild_links() -> str:
+    """Rescan all root entries' bodies and refresh the `links` frontmatter field.
+
+    Fixes legacy notes whose `links` field is out of sync with their actual
+    wiki links (improvement #3).
+    """
+    _invalidate_cache()
+    count = 0
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        meta, body = _load_memory(f)
+        links = _extract_wiki_links(body)
+        links = [_clean_link_name(l) for l in links]
+        links = _auto_link_titles(body, links)
+        meta["links"] = links
+        meta["updated"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write_text(f, f"---\n{_dump_yaml_frontmatter(meta)}\n---\n\n{body}")
+        count += 1
+    logger.info("REBUILD_LINKS count=%d", count)
+    return f"已刷新 {count} 条笔记的 links 字段（改进#3）"
+
+
+@mcp.tool()
+def memory_search(keyword: str, tag: str | None = None, limit: int = 20) -> str:
+    """Search memories by keyword across title, tags, and body (recent-first).
+
+    limit caps the number of returned matches (default 20). Keyword occurrences
+    in the body snippet are wrapped in ** for visibility.
+    """
+    if not keyword or not keyword.strip():
+        return "错误：搜索关键词不能为空。"
     results: list[str] = []
     keyword_lower = keyword.lower()
     archive_dir = MEMORY_DIR / ".archive"
@@ -617,6 +887,7 @@ def memory_search(keyword: str, tag: str | None = None) -> str:
                     start = max(0, idx - 20)
                     end = min(len(body), idx + len(keyword) + 20)
                     ctx = body[start:end].replace("\n", " ")
+                    ctx = re.sub(re.escape(keyword), f"**{keyword}**", ctx, flags=re.IGNORECASE)
                     if start > 0:
                         ctx = "..." + ctx
                     if end < len(body):
@@ -626,7 +897,7 @@ def memory_search(keyword: str, tag: str | None = None) -> str:
                 source = meta.get("source", "")
                 source_info = f" | 来源: {source}" if source else ""
                 tags_display = ", ".join(entry_tags)
-                summary_display = f"\n  📋 {summary}" if summary else ""
+                summary_display = f"\n  {summary}" if summary else ""
 
                 results.append(
                     f"- [{title}] ({f.name}) | {tags_display} | tier={tier} | reads={count}{source_info}{summary_display}{context}"
@@ -635,7 +906,10 @@ def memory_search(keyword: str, tag: str | None = None) -> str:
     if not results:
         return f"未找到与 '{keyword}' 相关的记忆"
 
-    return f"找到 {len(results)} 条记忆:\n\n" + "\n\n".join(results[:20])
+    shown = results[:limit]
+    total = len(results)
+    header = f"找到 {total} 条记忆" + (f"，显示前 {limit} 条" if total > limit else "") + ":\n\n"
+    return header + "\n\n".join(shown)
 
 @mcp.tool()
 def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None) -> str:
@@ -683,30 +957,109 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     return result
 
 @mcp.tool()
-def memory_delete(title: str) -> str:
-    _invalidate_cache()
-    """Delete a memory entry by exact title, with filename fallback for legacy files."""
-    for f in MEMORY_DIR.glob("*.md"):
+@_locked_write
+def memory_delete(title: str, trash: bool = True, purge: bool = False) -> str:
+    """Delete a memory entry by exact title, with filename fallback for legacy files.
+
+    trash=True (default) moves the file to .trash/ instead of unlinking, so a
+    mistaken delete can be recovered. Pass purge=True (or trash=False) to
+    permanently remove it (including a previously soft-deleted copy in .trash/).
+    Archive entries (.archive/) are also matched.
+    """
+    search_dirs = [MEMORY_DIR]
+    archive_dir = MEMORY_DIR / ".archive"
+    if archive_dir.exists():
+        search_dirs.append(archive_dir)
+    if not trash:
+        trash_dir = MEMORY_DIR / ".trash"
+        if trash_dir.exists():
+            search_dirs.append(trash_dir)
+    for f in [p for d in search_dirs for p in d.glob("*.md")]:
         meta, _ = _load_memory(f)
-        if _entry_title(meta, f) == title:
+        if _entry_title(meta, f) == title or f.stem == title:
+            if trash and not purge:
+                trash_dir = MEMORY_DIR / ".trash"
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                dest = trash_dir / f.name
+                n = 2
+                while dest.exists():
+                    dest = trash_dir / f"{f.stem}_{n}{f.suffix}"
+                    n += 1
+                f.replace(dest)
+                logger.info("DELETE(soft) title=%s -> %s", title, dest.name)
+                _invalidate_cache()
+                if title != "记忆索引":
+                    _refresh_index()
+                return f"已软删除记忆: {title} -> .trash/{dest.name}（如需彻底删除，用 purge=true）"
             f.unlink()
-            return f"已删除记忆: {title} ({f.name})"
-            logger.info("DELETE  title=%s", title)
+            logger.info("DELETE(purge) title=%s", title)
+            _invalidate_cache()
+            if title != "记忆索引":
+                _refresh_index()
+            return f"已永久删除记忆: {title} ({f.name})"
+    return f"未找到标题为 '{title}' 的记忆"
+
+@mcp.tool()
+@_locked_write
+def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] | None = None,
+                           summary: str | None = None, source: str | None = None) -> str:
+    """Update only the frontmatter metadata of an entry without rewriting its body.
+
+    Useful for changing tier/tags/summary/source of an existing note while keeping
+    its full content intact (avoids the full rewrite that memory_write requires).
+    Pass None to leave a field unchanged; pass an empty list to clear tags.
+    """
+    for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
+        meta, body = _load_memory(f)
+        if _entry_title(meta, f) == title or f.stem == title:
+            if tier is not None:
+                meta["tier"] = tier
+            if tags is not None:
+                meta["tags"] = tags
+            if summary is not None:
+                meta["summary"] = summary
+            if source is not None:
+                meta["source"] = source
+            old_version = meta.get("version", 0)
+            meta["version"] = (old_version + 1) if isinstance(old_version, int) else 1
+            meta["updated"] = datetime.now(timezone.utc).isoformat()
+            _atomic_write_text(f, f"---\n{_dump_yaml_frontmatter(meta)}\n---\n\n{body}")
+            _invalidate_cache()
+            logger.info("UPDATE_META  title=%s", title)
+            return f"已更新元数据: {title}"
     return f"未找到标题为 '{title}' 的记忆"
 
 @mcp.tool()
 def memory_audit() -> str:
-    """Scan the vault and summarize what should be indexed or cleaned up manually."""
+    """Scan the vault and summarize what should be indexed or cleaned up manually.
+
+    Now also covers filesystem-level issues that frontmatter-only stats miss
+    (improvements #8/#9): empty shells, dead links, naming drift.
+    """
     entries = _iter_entries()
     if not entries:
         return "记忆库为空"
+
+    # 建立全量 title 集合（含 .archive）用于死链检测
+    all_titles: set[str] = set()
+    archive_dir = MEMORY_DIR / ".archive"
+    for d in ([MEMORY_DIR, archive_dir] if archive_dir.exists() else [MEMORY_DIR]):
+        for f in d.glob("*.md"):
+            try:
+                m, _ = _load_memory(f)
+                all_titles.add(_entry_title(m, f))
+                all_titles.add(f.stem)
+            except Exception:
+                pass
 
     bucket_counts: Counter[str] = Counter()
     source_counts: Counter[str] = Counter()
     attention: list[str] = []
     suggestions: list[str] = []
+    dead_links: set[str] = set()
+    empty_shells: list[str] = []
 
-    for path, meta, _body in entries:
+    for path, meta, body in entries:
         title = _entry_title(meta, path)
         bucket, reason = _entry_bucket(meta, path)
         bucket_counts[bucket] += 1
@@ -720,6 +1073,31 @@ def memory_audit() -> str:
         tags = _entry_tags(meta)
         if not tags:
             attention.append(f"- {title}：缺少 tags")
+
+        # 改进#9：空壳检测
+        if not body or not body.strip():
+            empty_shells.append(title)
+            attention.append(f"- {title}：空壳（正文为空）")
+
+        # 改进#9/#10：死链检测（links 字段 + 正文 wikilink）
+        # 跳过代码块（```...``` 与 ~~~...~~~）中的示例链接，避免误报噪点
+        body_no_code = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        body_no_code = re.sub(r"~~~.*?~~~", "", body_no_code, flags=re.DOTALL)
+        PLACEHOLDER_LINKS = {"X", "XX", "XXX", "笔记名", "示例", "example", "placeholder", "Placeholder"}
+        for link in (meta.get("links", []) or []):
+            if link in PLACEHOLDER_LINKS:
+                continue
+            if link != title and link not in all_titles:
+                dead_links.add(f"- {title} → [[{link}]]（指向不存在的笔记）")
+        for link in _extract_wiki_links(body_no_code):
+            if link in PLACEHOLDER_LINKS:
+                continue
+            if link != title and link not in all_titles:
+                dead_links.add(f"- {title} → [[{link}]]（正文指向不存在的笔记）")
+
+        # 改进#8：命名建议（游离的时间戳前缀）
+        if re.match(r"^\d{4}-\d{2}-\d{2}_", title) and bucket == "其他":
+            suggestions.append(f"- {title} -> 建议加分类前缀（如 项目_/修复_/工具_）")
 
         if bucket in {"项目", "工具", "运维", "修复", "规则", "身份与配置"}:
             suggestions.append(f"- {title} -> {bucket}（{reason}）")
@@ -737,6 +1115,14 @@ def memory_audit() -> str:
     lines.append("")
     lines.append("## 建议纳入索引")
     lines.extend(suggestions[:60] if suggestions else ["- 暂无"])
+
+    lines.append("")
+    lines.append("## 死链（指向不存在的笔记）")
+    lines.extend(sorted(dead_links)[:60] if dead_links else ["- 暂无"])
+
+    lines.append("")
+    lines.append("## 空壳笔记")
+    lines.extend([f"- {t}" for t in empty_shells] if empty_shells else ["- 暂无"])
 
     lines.append("")
     lines.append("## 需要人工补齐")
@@ -786,6 +1172,7 @@ def memory_index_draft() -> str:
     return "\n".join(lines).rstrip()
 
 @mcp.tool()
+@_locked_write
 def memory_archive(title: str) -> str:
     """Archive a memory entry: move full content to .archive/, leave a summary stub."""
     archive_dir = MEMORY_DIR / ".archive"
@@ -797,7 +1184,7 @@ def memory_archive(title: str) -> str:
 
     for f in MEMORY_DIR.glob("*.md"):
         meta, body = _load_memory(f)
-        if _entry_title(meta, f) == title:
+        if _entry_title(meta, f) == title or f.stem == title:
             target_path = f
             target_meta = meta
             target_body = body
@@ -810,11 +1197,15 @@ def memory_archive(title: str) -> str:
         return f"记忆 '{title}' 已在归档中"
 
     archive_path = archive_dir / target_path.name
+    if archive_path.exists():
+        # 第三轮 P1-10：同名归档不覆盖，加时间戳唯一化
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_path = archive_dir / f"{target_path.stem}_{ts}{target_path.suffix}"
     meta_copy = dict(target_meta)
     meta_copy["tier"] = "cold"
     meta_copy["updated"] = datetime.now(timezone.utc).isoformat()
-    archive_fm = json.dumps(meta_copy, ensure_ascii=False, indent=2)
-    archive_path.write_text(f"---\n{archive_fm}\n---\n\n{target_body}", encoding="utf-8")
+    archive_fm = _dump_yaml_frontmatter(meta_copy)
+    _atomic_write_text(archive_path, f"---\n{archive_fm}\n---\n\n{target_body}")
 
     summary = target_meta.get("summary", "")
     if not summary:
@@ -827,19 +1218,68 @@ def memory_archive(title: str) -> str:
         "summary": summary,
         "tier": "cold",
         "access_count": target_meta.get("access_count", 0),
-        "archived_to": ".archive/{0}".format(target_path.name),
+        "archived_to": ".archive/{0}".format(archive_path.name),
         "created": str(target_meta.get("created", "")),
         "updated": datetime.now(timezone.utc).isoformat(),
     }
     if target_meta.get("source"):
         stub_meta["source"] = target_meta["source"]
 
-    stub_fm = json.dumps(stub_meta, ensure_ascii=False, indent=2)
+    stub_fm = _dump_yaml_frontmatter(stub_meta)
     stub_body = "> \u26a1 本条记忆已归档。完整内容在 `.archive/{0}`\n> 需要恢复的话跟我说一声就行。\n\n{1}".format(target_path.name, summary)
-    target_path.write_text("---\n{0}\n---\n\n{1}".format(stub_fm, stub_body), encoding="utf-8")
+    _atomic_write_text(target_path, "---\n{0}\n---\n\n{1}".format(stub_fm, stub_body))
 
     logger.info("ARCHIVE title=%s", title)
-    return "已归档: {0} -> .archive/{1}".format(title, target_path.name)
+    return "已归档: {0} -> .archive/{1}".format(title, archive_path.name)
+
+@mcp.tool()
+@_locked_write
+def memory_restore(title: str) -> str:
+    """Restore an archived entry back to the vault root (P1-7).
+
+    Moves the full content from .archive/ back to MEMORY_DIR, replacing the stub
+    left behind by memory_archive, and bumps tier back to warm.
+    """
+    archive_dir = MEMORY_DIR / ".archive"
+    if not archive_dir.exists():
+        return "归档目录不存在，无内容可恢复"
+
+    target_path: Path | None = None
+    target_meta: dict[str, Any] = {}
+    target_body = ""
+    for f in archive_dir.glob("*.md"):
+        meta, body = _load_memory(f)
+        if _entry_title(meta, f) == title or f.stem == title:
+            target_path = f
+            target_meta = meta
+            target_body = body
+            break
+    if not target_path:
+        return f"归档中未找到标题为 '{title}' 的记忆"
+
+    target_title = str(target_meta.get("title") or title)
+    if target_title in CORE_PAGES:
+        return f"错误：'{target_title}' 是核心页面，不允许恢复覆盖。"
+
+    # 定位根目录中的 stub（若有），否则用安全文件名新建
+    stub = MEMORY_DIR / _safe_filename(target_title)
+    for f in MEMORY_DIR.glob("*.md"):
+        m, _ = _load_memory(f)
+        if _entry_title(m, f) == target_title or f.stem == target_title:
+            stub = f
+            break
+
+    restored_meta = dict(target_meta)
+    restored_meta["tier"] = "warm"
+    restored_meta.pop("archived_to", None)
+    restored_meta["updated"] = datetime.now(timezone.utc).isoformat()
+    _atomic_write_text(stub, f"---\n{_dump_yaml_frontmatter(restored_meta)}\n---\n\n{target_body}")
+    target_path.unlink(missing_ok=True)
+    _invalidate_cache()
+    if target_title != "记忆索引":
+        _refresh_index()
+    logger.info("RESTORE title=%s", target_title)
+    return f"已恢复记忆: {target_title}（从 .archive/{target_path.name}）"
 
 @mcp.tool()
 def memory_heat_suggest() -> str:
@@ -864,14 +1304,7 @@ def memory_heat_suggest() -> str:
         stats.append((title, tier_val, source, reads, updated_str, created_str))
 
         updated_raw = meta.get("updated", "")
-        if isinstance(updated_raw, str) and updated_raw:
-            try:
-                updated_dt = datetime.fromisoformat(updated_raw)
-                days_since_update = (now - updated_dt).days
-            except (ValueError, TypeError):
-                days_since_update = 999
-        else:
-            days_since_update = 999
+        days_since_update = _days_since_utc(updated_raw)
 
         score = _heat_score(reads, str(meta.get("updated", "")))
         if score < 0.1 and tier_val != "cold":
@@ -886,7 +1319,7 @@ def memory_heat_suggest() -> str:
 
     lines.append("## 按访问次数排序")
     for title, tier_val, source, reads, updated_str, created_str in sorted(stats, key=lambda x: -x[3]):
-        score = _heat_score(reads, str(meta.get("updated", "")))
+        score = _heat_score(reads, updated_str)
         lines.append("- [{0}] {1} | {2} | score={3:.1f}, {4} 次读取 | {5}".format(created_str, title, tier_val, score, reads, source))
 
     lines.append("")
@@ -908,7 +1341,7 @@ def memory_graph(title: str) -> str:
     target_meta: dict[str, Any] = {}
     target_body = ""
     for f, meta, body in all_entries:
-        if _entry_title(meta, f) == title:
+        if _entry_title(meta, f) == title or f.stem == title:
             target_meta = meta
             target_path = f
             target_body = body
@@ -997,6 +1430,7 @@ def memory_orphans() -> str:
     return "\n".join(lines)
 
 @mcp.tool()
+@_locked_write
 def memory_batch_tag(old_tag: str, new_tag: str) -> str:
     """Rename a tag across all entries."""
     _invalidate_cache()
@@ -1029,6 +1463,7 @@ def memory_batch_tag(old_tag: str, new_tag: str) -> str:
     return '未找到包含标签 "{}" 的记忆'.format(old_tag)
 
 @mcp.tool()
+@_locked_write
 def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float | None = None) -> str:
     """Batch-set tier based on heat score range."""
     _invalidate_cache()
@@ -1066,6 +1501,7 @@ def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float
     return "没有符合筛选条件的记忆"
 
 @mcp.tool()
+@_locked_write
 def memory_archive_old(days: int = 90) -> str:
     """Archive entries not updated in N days."""
     _invalidate_cache()
@@ -1083,14 +1519,10 @@ def memory_archive_old(days: int = 90) -> str:
         if meta.get("tier") == "cold":
             continue
         updated_raw = meta.get("updated", "")
-        if isinstance(updated_raw, str) and updated_raw:
-            try:
-                updated_dt = datetime.fromisoformat(updated_raw)
-                if (now - updated_dt).days < days:
-                    continue
-            except (ValueError, TypeError):
-                pass
-        else:
+        updated_dt = _parse_dt_utc(updated_raw)
+        if updated_dt is None:
+            continue
+        if (datetime.now(timezone.utc) - updated_dt).days < days:
             continue
         result = memory_archive(title)
         archived.append("{} -> {}".format(title, result))
@@ -1106,7 +1538,18 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
     now = datetime.now(timezone.utc)
 
-    keywords = [w.lower() for w in re.findall(r"[\w\u4e00-\u9fff]+", query)]
+    def _tokenize(q: str) -> list[str]:
+        # English/number words stay whole; contiguous CJK runs are split into
+        # 2-grams so a whole Chinese phrase matches relevant fragments (P2-11).
+        out: list[str] = []
+        for tok in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", q.lower()):
+            if len(tok) > 2 and re.fullmatch(r"[\u4e00-\u9fff]+", tok):
+                out.extend(tok[i:i + 2] for i in range(len(tok) - 1))
+            else:
+                out.append(tok)
+        return out
+
+    keywords = _tokenize(query)
     if not keywords:
         return "查询词无效"
 
@@ -1146,12 +1589,10 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
             score += min(body_count, 5) * 1.0
 
         if updated_str:
-            try:
-                updated_dt = datetime.fromisoformat(updated_str)
-                days_since = (now - updated_dt).days
+            updated_dt = _parse_dt_utc(updated_str)
+            if updated_dt is not None:
+                days_since = (datetime.now(timezone.utc) - updated_dt).days
                 score += max(0, 2.0 - days_since * 0.02)
-            except (ValueError, TypeError):
-                pass
 
         if score > 0:
             scored.append((score, title, tier, summary[:80], source))
@@ -1167,6 +1608,36 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
         if summary:
             lines.append("  {}".format(summary))
 
+    return "\n".join(lines)
+
+@mcp.tool()
+def memory_recent(days: int = 7, limit: int = 20) -> str:
+    """List entries updated within the last N days, most recent first."""
+    now = datetime.now(timezone.utc)
+    recent: list[tuple[str, str, str]] = []
+    for f in MEMORY_DIR.glob("*.md"):
+        try:
+            meta, _ = _load_memory(f)
+        except Exception:
+            continue
+        updated_str = str(meta.get("updated", ""))
+        updated_dt = _parse_dt_utc(updated_str)
+        if updated_dt is None:
+            continue
+        if (now - updated_dt).days <= days:
+            title = _entry_title(meta, f)
+            summary = str(meta.get("summary", ""))
+            recent.append((updated_str, title, summary[:80]))
+    if not recent:
+        return f"近 {days} 天无更新"
+    recent.sort(reverse=True)
+    lines = [f"# 近 {days} 天更新（{len(recent)} 条）", ""]
+    for updated_str, title, summary in recent[:limit]:
+        lines.append(f"- {updated_str[:10]} [[{title}]]")
+        if summary:
+            lines.append(f"  {summary}")
+    if len(recent) > limit:
+        lines.append(f"\n... 共 {len(recent)} 条，显示前 {limit} 条")
     return "\n".join(lines)
 
 @mcp.tool()
@@ -1202,18 +1673,15 @@ def memory_stats() -> str:
             total_links += len(links)
 
         updated_str = str(meta.get("updated", ""))
-        if updated_str:
-            try:
-                updated_dt = datetime.fromisoformat(updated_str)
-                days = (now - updated_dt).days
-                if days <= 7:
-                    recent_7d += 1
-                if days <= 30:
-                    recent_30d += 1
-                if days <= 90:
-                    recent_90d += 1
-            except (ValueError, TypeError):
-                pass
+        updated_dt = _parse_dt_utc(updated_str)
+        if updated_dt is not None:
+            days = (now - updated_dt).days
+            if days <= 7:
+                recent_7d += 1
+            if days <= 30:
+                recent_30d += 1
+            if days <= 90:
+                recent_90d += 1
 
     # Build backlink index for orphan count
     backlinks: dict[str, set[str]] = {}

@@ -1,4 +1,4 @@
-﻿# 多平台AI融合记忆库
+# 多平台AI融合记忆库
 
 > 跨 AI 工具共享长期记忆 — 让你的ai工具无需复杂的环境共用同一个大脑 — 可视化记忆
 
@@ -71,6 +71,7 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 - **Claude Desktop** - Anthropic 桌面客户端
 - **WorkBuddy** - 国产 AI 助手
 - **Cursor** - AI 代码编辑器
+- **OpenCode** - 开源终端 AI 编程助手
 - 任何支持 MCP stdio 传输的工具
 
 ### 5. 3 个内置自动机制
@@ -184,6 +185,38 @@ args = ["/home/you/ai-memory/server.py"]
 }
 ```
 
+**OpenCode** — 全局配置 `~/.config/opencode/opencode.json`（或项目根目录 `opencode.json`）
+```json
+{
+  "mcp": {
+    "ai-memory": {
+      "type": "local",
+      "command": ["/usr/bin/python3", "/home/you/ai-memory/server.py"],
+      "enabled": true
+    }
+  }
+}
+```
+
+如需自定义记忆库路径，加一个 `environment` 字段即可：
+```json
+"environment": { "AI_MEMORY_DIR": "/path/to/your/memory" }
+```
+
+> OpenCode v2 的配置结构改为 `mcp.servers`，并用 `disabled` 取代 `enabled`：
+> ```json
+> {
+>   "mcp": {
+>     "servers": {
+>       "ai-memory": {
+>         "type": "local",
+>         "command": ["/usr/bin/python3", "/home/you/ai-memory/server.py"]
+>       }
+>     }
+>   }
+> }
+> ```
+
 > 完整的配置模板见 [`setup/`](setup/) 目录。
 
 ---
@@ -231,9 +264,9 @@ python server.py
 ┌─────────────────────────────────────────────────────┐
 │                    AI 客户端层                        │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │ Codex    │  │ Claude   │  │ WorkBuddy        │  │
-│  │ CLI      │  │ Desktop  │  │ (and any MCP     │  │
-│  │          │  │          │  │  compatible tool)│  │
+│  │ Codex    │  │ Claude   │  │ OpenCode / Cursor│  │
+│  │ CLI      │  │ Desktop  │  │ WorkBuddy 等一切 │  │
+│  │          │  │          │  │  MCP 客户端      │  │
 │  └────┬─────┘  └────┬─────┘  └────────┬─────────┘  │
 │       │             │                 │             │
 ├───────┴─────────────┴─────────────────┴─────────────┤
@@ -339,7 +372,7 @@ git push
 | 约定 | 说明 |
 |------|------|
 | commit 格式 | `{source}: {动作} - {简要说明}`，例如 `codex: 更新项目状态 - 完成TS合并工具v4` |
-| source 标识 | 每个 AI 用自己的标识：`codex`、`claude`、`workbuddy` |
+| source 标识 | 每个 AI 用自己的标识：`codex`、`claude`、`workbuddy`、`opencode` |
 | push | commit 后立即 push，确保远程始终最新 |
 
 **每次对话开始时，先拉取最新：**
@@ -388,7 +421,8 @@ ai-memory-template/
 ├── setup/                  # 各平台的 MCP 配置模板
 │   ├── codex.toml
 │   ├── claude.json
-│   └── workbuddy.json
+│   ├── workbuddy.json
+│   └── opencode.json
 ├── template/               # 初始记忆文件（开箱即用）
 │   ├── 近期工作动态.md
 │   ├── 用户画像.md

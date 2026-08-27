@@ -1,0 +1,9 @@
+{
+  "mcp": {
+    "ai-memory": {
+      "type": "local",
+      "command": ["/path/to/python", "/path/to/ai-memory/server.py"],
+      "enabled": true
+    }
+  }
+}

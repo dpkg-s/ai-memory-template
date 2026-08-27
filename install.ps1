@@ -83,4 +83,15 @@ Write-Host '    }'
 Write-Host '  }'
 Write-Host '}'
 Write-Host ""
+Write-Host "--- OpenCode ($env:USERPROFILE\.config\opencode\opencode.json 或项目根 opencode.json) ---"
+Write-Host '{'
+Write-Host '  "mcp": {'
+Write-Host '    "ai-memory": {'
+Write-Host '      "type": "local",'
+Write-Host "      ""command"": [""$py"", ""$memDir\server.py""],"
+Write-Host '      "enabled": true'
+Write-Host '    }'
+Write-Host '  }'
+Write-Host '}'
+Write-Host ""
 Write-Host "具体配置示例见 setup/ 目录"

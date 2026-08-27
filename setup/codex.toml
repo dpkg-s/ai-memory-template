@@ -2,3 +2,5 @@
 [mcp_servers.ai-memory]
 command = "/path/to/python"
 args = ["/path/to/ai-memory/server.py"]
+# 可选：自定义记忆库路径（默认 ~/ai-memory）
+# env = { AI_MEMORY_DIR = "/path/to/your/memory" }

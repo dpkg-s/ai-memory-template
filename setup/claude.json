@@ -2,7 +2,8 @@
   "mcpServers": {
     "ai-memory": {
       "command": "/path/to/python",
-      "args": ["/path/to/ai-memory/server.py"]
+      "args": ["/path/to/ai-memory/server.py"],
+      "env": { "AI_MEMORY_DIR": "/path/to/your/memory" }
     }
   }
 }

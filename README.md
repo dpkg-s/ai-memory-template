@@ -122,13 +122,13 @@ ai助手-快速上手：
 
 macOS / Linux：
 ```bash
-curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.sh | bash
 ```
 
 
 Windows PowerShell：
 ```bash
-irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.ps1 | iex
 ```
 
 安装脚本会：
@@ -381,9 +381,10 @@ clone 完成即可使用，所有 AI 的记忆自动同步。
 ```
 ai-memory-template/
 ├── README.md               # 本文档
-├── server.py               # MCP 服务器（单文件，~1300 行）
+├── server.py               # MCP 服务器（单文件，~1700 行）
 ├── install.ps1             # Windows 一键安装脚本
 ├── install.sh              # Linux/macOS 一键安装脚本
+├── LICENSE                 # MIT 许可证
 ├── setup/                  # 各平台的 MCP 配置模板
 │   ├── codex.toml
 │   ├── claude.json
@@ -394,7 +395,8 @@ ai-memory-template/
 │   ├── 记忆索引.md
 │   └── 记忆写入格式规范.md
 └── rules/                  # AI 写入时遵循的规范
-    └── 记忆写入格式规范.md
+    ├── 记忆写入格式规范.md
+    └── Git版本控制规范.md
 ```
 
 ---

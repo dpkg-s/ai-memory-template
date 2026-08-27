@@ -55,3 +55,24 @@ echo "记忆库: $MEM_DIR"
 echo ""
 echo "Python: $PY"
 echo "Server: $MEM_DIR/server.py"
+
+echo ""
+echo "=== 配置各 AI 工具 ==="
+echo ""
+echo "--- Codex CLI (~/.codex/config.toml) ---"
+echo "[mcp_servers]"
+echo "[mcp_servers.ai-memory]"
+echo "command = \"$PY\""
+echo "args = [\"$MEM_DIR/server.py\"]"
+echo ""
+echo "--- Claude Desktop (claude_desktop_config.json) ---"
+echo '{'
+echo '  "mcpServers": {'
+echo '    "ai-memory": {'
+echo "      \"command\": \"$PY\","
+echo "      \"args\": [\"$MEM_DIR/server.py\"]"
+echo '    }'
+echo '  }'
+echo '}'
+echo ""
+echo "具体配置示例见 setup/ 目录"

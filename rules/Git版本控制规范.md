@@ -1,4 +1,4 @@
-﻿# Git 版本控制规范
+# Git 版本控制规范
 
 > 记忆库必须启用 git 版本控制，确保多设备同步和历史可追溯。
 
@@ -17,7 +17,7 @@ git push
 
 | 项 | 说明 |
 |----|------|
-| source | `codex` / `claude` / `workbuddy`，标识哪个 AI 提交的 |
+| source | `codex` / `claude` / `workbuddy` / `opencode`，标识哪个 AI 提交的 |
 | 动作 | `新增` / `更新` / `修复` / `归档` 等 |
 | 示例 | `codex: 更新项目_xxx - 完成API对接` |
 

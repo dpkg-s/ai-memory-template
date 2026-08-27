@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ai-memory-template installer for Linux/macOS
 
 set -e
@@ -71,6 +71,17 @@ echo '  "mcpServers": {'
 echo '    "ai-memory": {'
 echo "      \"command\": \"$PY\","
 echo "      \"args\": [\"$MEM_DIR/server.py\"]"
+echo '    }'
+echo '  }'
+echo '}'
+echo ""
+echo "--- OpenCode (~/.config/opencode/opencode.json 或项目根 opencode.json) ---"
+echo '{'
+echo '  "mcp": {'
+echo '    "ai-memory": {'
+echo '      "type": "local",'
+echo "      \"command\": [\"$PY\", \"$MEM_DIR/server.py\"],"
+echo '      "enabled": true'
 echo '    }'
 echo '  }'
 echo '}'

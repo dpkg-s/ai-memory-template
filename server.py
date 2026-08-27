@@ -326,7 +326,7 @@ _TAG_AUTO_MAP: dict[str, str] = {
     "mcp": "mcp", "ai": "ai", "llm": "ai", "gpt": "ai",
     "git": "git", "github": "git",
     "obsidian": "obsidian", "markdown": "markdown",
-    "deploy": "deploy", "部署": "deploy", "docker": "deploy",
+    "deploy": "deploy", "部署": "deploy",
     "美化": "美化", "theme": "美化", "customization": "美化",
 }
 
@@ -743,7 +743,10 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     # 若根目录无此标题而归档中有，视为"归档后重建"——在根目录新建条目，
     # 归档保持原样。要修改归档内容请先 memory_restore。
     for f in list(MEMORY_DIR.glob("*.md")):
-        meta, body = _load_memory(f)
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断写入
         if _entry_title(meta, f) == title or f.stem == title:
             existing_path = f
             existing_meta = meta
@@ -796,6 +799,8 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
             filepath = _resolve_unique_path(MEMORY_DIR, title)
             _write_memory(filepath, title=title, tags=tags, source=effective_source, content=content,
                           summary=summary, tier=tier or "warm", links=links, version=new_version)
+            # 新建的 cold 条目同样自动归档（与更新分支行为一致）
+            _maybe_auto_archive(title, filepath)
             logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
             result_msg = f"已创建记忆: {title} ({filepath.name})"
         # 改进#7：写入后自动维护索引（跳过索引自身，直接写文件防递归）
@@ -810,7 +815,10 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
 def memory_read(title: str) -> str:
     """Read a memory entry by exact title, with filename fallback for legacy files."""
     for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
-        meta, body = _load_memory(f)
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断读取
         if _entry_title(meta, f) == title or f.stem == title:
             # increment access_count in memory cache (lazy write-back)
             _ACCESS_CACHE[title] = _ACCESS_CACHE.get(title, 0) + 1
@@ -970,12 +978,16 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False) -> str:
     archive_dir = MEMORY_DIR / ".archive"
     if archive_dir.exists():
         search_dirs.append(archive_dir)
-    if not trash:
+    if not trash or purge:
+        # purge=True 也要搜索 .trash，否则软删副本永远无法连带清除（与 docstring 承诺一致）
         trash_dir = MEMORY_DIR / ".trash"
         if trash_dir.exists():
             search_dirs.append(trash_dir)
     for f in [p for d in search_dirs for p in d.glob("*.md")]:
-        meta, _ = _load_memory(f)
+        try:
+            meta, _ = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断删除
         if _entry_title(meta, f) == title or f.stem == title:
             if trash and not purge:
                 trash_dir = MEMORY_DIR / ".trash"
@@ -1010,7 +1022,10 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
     Pass None to leave a field unchanged; pass an empty list to clear tags.
     """
     for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
-        meta, body = _load_memory(f)
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断元数据更新
         if _entry_title(meta, f) == title or f.stem == title:
             if tier is not None:
                 meta["tier"] = tier
@@ -1183,7 +1198,10 @@ def memory_archive(title: str) -> str:
     target_body = ""
 
     for f in MEMORY_DIR.glob("*.md"):
-        meta, body = _load_memory(f)
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断归档
         if _entry_title(meta, f) == title or f.stem == title:
             target_path = f
             target_meta = meta
@@ -1229,6 +1247,7 @@ def memory_archive(title: str) -> str:
     stub_body = "> \u26a1 本条记忆已归档。完整内容在 `.archive/{0}`\n> 需要恢复的话跟我说一声就行。\n\n{1}".format(target_path.name, summary)
     _atomic_write_text(target_path, "---\n{0}\n---\n\n{1}".format(stub_fm, stub_body))
 
+    _invalidate_cache()
     logger.info("ARCHIVE title=%s", title)
     return "已归档: {0} -> .archive/{1}".format(title, archive_path.name)
 
@@ -1248,7 +1267,10 @@ def memory_restore(title: str) -> str:
     target_meta: dict[str, Any] = {}
     target_body = ""
     for f in archive_dir.glob("*.md"):
-        meta, body = _load_memory(f)
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断恢复
         if _entry_title(meta, f) == title or f.stem == title:
             target_path = f
             target_meta = meta
@@ -1264,7 +1286,10 @@ def memory_restore(title: str) -> str:
     # 定位根目录中的 stub（若有），否则用安全文件名新建
     stub = MEMORY_DIR / _safe_filename(target_title)
     for f in MEMORY_DIR.glob("*.md"):
-        m, _ = _load_memory(f)
+        try:
+            m, _ = _load_memory(f)
+        except Exception:
+            continue  # 单个损坏/被占用的文件不应阻断恢复
         if _entry_title(m, f) == target_title or f.stem == target_title:
             stub = f
             break
@@ -1505,16 +1530,15 @@ def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float
 def memory_archive_old(days: int = 90) -> str:
     """Archive entries not updated in N days."""
     _invalidate_cache()
-    core_pages = {"记忆索引", "近期工作动态", "用户画像", "AI身份档案", "Codex 身份档案",
-                  "Claude Code 身份档案", "记忆库总规范", "共享记忆库规则", "记忆半自动整理流程",
-                  "AI交互配置", "AI 对话自动归档提示词"}
+    # 直接复用全局 CORE_PAGES，与 _maybe_auto_archive 的保护范围保持一致
+    # （此前本地副本少了 2 个页面，会被批量归档误伤）
     now = datetime.now(timezone.utc)
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
     archived: list[str] = []
 
     for f, meta, body in all_entries:
         title = _entry_title(meta, f)
-        if title in core_pages:
+        if title in CORE_PAGES:
             continue
         if meta.get("tier") == "cold":
             continue

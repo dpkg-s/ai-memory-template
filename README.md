@@ -75,9 +75,9 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 - **Cursor** - AI 代码编辑器
 - 任何支持 MCP stdio 传输的工具
 
-### 5. 3 个内置自动机制
+### 5. 2 个内置自动机制 + 显式双链
 
-减少手写工作量，AI 写入时自动处理：
+AI 写入时自动处理，同时支持手动标注关联：
 
 **自动标签** — 正文关键词自动推断标签，30+ 条映射规则覆盖常见领域
 
@@ -86,12 +86,7 @@ MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
 输出标签: [deploy, python]
 ```
 
-**自动链接** — 检测正文中的已知笔记标题，自动补入双向链接
-
-```
-输入: "参考了用户画像和记忆索引的内容"
-输出 links: [用户画像, 记忆索引]
-```
+**显式双链** — 记忆用 Obsidian 风格 `[[Wiki Link]]` 手动标注关联，正文显式双链是链接关系的唯一事实源（自动补链已停用以避免冗余，`memory_rebuild_links` 只做只读校验）
 
 **自动归档** — cold tier 条目在写入时自动移入 `.archive/` 目录，原位保留摘要
 
@@ -221,6 +216,7 @@ python server.py
 | 协议 | **MCP (Model Context Protocol)** | 开放标准，stdio 传输，JSON-RPC 2.0 |
 | 框架 | **FastMCP (Python SDK)** | MCP 服务器框架，自动处理协议层 |
 | 存储 | **Markdown + YAML Frontmatter** | 每个记忆一个 .md 文件，元数据存 frontmatter（Obsidian 原生识别，兼容旧 JSON） |
+| 索引 | **SQLite 元数据索引（内置 sqlite3）** | 镜像 frontmatter 元数据用于标题 O(1) 定位，正文实时读盘；索引故障自动回退全库扫描 |
 | 缓存 | **Python dict（内存）** | 条目缓存 + 访问计数缓存，写入时失效 |
 | 锁 | **文件锁（PID + 时间戳）** | 跨进程互斥，15 秒超时 |
 | 搜索 | **关键词匹配 + 多字段打分** | 标题/标签/摘要/正文加权排序 |
@@ -253,14 +249,14 @@ python server.py
 │  ┌──────────────────────────────────────────────┐   │
 │  │ 基础设施                                      │   │
 │  │ 文件锁 │ 条目缓存 │ 访问计数缓存 │ 日志        │   │
-│  │ 自动标签 │ 自动链接 │ 自动归档                 │   │
+│  │ SQLite 索引 │ 自动标签 │ 自动归档             │   │
 │  └──────────────────────────────────────────────┘   │
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────┴──────────────────────────────┐
 │                  存储层 (文件系统)                    │
 │  ┌──────────────────────────────────────────────┐   │
-│  │ D:/ai-memory/  (或任意目录)                    │   │
+│  │ ~/ai-memory/  (或 AI_MEMORY_DIR 指定目录)     │   │
 │  │  ├── 用户画像.md                               │   │
 │  │  ├── 近期工作动态.md                            │   │
 │  │  ├── 项目_xxx.md                               │   │
@@ -280,7 +276,7 @@ python server.py
 
 | 工具 | 签名 | 功能 |
 |------|------|------|
-| `memory_write` | `(title, content, tags?, source?, summary?, tier?, expected_version?)` | 写入或更新记忆。自动标签 + 自动链接 + 自动归档；拒绝空内容；同标题自动 upsert 覆盖；支持乐观锁 |
+| `memory_write` | `(title, content, tags?, source?, summary?, tier?, expected_version?)` | 写入或更新记忆。自动标签 + 自动归档；拒绝空内容；同标题自动 upsert 覆盖；支持乐观锁 |
 | `memory_read` | `(title, max_chars=8000)` | 按标题精确读取（含文件名回退，命中 `.archive`）。访问计数缓存在内存，攒够 10 次批量写回；正文默认截断 8000 字符，`max_chars=0` 取全文 |
 | `memory_search` | `(keyword, tag?, limit?)` | 关键词搜索（标题/标签/正文），命中处 `**` 高亮，可指定标签过滤 |
 | `memory_delete` | `(title, trash=True, purge=False)` | 删除记忆（默认软删到 `.trash` 可恢复；`purge=True` 永久删） |
@@ -307,7 +303,7 @@ python server.py
 | `memory_batch_tag(old_tag, new_tag)` | 全库标签重命名 |
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
 | `memory_heat_suggest()` | 扫描全库，按访问频次与陈旧度给出 tier 升降建议 |
-| `memory_rebuild_links()` | 重扫所有笔记正文，刷新 frontmatter 的 `links` 字段（修复历史笔记脱节） |
+| `memory_rebuild_links()` | 只读校验：扫描正文 `[[双链]]`，报告死链（指向不存在标题）与计数，不修改文件 |
 
 ### 审计工具
 
@@ -383,7 +379,8 @@ clone 完成即可使用，所有 AI 的记忆自动同步。
 ```
 ai-memory-template/
 ├── README.md               # 本文档
-├── server.py               # MCP 服务器（单文件，~1700 行）
+├── server.py               # MCP 服务器（~1940 行）
+├── memory_index.py         # SQLite 元数据索引模块（标题 O(1) 定位）
 ├── install.ps1             # Windows 一键安装脚本
 ├── install.sh              # Linux/macOS 一键安装脚本
 ├── LICENSE                 # MIT 许可证

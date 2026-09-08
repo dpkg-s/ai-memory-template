@@ -29,13 +29,13 @@
 
 ### 1. 零外部依赖
 
-只需要 Python 3.10+ 和一个 `pip install mcp`。不需要数据库、不需要容器、不需要云服务。
+只需要 Python 3.10+ 和一个 `pip install mcp`。不需要装数据库服务、不需要容器、不需要云服务。
 
-> **性能说明（SQLite 元数据索引）**：`memory_read` / `memory_list` 的标题定位走内置 `sqlite3`（Python 标准库）的本地索引，把 O(n) 全库扫描降为 O(1)。索引仅镜像 frontmatter 元数据（正文永不入库、实时读盘），md 文件仍是唯一事实源，索引故障时自动回退全库扫描，功能不降级。
+> **性能说明（SQLite 元数据索引）**：`memory_read` / `memory_list` 的标题定位走 Python 内置的 `sqlite3`（标准库自带，非外部依赖、无需安装），把 O(n) 全库扫描降为 O(1)。索引只是运行时自动生成的**缓存文件**，仅镜像 frontmatter 元数据——正文永不入库、实时读盘，md 文件仍是唯一事实源；索引损坏或缺失时自动回退全库扫描，功能不降级。
 
 ### 2. 纯文件存储
 
-所有记忆是**纯 Markdown 文件**。这意味着：
+所有记忆是**纯 Markdown 文件**（数据库只是运行时生成的缓存，删掉随时重建，记忆永不丢失）。这意味着：
 - 你可以用 **Obsidian** 直接打开浏览编辑
 - 用 **git** 做版本管理
 - 用 **grep** 做全文搜索
@@ -69,7 +69,7 @@ Obsidian 图谱视图效果（文本示意）:
 ### 4. 跨平台 + 跨 AI
 
 MCP 是开放协议。这套服务可以接入任何支持 MCP 的客户端：
-- **Codex CLI** - 当前对话
+- **Codex CLI** - OpenAI 终端 AI 助手
 - **Claude Desktop** - Anthropic 桌面客户端
 - **WorkBuddy** - 国产 AI 助手
 - **Cursor** - AI 代码编辑器
@@ -216,7 +216,7 @@ python server.py
 | 协议 | **MCP (Model Context Protocol)** | 开放标准，stdio 传输，JSON-RPC 2.0 |
 | 框架 | **FastMCP (Python SDK)** | MCP 服务器框架，自动处理协议层 |
 | 存储 | **Markdown + YAML Frontmatter** | 每个记忆一个 .md 文件，元数据存 frontmatter（Obsidian 原生识别，兼容旧 JSON） |
-| 索引 | **SQLite 元数据索引（内置 sqlite3）** | 镜像 frontmatter 元数据用于标题 O(1) 定位，正文实时读盘；索引故障自动回退全库扫描 |
+| 索引 | **SQLite（内置 sqlite3，运行时缓存）** | 镜像 frontmatter 元数据用于标题 O(1) 定位，正文实时读盘；可随时删除重建，故障自动回退全库扫描 |
 | 缓存 | **Python dict（内存）** | 条目缓存 + 访问计数缓存，写入时失效 |
 | 锁 | **文件锁（PID + 时间戳）** | 跨进程互斥，15 秒超时 |
 | 搜索 | **关键词匹配 + 多字段打分** | 标题/标签/摘要/正文加权排序 |

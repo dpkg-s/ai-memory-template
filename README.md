@@ -1,4 +1,4 @@
-﻿# 多平台AI融合记忆库
+# 多平台AI融合记忆库
 
 > 跨 AI 工具共享长期记忆 — 让你的ai工具无需复杂的环境共用同一个大脑 — 可视化记忆
 
@@ -30,6 +30,8 @@
 ### 1. 零外部依赖
 
 只需要 Python 3.10+ 和一个 `pip install mcp`。不需要数据库、不需要容器、不需要云服务。
+
+> **性能说明（SQLite 元数据索引）**：`memory_read` / `memory_list` 的标题定位走内置 `sqlite3`（Python 标准库）的本地索引，把 O(n) 全库扫描降为 O(1)。索引仅镜像 frontmatter 元数据（正文永不入库、实时读盘），md 文件仍是唯一事实源，索引故障时自动回退全库扫描，功能不降级。
 
 ### 2. 纯文件存储
 
@@ -279,7 +281,7 @@ python server.py
 | 工具 | 签名 | 功能 |
 |------|------|------|
 | `memory_write` | `(title, content, tags?, source?, summary?, tier?, expected_version?)` | 写入或更新记忆。自动标签 + 自动链接 + 自动归档；拒绝空内容；同标题自动 upsert 覆盖；支持乐观锁 |
-| `memory_read` | `(title)` | 按标题精确读取（含文件名回退，命中 `.archive`）。访问计数缓存在内存，攒够 10 次批量写回 |
+| `memory_read` | `(title, max_chars=8000)` | 按标题精确读取（含文件名回退，命中 `.archive`）。访问计数缓存在内存，攒够 10 次批量写回；正文默认截断 8000 字符，`max_chars=0` 取全文 |
 | `memory_search` | `(keyword, tag?, limit?)` | 关键词搜索（标题/标签/正文），命中处 `**` 高亮，可指定标签过滤 |
 | `memory_delete` | `(title, trash=True, purge=False)` | 删除记忆（默认软删到 `.trash` 可恢复；`purge=True` 永久删） |
 | `memory_update_metadata` | `(title, tier?, tags?, summary?, source?)` | 仅更新 frontmatter 元数据，不重写正文 |
@@ -289,7 +291,7 @@ python server.py
 
 | 工具 | 功能 |
 |------|------|
-| `memory_graph(title)` | 显示指定笔记的出链和反向链接图谱 |
+| `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链和反向链接图谱 |
 | `memory_orphans()` | 查找**孤立笔记**（没有任何其他笔记引用它） |
 | `memory_smart_search(query, tag?, limit?)` | **多字段加权搜索**：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，额外加时效性加分 |
 | `memory_list(tag?, limit?, tier?)` | 罗列所有记忆摘要 |

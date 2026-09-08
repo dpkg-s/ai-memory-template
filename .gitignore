@@ -2,3 +2,8 @@
 *.pyc
 .memory.lock
 .DS_Store
+
+# SQLite metadata index (generated at runtime by memory_index.py)
+memory_index_*.db
+memory_index_*.db-shm
+memory_index_*.db-wal

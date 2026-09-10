@@ -7,6 +7,66 @@
 
 ## [Unreleased]
 
+三层补强：**作用域与生命周期**（记忆该在哪个范围生效、哪条还适用）、**工程韧性**（把「多 AI 工具同时写一个库」纳入自动化测试并修复其暴露的并发缺陷）、**可观测性**（服务跑得怎么样）。
+
+### Added
+
+- **作用域 / 生命周期字段**（frontmatter 升到 `schema_version: 2`）：
+  - `scope`：`global` / `project` / `temporary`，配 `project` 标识用于项目级隔离
+  - `status`：`candidate` / `active` / `stale` / `deprecated` / `archived`
+  - `supersedes`：本条结论取代了哪条旧记忆；`conflicts`：与之冲突的条目
+  - `source_context`：写入方上下文（如 `workbuddy` / `claude-desktop` / `codex`），可在各客户端 MCP 配置里用 `AI_MEMORY_SOURCE_CONTEXT` 环境变量设定
+  - **只做字段层，不做目录分层**：单一根目录 + 字段过滤。`global/ projects/ temporary/` 目录分层被明确否决 —— 服务端有 15 处 glob 扫描是非递归的，搬文件即脱离检索，收益不抵风险
+  - **默认排除 archived**：`memory_search` / `memory_list` / `memory_smart_search` 省略 `status` 时自动隐藏归档条目（`stale` / `deprecated` 仍保留 —— 「过时」不等于「不该看见」），被隐藏的命中数会在结果末尾提示，避免误判为「记忆不存在」
+  - **零迁移向后兼容**：旧笔记读取端注入默认值（`global` / `active` / schema v1），仅在被显式写入时渐进补齐
+  - `memory_archive` / `memory_restore` 自动联动 `status`（`archived` ⇄ `active`），并保留原 scope/project
+  - `memory_stats` 新增作用域 / 生命周期 / 写入方上下文 / 结构版本 / 项目五项分布
+  - `memory_audit` 新增「生命周期 / 冲突 / 作用域一致性」章节：检出 `supersedes` 与 `conflicts` 的死引用、`scope=project` 却缺 `project`、`status=archived` 却无 `archived_to`
+  - **作用域与生命周期专项测试**（`tests/test_scope_lifecycle.py`，70 断言）
+- **跨进程并发测试**（`tests/test_concurrency.py`，38 断言；配套子进程工人 `tests/concurrency_worker.py`）：
+  覆盖五种真实竞争场景 —— 乐观锁竞争（10 进程同版本写入 → 恰好 1 成功 9 冲突）、无冲突并发写、
+  写/归档/删除混合、读写并发（300 次读循环 vs 3 写）、收尾对账（无锁残留 + 索引与磁盘逐行核对）。
+  用**真实 subprocess** 而非线程，才能复现多客户端同写一库时的进程级锁与缓存隔离语义。
+- **异常恢复测试**（`tests/test_recovery.py`，35 断言）：索引删除→重建、索引垃圾字节→自愈、
+  锁文件残留/损坏→陈旧回收、写入窗口内强杀进程→无损坏、外部改写正文→以磁盘为准、
+  外部增删文件（如 `git` 切版本）→以磁盘为准、七类畸形 Markdown（0 字节 / 无 frontmatter /
+  半截 `---` / 非法 YAML）→工具全部降级不崩、重复重建幂等。
+- **检索质量评测**（`tests/test_search_quality.py`，7 断言）：15 篇 fixture（中文 / 英文 /
+  代码标识符 / 专有名词）× 20 查询 + 3 负样本，以 recall@10 ≥ 0.95、MRR ≥ 0.80、
+  零结果率为 0、负样本必须全空等指标作为**检索质量护栏**。后续任何检索改动都要过这道闸。
+- **运行时指标层**（`metrics.py` + `tests/test_metrics.py`，44 断言）：纯标准库，记录检索调用数 /
+  零结果率 / 命中数 / 平均耗时、读写次数与未命中率、锁获取与等待时长 / 超时、索引重建次数。
+  设计上**绝不阻塞主流程**（全链路 try/except，指标自身崩溃也不外泄）、允许并发下少量丢失
+  （多进程 read-merge-write 同一 JSON 非原子，用「不精确」换「零耦合」）、正常退出时自动落盘零头。
+  指标摘要已并入 `memory_stats` 与 `memory_audit` 的「## 运行时指标」章节。
+  可用环境变量 `AI_MEMORY_METRICS=0` 关闭。
+
+### Fixed
+
+- **索引损坏不自愈**：索引文件被截断或写入垃圾字节后，`_ensure_index` 只是静默返回，
+  索引会永久失效。现改为**丢弃并重建一次**（优先截断为 0 字节 —— 部分受限环境会拦截删除动作），
+  重建仍失败才保持脏标记并回退全库扫描。
+- **把锁竞争误判为索引损坏**（并发测试实测）：SQLite 的 `database is locked` 属 `OperationalError`，
+  原判定会在多进程同时访问时丢弃**他人正在使用**的索引文件，引发连锁失败。
+  现严格区分「内容损坏」（`DatabaseError` 且非 `OperationalError`）与「锁竞争」。
+- **读路径写盘未持锁**：`_flush_access_counts` 由读路径调用却不持锁，与写进程共用同一个
+  `<文件名>.tmp` 互相删除（CI 在 Python 3.10/3.11 上偶发 `FileNotFoundError`）。
+  现改为自持锁，并把临时文件名加上 pid 后缀。
+- **Windows 下写盘替换偶发 `PermissionError(WinError 5)`**：只要有另一进程此刻正打开目标文件读取，
+  `os.replace` 就会失败。新增退避重试（累计约 0.75 秒），把「替换瞬间」与「他人读取窗口」错开；
+  仍失败则原样抛出，绝不降级为非原子写。POSIX 上该分支不会触发。
+- **`memory_smart_search` 过度召回**：时间新鲜度原本可**单独**决定入选，导致任意查询都会把
+  「当天更新」的条目塞进结果（负样本用例实测：查询「量子纠缠退相干」返回 10 条完全无关的记忆）。
+  现改为零词法命中即非候选，新鲜度只作加权项。
+
+### Changed
+
+- **CI 测试步骤改为遍历 `tests/test_*.py`**：新增回归测试无需再改 CI（子进程工人
+  `tests/concurrency_worker.py` 不匹配该模式，不会被误执行）。CI 断言总数 77 → 271。
+- **CI lint 目标加入 `metrics.py`**。
+- `.gitignore` 用一条通配 `memory_index_*.db*` 覆盖索引全部派生物（`.db` / `-wal` / `-shm` / 测试用 `.db.orphan`），
+  并新增 `memory_metrics_*.json`。
+
 ## [2.1.0] - 2026-09-10
 
 引入**记忆可信度字段**，区分「用户明说的事实」与「AI 自行推断」，遏制 Memory Poisoning（AI 推测被写入后被后续会话当成事实复用）。

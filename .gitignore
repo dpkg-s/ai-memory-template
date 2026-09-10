@@ -11,3 +11,7 @@ server.bak.*
 # .db.orphan（恢复测试需模拟「索引文件不存在」，用 rename 而非删除以规避受限环境
 # 对删除动作的拦截）。
 memory_index_*.db*
+
+# 运行时指标快照 (generated at runtime by metrics.py)
+# 与索引同目录、按 MEMORY_DIR 哈希隔离；纯观测数据，删掉即从零重新累积。
+memory_metrics_*.json

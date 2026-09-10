@@ -129,13 +129,19 @@ verified_at: 2026-09-10
 
 多个 AI 同时写入时，基于 PID + 时间戳的**文件锁**保证互斥，15 秒超时并自动接管陈旧锁。锁在**线程内可重入**，因此 `memory_write → 自动归档 → memory_archive` 这条嵌套链路不会自死锁。
 
+### 运行时可观测性
+
+`memory_stats` / `memory_audit` 回答的是「库里有什么」，回答不了「服务跑得怎么样」。`metrics.py` 补齐后者：检索调用数与**零结果率**、命中条数、平均耗时，读写次数与未命中率，锁获取与等待时长、超时次数，索引重建次数 —— 全部并入两个工具输出末尾的「## 运行时指标」章节。
+
+设计上刻意克制：纯标准库、全链路 `try/except`（观测绝不能成为主流程的新故障点）、**不加跨进程锁**（多进程 read-merge-write 同一 JSON 非原子，允许少量丢失 —— 指标看趋势，不需要精确到个位）。正常退出时自动落盘零头；被强杀则丢最后不足 50 次事件，这正是这层取舍的一部分。设 `AI_MEMORY_METRICS=0` 可完全关闭。
+
 ### 工程化保障
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **77 条断言**的三层测试（语义回归 28 + 全工具冒烟 25 + 记忆可信度 24）
+- **271 条断言**的八层测试：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 7 + 运行时可观测性 44
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
-- **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`
+- **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`，可观测层拆为 `metrics.py`
 
 ---
 
@@ -344,6 +350,16 @@ python server.py
 }
 ```
 
+### 可选环境变量
+
+| 变量 | 作用 | 默认 |
+|------|------|------|
+| `AI_MEMORY_DIR` | 记忆库（vault）目录 | `~/ai-memory` |
+| `AI_MEMORY_METRICS` | 运行时指标；设 `0` 完全关闭 | 开启 |
+| `AI_MEMORY_SOURCE_CONTEXT` | 本条记忆的写入方上下文，写入 `source_context` 字段（如 `workbuddy` / `claude-desktop` / `codex`），便于日后分辨「谁写的」 | 不设置 |
+
+指标与索引一样，是**运行时生成的缓存文件**（`memory_metrics_<哈希>.json`，位于 `server.py` 同目录，不入库、可随时删除）。想从哪里看服务健康状况，直接调用 `memory_stats` 或 `memory_audit` 即可。
+
 ### 自定义自动标签规则
 
 编辑 `server.py` 中的 `_TAG_AUTO_MAP` 字典（目前 68 条「正文关键词 → 标签」映射），按需增删即可。
@@ -456,6 +472,7 @@ clone 完即可使用，所有 AI 的记忆自动同步。
 | 存储 | **Markdown + YAML Frontmatter** | 一条记忆一个 `.md`，元数据存 frontmatter（Obsidian 原生识别，兼容旧 JSON） |
 | 索引 | **SQLite（内置 sqlite3，运行时缓存）** | 镜像 frontmatter 用于标题 O(1) 定位；可随时删除重建，故障自动回退全库扫描 |
 | 缓存 | **Python dict（内存）** | 条目缓存 + 访问计数缓存，写入时失效 |
+| 可观测性 | **JSON 快照（内置 json，运行时缓存）** | 检索/读写/锁/索引四类指标的进程内累积 + 定期合并落盘；不加跨进程锁，允许少量丢失 |
 | 锁 | **文件锁（PID + 时间戳）** | 跨进程互斥，线程内可重入，15 秒超时接管 |
 | 搜索 | **关键词匹配 + 多字段加权** | 标题 / 标签 / 摘要 / 正文分级打分 |
 | 图谱 | **正则解析 `[[Wiki Link]]`** | Obsidian 兼容双链语法 |
@@ -478,7 +495,7 @@ clone 完即可使用，所有 AI 的记忆自动同步。
   ├─ 审计：audit / index_draft / rebuild_links
   ├─ 无状态工具层（可独立测试）
   │    yaml_io.py · text_utils.py · locks.py
-  └─ 基础设施：条目缓存 · 访问计数 · SQLite 索引 · 自动标签 · 自动归档
+  └─ 基础设施：条目缓存 · 访问计数 · SQLite 索引 · 运行时指标 · 自动标签 · 自动归档
         │
         ▼
   存储层  ~/ai-memory/（纯 Markdown，也可直接用 Obsidian 打开）
@@ -498,6 +515,7 @@ ai-memory-template/
 │
 ├── server.py                # MCP 服务端：20 个工具注册 + 存储层 + 业务逻辑
 ├── memory_index.py          # SQLite 元数据索引（标题 O(1) 定位）
+├── metrics.py               # 运行时指标（检索/读写/锁/索引；仅标准库）
 ├── yaml_io.py               # YAML frontmatter 解析 / 序列化（无状态）
 ├── text_utils.py            # 文件名 / 链接 / 时间 / 热度工具（无状态）
 ├── locks.py                 # 跨进程文件锁（可重入 + 抗陈旧）
@@ -510,9 +528,15 @@ ai-memory-template/
 ├── .gitattributes           # 强制 LF 换行，避免 CRLF 污染
 │
 ├── tests/
-│   ├── test_roundtrip.py       # 28 断言：语义回归
-│   ├── test_tools_smoke.py     # 25 断言：全工具冒烟 + 注册完整性
-│   └── test_p0_credentials.py  # 24 断言：记忆可信度字段
+│   ├── test_roundtrip.py         # 28 断言：语义回归
+│   ├── test_tools_smoke.py       # 25 断言：全工具冒烟 + 注册完整性
+│   ├── test_p0_credentials.py    # 24 断言：记忆可信度字段
+│   ├── test_scope_lifecycle.py   # 70 断言：作用域 / 生命周期 / 冲突字段
+│   ├── test_concurrency.py       # 38 断言：跨进程并发（乐观锁 / 混合操作 / 读写并发）
+│   ├── concurrency_worker.py     # 并发测试的子进程工人（非测试脚本，不被 CI 执行）
+│   ├── test_recovery.py          # 35 断言：索引损坏 / 锁残留 / 进程强杀 / 畸形文件
+│   ├── test_search_quality.py    #  7 断言：检索质量护栏（recall@10 / MRR / 零结果率）
+│   └── test_metrics.py           # 44 断言：运行时可观测性
 ├── .github/workflows/
 │   └── ci.yml               # CI：Python 矩阵测试 + ruff lint
 │
@@ -534,7 +558,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分三层：**语义正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**字段语义**（可信度标记是否可靠）。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 271 条断言。
 
 ### 语义回归 —— `tests/test_roundtrip.py`（28 断言）
 
@@ -560,18 +584,57 @@ ai-memory-template/
 - 检索过滤（`mem_type`）与统计分布输出
 - 序列化层边界：非法值防御性兜底、`false` 不被序列化为 `null`
 
-三个脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
+### 作用域与生命周期 —— `tests/test_scope_lifecycle.py`（70 断言）
+
+- 字段默认值与写入落盘、`scope` / `status` 非法取值拒绝
+- 更新时继承磁盘原值（只改正文不丢语义字段），`memory_update_metadata` 可修正与清空
+- `AI_MEMORY_SOURCE_CONTEXT` 环境变量回落
+- 检索默认排除 `archived`（`stale` / `deprecated` 保留）、`scope` / `project` 过滤
+- 归档 / 恢复与 `status` 联动；`memory_stats` / `memory_audit` 新章节
+- 旧笔记（无新字段）向后兼容
+
+### 跨进程并发 —— `tests/test_concurrency.py`（38 断言）
+
+用**真实子进程**（`tests/concurrency_worker.py`）而非线程，才能复现多个 AI 客户端同写一个库时的进程级锁与缓存隔离语义：
+
+- 乐观锁竞争：10 进程同 `expected_version` 写同标题 → 恰好 1 成功 9 冲突
+- 无冲突并发：10 进程写 10 个标题互不干扰
+- 混合操作：写入 / 归档 / 删除交错
+- 读写并发：300 次读循环 vs 3 个写进程
+- 收尾对账：无锁文件残留、索引与磁盘逐行核对无差异、无 `.tmp` 残留
+
+### 异常恢复 —— `tests/test_recovery.py`（35 断言）
+
+- 索引被删除 → 自动重建；索引被写入垃圾字节 → 自愈
+- 锁文件残留 / 内容损坏 → 陈旧检测回收
+- 写入窗口内强杀进程 → 库无损坏
+- 外部直接改写正文 → 以磁盘为准；外部增删文件（如 `git` 切版本）→ 以磁盘为准
+- 七类畸形 Markdown（0 字节 / 无 frontmatter / 半截 `---` / 非法 YAML 等）→ 10 个工具全部降级不崩
+- 重复重建幂等
+
+### 检索质量 —— `tests/test_search_quality.py`（7 断言）
+
+15 篇 fixture（中文 / 英文 / 代码标识符 / 专有名词）× 20 条查询 + 3 条负样本，以 **recall@10 ≥ 0.95、MRR ≥ 0.80、零结果率为 0、负样本必须全空** 作为护栏。检索相关改动必须过这道闸。
+
+### 运行时可观测性 —— `tests/test_metrics.py`（44 断言）
+
+- 计数 / 耗时累积、跨实例 read-merge-write 合并、达到阈值自动落盘
+- 落盘失败静默且增量不丢；`path=None` 时全操作安全
+- 各工具确实打点（写入新建 vs 覆盖、读命中 vs 未命中、检索零结果、锁获取）
+- 指标摘要确实出现在 `memory_stats` / `memory_audit`
+- `AI_MEMORY_METRICS=0` 可关闭（子进程验证）
+- **容错**：指标设施自身崩塌时，检索与统计仍然正常返回
+
+所有脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
 
 ```bash
 pip install -r requirements-dev.txt
-python tests/test_roundtrip.py
-python tests/test_tools_smoke.py
-python tests/test_p0_credentials.py
+for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 ```
 
-CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵（三个脚本）+ ruff lint。
+CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
 
-> 这三层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。
+> 这八层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。
 
 ---
 
@@ -588,6 +651,12 @@ CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 
 
 **删掉 `memory_index_*.db` 会丢数据吗？**
 不会。它只是运行时缓存，下次启动自动重建。**md 文件才是唯一事实源**。
+
+**`memory_metrics_*.json` 是什么？**
+运行时指标快照（检索零结果率、锁等待、索引重建次数等），与索引同目录。纯观测数据，删掉即从零重新累积；设 `AI_MEMORY_METRICS=0` 可不再生成。
+
+**怎么知道记忆库是不是「检索不出来」了？**
+调 `memory_stats`，看末尾「## 运行时指标」里的**零结果率**与 `memory_read` 未命中率。零结果率持续偏高通常意味着新问题落在已有记忆的覆盖范围之外，该补笔记了；索引重建次数持续增长则说明索引在反复失效，值得排查。
 
 **能在没有 Obsidian 的情况下用吗？**
 完全可以。Obsidian 只是可选的浏览/可视化方式，所有功能都由 MCP 工具提供。

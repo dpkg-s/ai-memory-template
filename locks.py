@@ -21,7 +21,13 @@ import threading
 import time
 from pathlib import Path
 
-__all__ = ["DEFAULT_LOCK_TIMEOUT", "acquire_lock", "release_lock", "reset_lock_state"]
+__all__ = [
+    "DEFAULT_LOCK_TIMEOUT",
+    "acquire_lock",
+    "release_lock",
+    "reset_lock_state",
+    "current_depth",
+]
 
 # 锁文件最长持有时间（秒）：超过视为陈旧锁并回收
 DEFAULT_LOCK_TIMEOUT = 15
@@ -78,3 +84,12 @@ def release_lock(lock_path: Path) -> None:
 def reset_lock_state() -> None:
     """清空当前线程的重入深度（仅测试用）。"""
     _lock_state.depth = 0
+
+
+def current_depth() -> int:
+    """当前线程的锁重入深度（0 表示未持锁）。
+
+    调用方据此区分「真实抢锁」与「同线程重入」——只有前者会产生等待、反映
+    并发压力，后者是纯逻辑嵌套。用于运行时指标打点，避免 lock_calls 虚高。
+    """
+    return int(getattr(_lock_state, "depth", 0))

@@ -18,6 +18,7 @@ Features:
 
 from __future__ import annotations
 
+import atexit
 import json
 import re
 import sqlite3
@@ -42,6 +43,7 @@ from mcp.server.fastmcp import FastMCP
 
 import memory_index as midx
 import locks
+import metrics
 import text_utils
 import yaml_io
 
@@ -78,8 +80,113 @@ from yaml_io import (
 
 MEMORY_DIR = Path(os.environ.get("AI_MEMORY_DIR", "~/ai-memory")).expanduser().resolve()
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-_IDX_FILE = midx.db_path(Path(__file__).resolve().parent, MEMORY_DIR)
+_SERVER_DIR = Path(__file__).resolve().parent
+_IDX_FILE = midx.db_path(_SERVER_DIR, MEMORY_DIR)
 _IDX_NEEDS_REBUILD = True
+
+# ---- 运行时指标 (2026-09-10, 《改进建议》P1 Observability) -----------
+# 只回答「服务跑得怎么样」，不回答「库里有什么」。全部异常静默、绝不阻塞主流程；
+# 可设 AI_MEMORY_METRICS=0 关闭。落盘位置与索引 db 同目录、按 MEMORY_DIR 哈希隔离。
+_METRICS_ENABLED = os.environ.get("AI_MEMORY_METRICS", "1") not in ("0", "false", "False")
+_METRICS = metrics.Metrics(
+    metrics.path_for(_SERVER_DIR, MEMORY_DIR) if _METRICS_ENABLED else None
+)
+# 正常退出时把内存里的零头也落盘（否则最后不足 FLUSH_EVERY 条事件会随进程消失）。
+# 被强杀时自然拿不到，这正是「指标允许少量丢失」的取舍——不值得为它引入信号处理。
+atexit.register(_METRICS.flush)
+
+
+def _m_inc(key: str, n: float = 1) -> None:
+    """指标计数。**永不抛异常** —— 观测绝不能成为主流程的新故障点。"""
+    try:
+        if _METRICS_ENABLED:
+            _METRICS.inc(key, n)
+    except Exception:
+        pass
+
+
+def _m_ms(key: str, ms: float) -> None:
+    """指标耗时累积。**永不抛异常**。"""
+    try:
+        if _METRICS_ENABLED:
+            _METRICS.observe_ms(key, ms)
+    except Exception:
+        pass
+
+
+def _m_search(kind: str, n_results: int, t0: float) -> None:
+    """检索类指标一次性记账：调用次数 / 耗时 / 结果数 / 零结果。
+
+    零结果率是这一层最有价值的信号——它同时反映「库里的记忆覆盖不到这个问法」
+    与「过滤条件把命中全挡掉了」两种情况，是判断检索是否退化的第一手依据。
+    """
+    try:
+        if not _METRICS_ENABLED:
+            return
+        _METRICS.inc(f"{kind}_calls")
+        _METRICS.observe_ms(f"{kind}_ms", (time.perf_counter() - t0) * 1000.0)
+        if n_results <= 0:
+            _METRICS.inc(f"{kind}_zero_results")
+        else:
+            _METRICS.inc(f"{kind}_results_total", n_results)
+    except Exception:
+        pass
+
+
+def _metrics_report_lines() -> list[str]:
+    """运行时指标摘要（供 memory_stats / memory_audit 复用）。永不抛异常。"""
+    try:
+        if not _METRICS_ENABLED:
+            return ["## 运行时指标", "- 已通过 AI_MEMORY_METRICS=0 关闭"]
+        snap = _METRICS.snapshot()
+        if not snap:
+            return ["## 运行时指标",
+                    "- （暂无采样。指标是运行时累积的：检索/读写/锁等待/索引重建各打点，"
+                    "每 50 次事件合并落盘一次）"]
+
+        lines = ["## 运行时指标"]
+
+        def _avg(sum_key: str, calls: int) -> float:
+            return (snap.get(sum_key, 0.0) / calls) if calls else 0.0
+
+        for kind, label in (("search", "memory_search"),
+                            ("smart_search", "memory_smart_search"),
+                            ("list", "memory_list")):
+            calls = int(snap.get(f"{kind}_calls", 0))
+            if not calls:
+                continue
+            zero = int(snap.get(f"{kind}_zero_results", 0))
+            hits = int(snap.get(f"{kind}_results_total", 0))
+            avg_ms = _avg(f"{kind}_ms", calls)
+            lines.append(
+                f"- {label}: 调用 {calls} 次 | 零结果 {zero} 次（{zero / calls:.0%}）"
+                f" | 命中均值 {hits / calls:.1f} 条 | 平均耗时 {avg_ms:.1f} ms"
+            )
+
+        reads = int(snap.get("read_calls", 0))
+        if reads:
+            misses = int(snap.get("read_misses", 0))
+            lines.append(f"- memory_read: 调用 {reads} 次 | 未命中 {misses} 次"
+                         f"（{misses / reads:.0%}）")
+        writes = int(snap.get("write_calls", 0))
+        if writes:
+            creates = int(snap.get("write_creates", 0))
+            updates = int(snap.get("write_updates", 0))
+            lines.append(f"- memory_write: 调用 {writes} 次（新建 {creates} / 覆盖 {updates}）")
+
+        locks = int(snap.get("lock_calls", 0))
+        if locks:
+            timeouts = int(snap.get("lock_timeouts", 0))
+            lines.append(f"- 互斥锁: 获取 {locks} 次（重入不计）"
+                         f" | 超时 {timeouts} 次 | 平均等待 {_avg('lock_wait_ms', locks):.0f} ms"
+                         "（跨进程竞争压力）")
+        rebuilds = int(snap.get("index_rebuilds", 0))
+        if rebuilds:
+            lines.append(f"- 索引重建: {rebuilds} 次"
+                         "（首次加载或损坏自愈；持续增长说明索引反复失效）")
+        return lines
+    except Exception:
+        return ["## 运行时指标", "- （指标读取失败，已忽略）"]
 
 
 # ---- SQLite 元数据索引接入 (2026-09-07) -----------------------------
@@ -113,6 +220,7 @@ def _discard_index_file() -> None:
 def _rebuild_index() -> None:
     """全量重建索引（覆盖根目录 + .archive），成功后清除脏标记。"""
     global _IDX_NEEDS_REBUILD
+    _m_inc("index_rebuilds")
     with midx.connect(_IDX_FILE) as conn:
         dirs = [MEMORY_DIR]
         a = MEMORY_DIR / ".archive"
@@ -239,8 +347,20 @@ MEMORY_LOCK = MEMORY_DIR / ".memory.lock"
 
 
 def _acquire_lock() -> bool:
-    """获取跨进程文件锁。实现见 locks.py（P3 模块化，2026-09-10）。"""
-    return locks.acquire_lock(MEMORY_LOCK)
+    """获取跨进程文件锁（含同线程重入）。实现见 locks.py（P3 模块化，2026-09-10）。
+
+    仅在**非重入**的真实抢锁路径上打点：重入是同一线程内的逻辑嵌套（如
+    memory_write -> memory_archive），既不产生等待也不反映竞争压力。
+    """
+    if locks.current_depth() > 0:
+        return locks.acquire_lock(MEMORY_LOCK)
+    t0 = time.perf_counter()
+    ok = locks.acquire_lock(MEMORY_LOCK)
+    _m_inc("lock_calls")
+    _m_ms("lock_wait_ms", (time.perf_counter() - t0) * 1000.0)
+    if not ok:
+        _m_inc("lock_timeouts")
+    return ok
 
 
 def _release_lock() -> None:
@@ -957,6 +1077,8 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         # 改进#7：写入后自动维护索引（跳过索引自身，直接写文件防递归）
         if title != "记忆索引":
             _refresh_index()
+        _m_inc("write_calls")
+        _m_inc("write_updates" if existing_path else "write_creates")
         return result_msg
     finally:
         _flush_access_counts()
@@ -978,6 +1100,7 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
     Body is truncated to max_chars (default 8000) to bound token usage;
     pass max_chars=0 to get the full body.
     """
+    _m_inc("read_calls")
     # 索引快速路径: title/stem 命中 + 文件新鲜 -> 直接读该文件, 免全库 glob+parse
     idx_hit = _resolve_title_via_index(title)
     if idx_hit is not None:
@@ -1020,7 +1143,10 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
                 body = (body[:max_chars]
                         + f"\n\n... [正文共 {len(body)} 字符，已截断至前 {max_chars}。需要完整内容请以 max_chars=0 重读]")
             return f"[{meta_str}]\n\n{body}"
+    _m_inc("read_misses")
     return f"未找到标题为 '{title}' 的记忆"
+
+
 @mcp.tool()
 def memory_rebuild_links() -> str:
     """链接一致性校验（2026-09-06 起不再重写文件/写 links 字段）。
@@ -1077,6 +1203,7 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     """
     if not keyword or not keyword.strip():
         return "错误：搜索关键词不能为空。"
+    _t0 = time.perf_counter()
     results: list[str] = []
     hidden = 0
     keyword_lower = keyword.lower()
@@ -1137,10 +1264,12 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                 )
 
     if not results:
+        _m_search("search", 0, _t0)
         return f"未找到与 '{keyword}' 相关的记忆" + _filter_hint(hidden)
 
     shown = results[:limit]
     total = len(results)
+    _m_search("search", total, _t0)
     header = f"找到 {total} 条记忆" + (f"，显示前 {limit} 条" if total > limit else "") + ":\n\n"
     return header + "\n\n".join(shown) + _filter_hint(hidden)
 
@@ -1156,6 +1285,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     status (optional): 生命周期过滤。**省略时默认排除 archived**（归档条目不再出现
     在日常列表中）；传 "any" 查看全部，传具体值精确过滤。被隐藏的条目数会在末尾提示。
     """
+    _t0 = time.perf_counter()
     entries: list[str] = []
     hidden = 0
 
@@ -1196,9 +1326,11 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
         entries.append(f"- [{created}] {title} [{tier_val}|{reads}]{source_info}{cred_info} | {tags_display}\n  {preview}")
 
     if not entries:
+        _m_search("list", 0, _t0)
         return "记忆库为空" + _filter_hint(hidden)
 
     total = len(entries)
+    _m_search("list", total, _t0)
     entries = entries[:limit]
     result = "\n".join(entries)
     if total > limit:
@@ -1479,7 +1611,11 @@ def memory_audit() -> str:
     lines.append("## 需要人工补齐")
     lines.extend(attention[:60] if attention else ["- 暂无"])
 
+    lines.append("")
+    lines.extend(_metrics_report_lines())
+
     return "\n".join(lines)
+
 
 @mcp.tool()
 def memory_index_draft() -> str:
@@ -1926,6 +2062,7 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
     scope / project (optional): 仅检索该作用域 / 项目的条目；传 "any" 表示不过滤。
     status (optional): 生命周期过滤。**省略时默认排除 archived**；传 "any" 查看全部。
     """
+    _t0 = time.perf_counter()
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
     now = datetime.now(timezone.utc)
     hidden = 0
@@ -1968,37 +2105,45 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
         body_lower = body.lower()[:2000]
         tags_lower = {t.lower() for t in tags}
 
-        score = 0.0
+        lexical = 0.0
 
         for kw in keywords:
             if kw == title_lower:
-                score += 10.0
+                lexical += 10.0
             elif kw in title_lower:
-                score += 5.0
+                lexical += 5.0
 
             if kw in tags_lower:
-                score += 4.0
+                lexical += 4.0
 
             if kw in summary_lower:
-                score += 3.0
+                lexical += 3.0
 
             body_count = body_lower.count(kw)
-            score += min(body_count, 5) * 1.0
+            lexical += min(body_count, 5) * 1.0
 
+        if lexical <= 0:
+            # 零词法命中即非候选。时间新鲜度只能作为**加权项**，不能单独决定入选：
+            # 否则任意查询都会把所有「当天更新」的条目塞进结果——搜索质量评测的
+            # 负样本用例实测过（查询「量子纠缠退相干」曾返回 10 条完全无关的记忆）。
+            continue
+
+        score = lexical
         if updated_str:
             updated_dt = _parse_dt_utc(updated_str)
             if updated_dt is not None:
                 days_since = (datetime.now(timezone.utc) - updated_dt).days
                 score += max(0, 2.0 - days_since * 0.02)
 
-        if score > 0:
-            scored.append((score, title, tier, summary[:80], source, _credential_badge(meta)))
+        scored.append((score, title, tier, summary[:80], source, _credential_badge(meta)))
 
     scored.sort(key=lambda x: -x[0])
 
     if not scored:
+        _m_search("smart_search", 0, _t0)
         return '未找到与 "{}" 相关的结果'.format(query) + _filter_hint(hidden)
 
+    _m_search("smart_search", len(scored), _t0)
     lines = ["# 搜索结果: {}".format(query), "共找到 {} 条相关记忆".format(len(scored)), ""]
     for score, title, tier, summary, source, cred in scored[:limit]:
         lines.append("- [{}] **{}** (score={:.1f}, {}){}".format(tier, title, score, source, cred))
@@ -2178,6 +2323,8 @@ def memory_stats() -> str:
     lines.append(f"## 热门标签 TOP 10")
     for tag, count in top_tags:
         lines.append(f"- {tag}: {count} 条")
+    lines.append("")
+    lines.extend(_metrics_report_lines())
     if zero_reads:
         lines.append(f"\n## 未读取条目（{len(zero_reads)} 条）")
         for title in zero_reads:

@@ -37,12 +37,33 @@ _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(messa
 logger.addHandler(_log_handler)
 logger.setLevel(logging.INFO)
 
-WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]|]+)?\]\]")
-HEAT_DECAY_LAMBDA = 0.2
-
 from mcp.server.fastmcp import FastMCP
 
 import memory_index as midx
+import locks
+import text_utils
+import yaml_io
+
+# ---- 拆分模块的别名导入 (P3 模块化, 2026-09-10) ----------------------
+# 下列函数已移入独立模块; 保留原下划线命名并通过 as 别名导入, 使本文件
+# 所有既有调用点零改动, 降低重构风险。
+from text_utils import (
+    clean_link_name as _clean_link_name,
+    days_since_utc as _days_since_utc,
+    extract_wiki_links as _extract_wiki_links,
+    heat_score as _heat_score,
+    parse_dt_utc as _parse_dt_utc,
+    safe_filename as _safe_filename,
+)
+from yaml_io import (
+    build_frontmatter as _build_frontmatter,
+    dump_yaml_frontmatter as _dump_yaml_frontmatter,
+    parse_frontmatter as _parse_frontmatter,
+    parse_yaml_frontmatter as _parse_yaml_frontmatter,
+    read_text as _read_text,
+    strip_bom as _strip_bom,
+    yaml_quote_scalar as _yaml_quote_scalar,
+)
 
 MEMORY_DIR = Path(os.environ.get("AI_MEMORY_DIR", "~/ai-memory")).expanduser().resolve()
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,15 +144,20 @@ def _resolve_title_via_index(title: str) -> Path | None:
     return None
 
 MEMORY_LOCK = MEMORY_DIR / ".memory.lock"
-LOCK_TIMEOUT = 15
+
+
+def _acquire_lock() -> bool:
+    """获取跨进程文件锁。实现见 locks.py（P3 模块化，2026-09-10）。"""
+    return locks.acquire_lock(MEMORY_LOCK)
+
+
+def _release_lock() -> None:
+    """释放跨进程文件锁。实现见 locks.py（P3 模块化，2026-09-10）。"""
+    locks.release_lock(MEMORY_LOCK)
 
 
 mcp = FastMCP("ai-memory", instructions="本地共享 Markdown 记忆库，支持多个 AI 工具读写")
 
-def _safe_filename(title: str) -> str:
-    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("._")
-    safe = safe[:80] or "memory"
-    return f"{safe}.md"
 
 def _resolve_unique_path(directory: Path, title: str) -> Path:
     """Pick a filename for a new entry, avoiding collisions with files that
@@ -159,42 +185,6 @@ def _resolve_unique_path(directory: Path, title: str) -> Path:
             return alt
         n += 1
 
-def _extract_wiki_links(body: str) -> list[str]:
-    """Extract [[wiki link]] page names from body text, deduplicated."""
-    links = WIKI_LINK_RE.findall(body)
-    seen: set[str] = set()
-    result: list[str] = []
-    for link in links:
-        normalized = link.strip()
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            result.append(normalized)
-    return result
-
-def _parse_dt_utc(value: Any) -> datetime | None:
-    """Parse an ISO datetime string, treating naive (tzinfo-less) values as UTC.
-
-    Legacy files may store ``updated``/``created`` without a timezone; comparing
-    those against ``datetime.now(timezone.utc)`` raises TypeError and is silently
-    swallowed by callers, making the entry appear stale or invisible. This helper
-    normalizes naive timestamps to UTC so all downstream comparisons work.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        dt = datetime.fromisoformat(value.strip())
-    except (ValueError, TypeError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-def _days_since_utc(value: Any) -> int:
-    """Whole days between an ISO timestamp and now (UTC); 999 if unparseable."""
-    dt = _parse_dt_utc(value)
-    if dt is None:
-        return 999
-    return (datetime.now(timezone.utc) - dt).days
 
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write text atomically: temp file in the same dir, then os.replace.
@@ -214,233 +204,6 @@ def _atomic_write_text(path: Path, content: str) -> None:
     if path.suffix == ".md":
         _idx_sync_path(path)
 
-def _heat_score(reads: int, updated_str: str) -> float:
-    """Heat score with time decay. Higher = more actively used."""
-    if not updated_str:
-        return float(reads)
-    days_since = _days_since_utc(updated_str)
-    return reads / (1 + HEAT_DECAY_LAMBDA * max(days_since, 0))
-
-def _strip_bom(text: str) -> str:
-    return text[1:] if text.startswith("\ufeff") else text
-
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8-sig")
-
-def _split_inline_list(value: str) -> list[str]:
-    items: list[str] = []
-    current: list[str] = []
-    quote: str | None = None
-
-    for ch in value:
-        if quote:
-            current.append(ch)
-            if ch == quote:
-                quote = None
-            continue
-
-        if ch in {'"', "'"}:
-            quote = ch
-            current.append(ch)
-            continue
-
-        if ch == ",":
-            items.append("".join(current).strip())
-            current = []
-            continue
-
-        current.append(ch)
-
-    if current:
-        items.append("".join(current).strip())
-
-    return items
-
-_YAML_DOUBLE_ESCAPES = {
-    "\\": "\\",
-    '"': '"',
-    "n": "\n",
-    "t": "\t",
-    "r": "\r",
-    "0": "\0",
-    "a": "\a",
-    "b": "\b",
-    "f": "\f",
-    "v": "\v",
-    "e": "\x1b",
-    " ": " ",
-}
-
-
-def _yaml_unescape_double(inner: str) -> str:
-    """Decode YAML double-quoted string escapes.
-
-    Counterpart of _yaml_quote_scalar (which escapes only \\ and ").
-    Handles the common YAML escape set so round-tripping a scalar that
-    contains backslashes (e.g. Windows paths) no longer doubles them on
-    every read-modify-write cycle. Fixes backslash snowball in summaries.
-    """
-    out: list[str] = []
-    i = 0
-    n = len(inner)
-    while i < n:
-        ch = inner[i]
-        if ch == "\\" and i + 1 < n:
-            nxt = inner[i + 1]
-            if nxt in _YAML_DOUBLE_ESCAPES:
-                out.append(_YAML_DOUBLE_ESCAPES[nxt])
-                i += 2
-                continue
-            if nxt == "x" and i + 3 < n:
-                try:
-                    out.append(chr(int(inner[i + 2:i + 4], 16)))
-                    i += 4
-                    continue
-                except ValueError:
-                    pass
-            if nxt == "u" and i + 5 < n:
-                try:
-                    out.append(chr(int(inner[i + 2:i + 6], 16)))
-                    i += 6
-                    continue
-                except ValueError:
-                    pass
-            if nxt == "U" and i + 9 < n:
-                try:
-                    out.append(chr(int(inner[i + 2:i + 10], 16)))
-                    i += 10
-                    continue
-                except ValueError:
-                    pass
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _parse_scalar(value: str) -> Any:
-    value = value.strip()
-    if not value:
-        return ""
-
-    if value in {"[]", "{}"}:
-        return [] if value == "[]" else {}
-
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [_parse_scalar(item) for item in _split_inline_list(inner)]
-
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        if value[0] == '"':
-            return _yaml_unescape_double(value[1:-1])
-        return value[1:-1]
-
-    lowered = value.lower()
-    if lowered in {"null", "~"}:
-        return None
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-
-    if re.fullmatch(r"-?\d+", value):
-        try:
-            return int(value)
-        except ValueError:
-            pass
-
-    if re.fullmatch(r"-?\d+\.\d+", value):
-        try:
-            return float(value)
-        except ValueError:
-            pass
-
-    return value
-
-def _parse_yaml_frontmatter(raw: str) -> dict[str, Any]:
-    meta: dict[str, Any] = {}
-    lines = raw.splitlines()
-    i = 0
-
-    while i < len(lines):
-        line = lines[i].rstrip()
-        stripped = line.strip()
-
-        if not stripped or stripped.startswith("#"):
-            i += 1
-            continue
-
-        if ":" not in line:
-            i += 1
-            continue
-
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        i += 1
-
-        if not key:
-            continue
-
-        if value:
-            meta[key] = _parse_scalar(value)
-            continue
-
-        if i < len(lines) and lines[i].lstrip().startswith("- "):
-            items: list[Any] = []
-            while i < len(lines):
-                item_line = lines[i]
-                item_stripped = item_line.strip()
-                if not item_stripped:
-                    i += 1
-                    continue
-                if not item_line.lstrip().startswith("- "):
-                    break
-                items.append(_parse_scalar(item_line.lstrip()[2:].strip()))
-                i += 1
-            meta[key] = items
-            continue
-
-        block: list[str] = []
-        while i < len(lines):
-            next_line = lines[i]
-            if not next_line.strip():
-                block.append("")
-                i += 1
-                continue
-            if next_line.startswith(" ") or next_line.startswith("\t"):
-                block.append(next_line.strip())
-                i += 1
-                continue
-            break
-        meta[key] = "\n".join(block).strip()
-
-    return meta
-
-def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
-    content = _strip_bom(content)
-    if not content.startswith("---"):
-        return {}, content.strip()
-
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return {}, content.strip()
-
-    raw_meta = parts[1].strip()
-    body = parts[2].lstrip("\r\n")
-
-    if not raw_meta:
-        return {}, body.strip()
-
-    try:
-        meta = json.loads(raw_meta)
-        if isinstance(meta, dict):
-            return meta, body.strip()
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-
-    return _parse_yaml_frontmatter(raw_meta), body.strip()
 
 _ACCESS_CACHE: dict[str, int] = {}  # title -> pending access_count increments
 _ACCESS_FLUSH_THRESHOLD = 10
@@ -489,50 +252,6 @@ def _maybe_auto_archive(title: str, path: Path) -> None:
     except Exception as e:
         logger.warning("_maybe_auto_archive(%s): %s", title, e)
 
-_lock_state = threading.local()  # re-entrancy depth per thread
-
-def _acquire_lock() -> bool:
-    """Cross-process file lock with staleness check.
-
-    Re-entrant within the same thread: nested acquisitions (e.g. memory_write
-    -> _maybe_auto_archive -> memory_archive) only bump a depth counter instead
-    of re-creating the lock file, which would deadlock the current design.
-    """
-    if getattr(_lock_state, "depth", 0) > 0:
-        _lock_state.depth += 1
-        return True
-    start = time.time()
-    while True:
-        try:
-            with open(MEMORY_LOCK, "x", encoding="utf-8") as f:
-                json.dump({"pid": os.getpid(), "time": time.time()}, f)
-            _lock_state.depth = 1
-            return True
-        except FileExistsError:
-            try:
-                with open(MEMORY_LOCK, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if time.time() - data.get("time", 0) > LOCK_TIMEOUT:
-                    MEMORY_LOCK.unlink(missing_ok=True)
-                    continue
-            except (json.JSONDecodeError, OSError):
-                MEMORY_LOCK.unlink(missing_ok=True)
-                continue
-            time.sleep(0.2)
-            if time.time() - start > LOCK_TIMEOUT:
-                return False
-    return False
-
-def _release_lock() -> None:
-    depth = getattr(_lock_state, "depth", 0)
-    if depth > 1:
-        _lock_state.depth = depth - 1
-        return
-    _lock_state.depth = 0
-    try:
-        MEMORY_LOCK.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 def _flush_access_counts() -> int:
     """Flush pending access_count increments to disk. Returns number of entries flushed.
@@ -707,66 +426,6 @@ def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
     _CACHE_VALID = True
     return entries
 
-def _yaml_quote_scalar(value: Any) -> str:
-    """Quote a scalar for YAML safety (handles colons, #, brackets, quotes, leading/trailing space)."""
-    s = str(value)
-    needs_quote = (
-        s == ""
-        or s.strip() != s
-        or re.search(r'[:#\[\]\{\},&*?|<>=!%@`"\']', s) is not None
-    )
-    if needs_quote:
-        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
-        return '"' + escaped + '"'
-    return s
-
-
-def _dump_yaml_frontmatter(meta: dict[str, Any]) -> str:
-    """Serialize frontmatter as YAML (Obsidian-native) instead of JSON.
-
-    Improves on the old JSON frontmatter so Obsidian property/tag/dataview
-    panels recognize the metadata (improvement #1).
-    """
-    lines: list[str] = []
-    for key, value in meta.items():
-        if isinstance(value, bool):
-            lines.append(f"{key}: {'true' if value else 'false'}")
-        elif isinstance(value, (int, float)):
-            lines.append(f"{key}: {value}")
-        elif value is None:
-            lines.append(f"{key}: null")
-        elif isinstance(value, list):
-            if not value:
-                lines.append(f"{key}: []")
-            else:
-                items = [_yaml_quote_scalar(v) for v in value]
-                lines.append(f"{key}: [{', '.join(items)}]")
-        else:
-            lines.append(f"{key}: {_yaml_quote_scalar(value)}")
-    return "\n".join(lines)
-
-
-def _build_frontmatter(title: str, tags: list[str], source: str | None, created: str | None = None,
-                       summary: str | None = None, tier: str | None = None, access_count: int = 0,
-                       links: list[str] | None = None, version: int | None = None) -> str:
-    now = datetime.now(timezone.utc).isoformat()
-    meta: dict[str, Any] = {
-        "title": title,
-        "tags": tags,
-        "created": created or now,
-        "updated": now,
-        "tier": tier or "warm",
-        "access_count": access_count,
-    }
-    if source:
-        meta["source"] = source
-    if summary:
-        meta["summary"] = summary
-    if links:
-        meta["links"] = links
-    if version is not None:
-        meta["version"] = version
-    return _dump_yaml_frontmatter(meta)
 
 def _write_memory(path: Path, title: str, tags: list[str], source: str | None, content: str,
                   created: str | None = None, summary: str | None = None,
@@ -786,10 +445,6 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
     frontmatter = _build_frontmatter(title, tags, source, created=created, summary=summary,
                                      tier=tier, access_count=access_count, links=links, version=version)
     _atomic_write_text(path, f"---\n{frontmatter}\n---\n\n{content}")
-
-def _clean_link_name(link: str) -> str:
-    """Normalize a wiki link name: strip whitespace and stray backslashes (improvement #2)."""
-    return link.strip().replace("\\", "")
 
 
 def _refresh_index() -> None:

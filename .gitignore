@@ -3,6 +3,9 @@ __pycache__/
 .memory.lock
 .DS_Store
 
+# 重构前的本地备份（不入库）
+server.bak.*
+
 # SQLite metadata index (generated at runtime by memory_index.py)
 memory_index_*.db
 memory_index_*.db-shm

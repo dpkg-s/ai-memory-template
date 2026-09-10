@@ -29,8 +29,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run round-trip regression tests
-        run: python tests/test_roundtrip.py
+      - name: Run regression tests
+        run: |
+          python tests/test_roundtrip.py
+          python tests/test_tools_smoke.py
 
   lint:
     name: Lint (ruff)
@@ -48,4 +50,4 @@ jobs:
         run: pip install ruff
 
       - name: Ruff check
-        run: ruff check server.py memory_index.py tests/
+        run: ruff check server.py memory_index.py yaml_io.py text_utils.py locks.py tests/

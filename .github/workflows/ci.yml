@@ -31,9 +31,13 @@ jobs:
 
       - name: Run regression tests
         run: |
-          python tests/test_roundtrip.py
-          python tests/test_tools_smoke.py
-          python tests/test_p0_credentials.py
+          # 自动遍历 tests/test_*.py：新增回归测试无需改 CI
+          # （tests/concurrency_worker.py 是子进程工人，不匹配该模式，不会被执行）
+          for f in tests/test_*.py; do
+            echo "::group::$f"
+            python "$f"
+            echo "::endgroup::"
+          done
 
   lint:
     name: Lint (ruff)

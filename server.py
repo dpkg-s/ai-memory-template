@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,51 +81,106 @@ _IDX_NEEDS_REBUILD = True
 # md 仍是唯一事实源; 索引只镜像元数据用于标题定位/过滤, 正文永远实时读盘。
 # 全部索引操作都 try/except 包裹: 索引故障时静默回退原 glob 全扫, 功能不降级。
 
+def _discard_index_file() -> None:
+    """丢弃索引文件（含 WAL/SHM 旁文件）。
+
+    索引定位为「运行时缓存，删掉可重建」，因此损坏时直接丢弃是最廉价且无风险的
+    恢复手段——md 文件才是唯一事实源，丢弃索引不丢任何数据。
+    """
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(_IDX_FILE) + suffix)
+        if not p.exists():
+            continue
+        try:
+            p.unlink()
+        except OSError:
+            # 文件被占用 / 安全删除策略拦截时退化为截断：0 字节文件在 SQLite 里
+            # 等同于空数据库，重新连接后会建表，同样达到「丢弃」的效果。
+            try:
+                p.write_bytes(b"")
+            except OSError:
+                pass
+
+
+def _rebuild_index() -> None:
+    """全量重建索引（覆盖根目录 + .archive），成功后清除脏标记。"""
+    global _IDX_NEEDS_REBUILD
+    with midx.connect(_IDX_FILE) as conn:
+        dirs = [MEMORY_DIR]
+        a = MEMORY_DIR / ".archive"
+        if a.exists():
+            dirs.append(a)
+
+        def _loader():
+            for d in dirs:
+                for f in d.glob("*.md"):
+                    try:
+                        meta, _ = _load_memory(f)
+                        yield f, meta
+                    except Exception:
+                        continue
+
+        midx.rebuild(conn, MEMORY_DIR, _loader)
+    _IDX_NEEDS_REBUILD = False
+    logger.info("index rebuilt: %s", _IDX_FILE.name)
+
+
 def _ensure_index() -> None:
-    """惰性全量重建(首次访问索引时). 覆盖根目录 + .archive."""
+    """惰性全量重建(首次访问索引时). 覆盖根目录 + .archive.
+
+    索引文件可能被外部截断或写入垃圾字节（磁盘故障、误操作、未完成的复制）。
+    此时 SQLite 连接会抛 DatabaseError —— 本函数丢弃损坏文件并重建一次，使索引
+    在无人干预下自愈；若重建仍失败则保持脏标记，退回全库 glob 兜底（功能不降级）。
+    """
     global _IDX_NEEDS_REBUILD
     if not _IDX_NEEDS_REBUILD:
         return
     try:
-        with midx.connect(_IDX_FILE) as conn:
-            dirs = [MEMORY_DIR]
-            a = MEMORY_DIR / ".archive"
-            if a.exists():
-                dirs.append(a)
-
-            def _loader():
-                for d in dirs:
-                    for f in d.glob("*.md"):
-                        try:
-                            meta, _ = _load_memory(f)
-                            yield f, meta
-                        except Exception:
-                            continue
-
-            midx.rebuild(conn, MEMORY_DIR, _loader)
-        _IDX_NEEDS_REBUILD = False
-        logger.info("index rebuilt: %s", _IDX_FILE.name)
+        _rebuild_index()
+        return
+    except sqlite3.DatabaseError as e:
+        logger.warning("index corrupted (%s), discarding & rebuilding: %s", _IDX_FILE.name, e)
     except Exception as e:
         logger.debug("_ensure_index failed: %s", e)
+        return
+    try:
+        _discard_index_file()
+        _rebuild_index()
+    except Exception as e:
+        logger.debug("_ensure_index: rebuild after discard failed: %s", e)
 
 
 def _idx_sync_path(path: Path) -> None:
-    """写盘成功后同步索引行(重新读 meta). 失败静默."""
+    """写盘成功后同步索引行(重新读 meta). 失败静默.
+
+    索引损坏（DatabaseError）时直接丢弃并立即重建，使写路径首次触碰即可自愈；
+    其余异常保持静默——索引是运行时缓存，故障绝不能影响主流程。
+    """
+    global _IDX_NEEDS_REBUILD
     try:
         with midx.connect(_IDX_FILE) as conn:
             meta, _ = _load_memory(path)
             midx.upsert(conn, midx.meta_to_row(MEMORY_DIR, path, meta))
             conn.commit()
+    except sqlite3.DatabaseError:
+        logger.warning("index corrupted while syncing %s; discarding", path.name)
+        _discard_index_file()
+        _IDX_NEEDS_REBUILD = True
+        _ensure_index()
     except Exception as e:
         logger.debug("_idx_sync_path %s: %s", path.name, e)
 
 
 def _idx_remove_path(path: Path) -> None:
     """文件被删除/移出库后移除索引行."""
+    global _IDX_NEEDS_REBUILD
     try:
         with midx.connect(_IDX_FILE) as conn:
             midx.remove(conn, path.relative_to(MEMORY_DIR).as_posix())
             conn.commit()
+    except sqlite3.DatabaseError:
+        # 索引损坏：标记待重建即可（少删一行无伤大雅，下次重建会纠正）
+        _IDX_NEEDS_REBUILD = True
     except Exception:
         pass
 

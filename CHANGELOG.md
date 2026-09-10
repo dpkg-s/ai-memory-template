@@ -5,6 +5,12 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Fixed
+
+- **跨进程缓存失效在 Windows 上不生效**（`_iter_entries`）：缓存失效键原先只比对记忆库**目录**的 `st_mtime`，而 Windows/NTFS 下改写已存在文件的**内容**不会更新父目录 mtime（只有新建 / 重命名 / 删除才会）——于是 Obsidian 保存、其它 MCP 客户端写入、`git` 改文件内容这类外部编辑**永远触发不了缓存重建**，服务端持续返回陈旧条目（`memory_search` / `memory_list` / `memory_audit` 均受影响），恰好命中「多 AI 工具共享同一记忆库」这一核心场景。现改为 `_vault_fingerprint()`：**目录 mtime + 逐文件 `(name, size, mtime_ns)` 指纹**，任何内容变更都会令缓存失效。147 篇规模下额外开销约 1~3 ms。
+
 ## [2.2.0] - 2026-09-10
 
 三层补强：**作用域与生命周期**（记忆该在哪个范围生效、哪条还适用）、**工程韧性**（把「多 AI 工具同时写一个库」纳入自动化测试并修复其暴露的并发缺陷）、**可观测性**（服务跑得怎么样）。

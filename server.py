@@ -462,7 +462,7 @@ _ACCESS_CACHE: dict[str, int] = {}  # title -> pending access_count increments
 _ACCESS_FLUSH_THRESHOLD = 10
 _ENTRY_CACHE: dict[str, tuple] = {}  # title -> (path, meta, body)
 _CACHE_VALID = False
-_DIR_MTIME = 0.0  # last seen MEMORY_DIR mtime, for cross-process cache invalidation
+_DIR_FINGERPRINT: tuple = ()  # last seen vault fingerprint, for cross-process cache invalidation
 _TAG_AUTO_MAP: dict[str, str] = {
     "python": "python", "py": "python", "flask": "python", "django": "python", "fastapi": "python",
     "javascript": "javascript", "js": "javascript", "typescript": "typescript", "ts": "typescript",
@@ -785,17 +785,41 @@ def _invalidate_cache() -> None:
     global _CACHE_VALID
     _CACHE_VALID = False
 
-def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
-    global _CACHE_VALID, _ENTRY_CACHE, _DIR_MTIME
-    # Cross-process invalidation: if another process (Obsidian edit, other MCP
-    # client, git operation) changed the directory since we cached, rebuild.
+def _vault_fingerprint() -> tuple:
+    """Vault fingerprint: dir mtime + per-file (name, size, mtime_ns).
+
+    On Windows/NTFS, rewriting the *content* of an existing file does NOT bump
+    the parent directory mtime — only create/rename/delete does. A dir-mtime-only
+    invalidation key therefore misses external edits (Obsidian save, another MCP
+    client writing, a git operation changing file contents) and the process keeps
+    serving stale entries. Include a file-level fingerprint so any content change
+    invalidates the cache.
+    """
     try:
-        dir_mtime = MEMORY_DIR.stat().st_mtime
+        dir_mtime = MEMORY_DIR.stat().st_mtime_ns
     except OSError:
-        dir_mtime = 0.0
-    if _CACHE_VALID and _ENTRY_CACHE and dir_mtime == _DIR_MTIME:
+        dir_mtime = 0
+    parts: list[tuple] = []
+    try:
+        for f in sorted(MEMORY_DIR.glob("*.md")):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            parts.append((f.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        pass
+    return (dir_mtime, tuple(parts))
+
+
+def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
+    global _CACHE_VALID, _ENTRY_CACHE, _DIR_FINGERPRINT
+    # Cross-process invalidation: rebuild when the vault fingerprint changed
+    # (Obsidian edit, other MCP client, git operation). See _vault_fingerprint.
+    fp = _vault_fingerprint()
+    if _CACHE_VALID and _ENTRY_CACHE and fp == _DIR_FINGERPRINT:
         return list(_ENTRY_CACHE.values())
-    _DIR_MTIME = dir_mtime
+    _DIR_FINGERPRINT = fp
     _ENTRY_CACHE.clear()
     entries: list[tuple[Path, dict[str, Any], str]] = []
     for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):

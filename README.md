@@ -560,6 +560,14 @@ CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 
 **记忆会不会越积越多？**
 配合 tier 体系与 `memory_archive_old` 自动归档，冷数据移入 `.archive/` 且原位保留摘要 stub，检索仍然可达。`memory_stats` 与 `memory_heat_suggest` 可随时体检。
 
+**调用不积极在ai个性化中加**
+
+```
+每次对话开始时，用 mcp__ai-memory__memory_search 搜索"近期工作动态"，了解最近做了什么。遇到不懂的项目或问题，直接搜相关记忆了解背景。
+每次完成实质性工作后，必须通过 MCP 工具 mcp__ai-memory__memory_write 把关键信息同步到共享记忆库 D:\ai记忆\。写入前先用 memory_search 查重。触发时机：做了技术决策、修了 bug、项目进展、我分享了新偏好、我说"记住"。这条规则每次对话自动注入，不用我再提醒
+写入具体项目笔记后须同步维护聚合笔记「近期工作动态」：先用 memory_read 读取它，在当日(YYYY-MM-DD)区块下追加一行 `- [x] 一句话摘要`；若当日区块不存在则新建 `## YYYY-MM-DD` 区块置于顶部（紧接开头说明之后），并同步更新「项目状态」表中相关行的状态。这样可避免聚合时间线滞后于各项目笔记而停更。
+```
+
 ---
 
 ## License

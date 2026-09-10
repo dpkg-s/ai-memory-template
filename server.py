@@ -253,8 +253,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
     Plain ``write_text`` truncates the target first; a crash or a concurrent
     reader can observe an empty or half-written file. Writing to a sibling
     temp file and atomically replacing avoids partial reads (fixes P0-1).
+
+    temp 名带上 pid（2026-09-10）：写操作虽已由跨进程锁串行化，但历史上有未持锁
+    的写盘路径（读路径的 access_count flush），两个进程共用同一个 ``<name>.tmp``
+    时会互相 unlink/replace 而抛 FileNotFoundError。pid 后缀使各进程的 temp 名
+    天然隔离，作为纵深防御，即使将来新增未持锁的写路径也不会互踩。
     """
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         tmp.unlink(missing_ok=True)
     except OSError:
@@ -321,9 +326,29 @@ def _flush_access_counts() -> int:
     读取操作 ≠ 内容更新——若 flush 时刷新 updated，常被检索的旧笔记会被标记
     为"今天更新"，从而架空 30 天滚动归档 / heat_score / memory_recent 的语义。
     updated 只允许在真正修改内容或元数据时由写入端更新。
+
+    P0-2 (2026-09-10, 由并发测试在 CI 上暴露): 本函数会**写盘**，因此必须与写
+    操作互斥。它由读路径（memory_read 在 pending 达阈值时）调用，而读路径本身
+    不持锁——若无锁保护，并发写同一文件会产生两种真实故障：
+      ① 两个进程共用同一个 ``<name>.md.tmp`` → 互相 unlink/replace，
+         抛 FileNotFoundError（CI 实测复现）；
+      ② 读侧用「读盘快照」整体覆盖文件，可能吞掉写侧刚提交的正文（lost update）。
+    写路径（memory_write 的 finally）调用本函数时已持锁，靠 locks 的可重入性
+    零成本复用；读路径则在此真正获取锁——flush 每 10 次读才触发一次，开销可忽略。
+    拿不到锁时保持 pending 返回 0，下次再 flush，绝不无锁写盘。
     """
     if not _ACCESS_CACHE:
         return 0
+    if not _acquire_lock():
+        return 0
+    try:
+        return _flush_access_counts_locked()
+    finally:
+        _release_lock()
+
+
+def _flush_access_counts_locked() -> int:
+    """写回 access_count（调用方必须已持有跨进程锁）。"""
     flushed = 0
     for f in MEMORY_DIR.glob("*.md"):
         try:

@@ -261,7 +261,7 @@ _d_writes = _d_res[1:]
 
 check("D1 读循环子进程无异常", _d_read["ok"], f"{_d_read.get('error')}")
 _d_w_err = [r.get("error") for r in _d_writes if not r["ok"]]
-check("D2 并发写子进程无异常（Windows 原子替换未被读阻塞）", not _d_w_err, f"{_d_w_err}")
+check("D2 并发写子进程无异常（写盘与读侧 flush 不互踩）", not _d_w_err, f"{_d_w_err}")
 _reads = _d_read.get("reads", [])
 check("D3 读循环返回 300 次结果", len(_reads) == 300, f"实际 {len(_reads)}")
 check("D4 无任何空读取", all(bool(r.strip()) for r in _reads),
@@ -274,6 +274,12 @@ check("D6 每次读取的正文长度均完整（>=2000 字节填充）",
 _marks = {r.split("[END-")[-1].split("]")[0] for r in _reads if "[END-" in r}
 check("D7 读到的版本号均为合法轮次（0~3）",
       _marks.issubset({"0", "1", "2", "3"}), f"marks={_marks}")
+# 读循环会周期性触发 access_count flush（写盘副作用），必须与写进程互斥。
+# 修复前该路径未持锁，两个进程共用同一个 <name>.tmp 互相 unlink，CI 实测报
+# FileNotFoundError；此断言是该缺陷的回归护栏。
+check("D8 读写并发后无 .tmp 残留（读侧 flush 与写侧未互踩）",
+      not list(server.MEMORY_DIR.rglob("*.tmp")),
+      f"{[p.name for p in server.MEMORY_DIR.rglob('*.tmp')][:3]}")
 
 # =====================================================================
 section("场景 E · 收尾对账（锁残留 / 索引一致性）")

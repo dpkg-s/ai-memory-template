@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
 [![Tests](https://img.shields.io/badge/tests-77%20assertions-brightgreen)](#测试与-ci)
@@ -118,6 +118,32 @@ verified_at: 2026-09-10
 ```
 
 **两种来源不混淆**：AI 自行推断写入的内容应保持 `verified: false`，只有用户明确陈述或经核验才置 `true`。旧笔记无需迁移 —— 读取时自动按 `fact` / `medium` / 未核验处理，被写入时才渐进补齐。
+
+### 作用域与生命周期
+
+一条记忆除了「可信吗」，还要回答「在什么范围内生效」「现在还作不作数」：
+
+| 字段 | 取值 | 说明 |
+|------|------|------|
+| `scope` | `global` / `project` / `temporary` | 生效范围；配 `project` 标识可做项目级隔离 |
+| `status` | `candidate` / `active` / `stale` / `deprecated` / `archived` | 生命周期状态 |
+| `supersedes` | 标题 | 本条结论取代了哪条旧记忆 |
+| `conflicts` | 标题列表 | 与之矛盾的条目 |
+| `source_context` | 字符串 | 写入方上下文（哪个客户端写的） |
+
+```yaml
+---
+title: 项目_xxx_索引层定案
+scope: project
+project: xxx
+status: active
+supersedes: 项目_xxx_旧索引方案
+---
+```
+
+**检索默认隐藏 `archived`**，但 `stale` / `deprecated` 仍会返回 —— 「过时」不等于「不该看见」，读者需要知道旧结论存在、以及什么取代了它。`memory_archive` / `memory_restore` 会自动联动 `status`。
+
+> **只做字段层，不做目录分层**：不按 `global/ projects/ temporary/` 拆分目录。检索走的是非递归 `glob`，搬文件即脱离检索；用字段过滤能达到同样的隔离效果，且不动你已有的笔记组织方式。
 
 ### 显式双链，关系可追溯
 
@@ -312,22 +338,22 @@ args = ["/path/to/ai-memory/server.py"]
 
 | 工具 | 签名 | 说明 |
 |------|------|------|
-| `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁与可信度标记 |
+| `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁、可信度与作用域/生命周期标记 |
 | `memory_read` | `(title, max_chars=8000)` | 按标题精确读取（含文件名回退，可命中 `.archive`）。默认截断正文 8000 字符，`max_chars=0` 取全文 |
 | `memory_delete` | `(title, trash=True, purge=False)` | 删除。默认软删到 `.trash` 可恢复，`purge=True` 永久删除 |
-| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?)` | 只改 frontmatter 元数据（含可信度字段），不重写正文 |
+| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?)` | 只改 frontmatter 元数据（含可信度、作用域、生命周期字段），不重写正文。传空串 / 空列表可清除 |
 | `memory_recent` | `(days=7, limit=20)` | 列出近 N 天更新的记忆，最新优先 |
 
 ### 查询
 
 | 工具 | 说明 |
 |------|------|
-| `memory_search(keyword, tag?, limit=20, mem_type?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮，可按标签或类型过滤 |
-| `memory_smart_search(query, tag?, limit=10, mem_type?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，额外加时效性加分 |
-| `memory_list(tag?, limit=20, tier?, mem_type?)` | 罗列记忆摘要 |
+| `memory_search(keyword, tag?, limit=20, mem_type?, scope?, project?, status?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮；可按标签 / 类型 / 作用域 / 项目过滤。**省略 `status` 时默认隐藏 `archived`**，隐藏条数会在末尾提示 |
+| `memory_smart_search(query, tag?, limit=10, mem_type?, scope?, project?, status?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，另加时效性加权。**零词法命中即非候选**，时效性不能单独决定入选 |
+| `memory_list(tag?, limit=20, tier?, mem_type?, scope?, project?, status?)` | 罗列记忆摘要，过滤语义同上 |
 | `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链与反向链接图谱，默认截断 10 条 |
 | `memory_orphans()` | 查找没有任何笔记引用的孤立笔记 |
-| `memory_stats()` | 健康度统计：各 tier 数量、记忆类型分布、可信度分布、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数 |
+| `memory_stats()` | 健康度统计：各 tier 数量、记忆类型 / 可信度 / 作用域 / 生命周期 / 写入方上下文 / 结构版本分布、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数，以及**运行时指标**（检索零结果率 / 锁等待 / 索引重建） |
 
 ### 维护
 

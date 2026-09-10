@@ -90,6 +90,7 @@ class Metrics:
         if self.path is None:
             return
         delta: dict[str, float] = {}
+        tmp: Path | None = None
         try:
             with self._lock:
                 if not self._counters and not force:
@@ -107,6 +108,14 @@ class Metrics:
             os.replace(tmp, self.path)
             self._persisted = merged
         except Exception:
+            # 替换失败（Windows 上目标文件被占用是常见原因）会留下 .tmp 孤儿。
+            # 这里顺手清掉——指标层不做重试：观测不值得为一次写盘去阻塞主流程，
+            # 增量已回收到内存，下次 flush 会重写。
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
             try:
                 with self._lock:
                     for k, v in delta.items():

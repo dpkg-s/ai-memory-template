@@ -114,6 +114,9 @@ except Exception as e:  # pragma: no cover - 失败即测试失败
     print(f"     unexpected: {e!r}")
 check("M5a 落盘失败不抛异常", _ok5)
 check("M5b 失败后增量仍在内存（下次可重试）", _m5.snapshot().get("y") == 7)
+_orphans = list(_sandbox.glob(f"{_bad.name}.*.tmp"))
+check("M5c 落盘失败不残留 .tmp 孤儿文件", not _orphans,
+      f"残留: {[p.name for p in _orphans]}")
 
 # =====================================================================
 section("M6 · path_for 按记忆库隔离")

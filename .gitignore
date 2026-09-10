@@ -19,4 +19,4 @@ SHA256SUMS.txt
 
 # 运行时指标快照 (generated at runtime by metrics.py)
 # 与索引同目录、按 MEMORY_DIR 哈希隔离；纯观测数据，删掉即从零重新累积。
-memory_metrics_*.json
+memory_metrics_*.json*

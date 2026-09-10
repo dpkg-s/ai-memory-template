@@ -1,0 +1,8 @@
+# 统一换行符：代码/配置/CI 文件强制 LF，避免 Windows CRLF 污染
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.json text eol=lf

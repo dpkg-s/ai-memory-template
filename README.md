@@ -3,6 +3,7 @@
 > 跨 AI 工具共享长期记忆 — 让你的ai工具无需复杂的环境共用同一个大脑 — 可视化记忆
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![CI](https://github.com/dpkg-s/ai-memory-template/workflows/CI/badge.svg)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![MCP](https://img.shields.io/badge/MCP-1.27-green)
 
@@ -100,7 +101,8 @@ AI 写入时自动处理，同时支持手动标注关联：
 ### 环境要求
 
 - Python 3.10+
-- 安装 `mcp` 包：`pip install mcp`
+- 安装依赖：`pip install -r requirements.txt`（仅 `mcp>=1.27`）
+- 开发/测试额外依赖：`pip install -r requirements-dev.txt`（pytest + ruff）
 
 ### 一键安装
 
@@ -139,7 +141,7 @@ irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.p
 ```bash
 git clone https://github.com/dpkg-s/ai-memory-template.git
 cd ai-memory-template
-pip install mcp
+pip install -r requirements.txt
 bash install.sh    # Linux/macOS
 .\install.ps1     # Windows
 ```
@@ -383,7 +385,14 @@ ai-memory-template/
 ├── memory_index.py         # SQLite 元数据索引模块（标题 O(1) 定位）
 ├── install.ps1             # Windows 一键安装脚本
 ├── install.sh              # Linux/macOS 一键安装脚本
+├── requirements.txt        # 运行时依赖（mcp）
+├── requirements-dev.txt    # 开发/测试依赖（pytest + ruff）
+├── ruff.toml               # ruff lint 配置（聚焦真实错误 F 系列）
 ├── LICENSE                 # MIT 许可证
+├── tests/                  # 回归测试（round-trip / 反斜杠雪崩 / 索引层）
+│   └── test_roundtrip.py
+├── .github/workflows/      # CI（pytest 矩阵 + ruff lint）
+│   └── ci.yml
 ├── setup/                  # 各平台的 MCP 配置模板
 │   ├── codex.toml
 │   ├── claude.json
@@ -397,6 +406,28 @@ ai-memory-template/
     ├── 记忆写入格式规范.md
     └── Git版本控制规范.md
 ```
+
+---
+
+## 测试
+
+`tests/test_roundtrip.py` 是回归测试脚本（退出码 0 = 全绿，1 = 有失败），覆盖：
+
+- frontmatter 写→读无损 round-trip（中文标题 / 多行 / tags 特殊字符 / 类型保持）
+- Windows 路径反斜杠不雪崩（连续 5 轮 update 回归）
+- `memory_read` 不污染 `updated`（P0-1 修复）
+- `max_chars` 截断语义
+- 文件名非法字符安全
+- SQLite 索引层（写入命中 / read 走索引 / miss 回退 / 外部改动自愈 / delete 清理）
+
+测试会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实的记忆库**。运行：
+
+```bash
+pip install -r requirements-dev.txt
+python tests/test_roundtrip.py
+```
+
+CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵 + ruff lint。
 
 ---
 

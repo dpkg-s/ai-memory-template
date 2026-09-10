@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ai-memory-template installer for Linux/macOS
 
 set -e

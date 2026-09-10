@@ -3,9 +3,12 @@
 > 跨 AI 工具共享长期记忆 — 让你的ai工具无需复杂的环境共用同一个大脑 — 可视化记忆
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![CI](https://github.com/dpkg-s/ai-memory-template/workflows/CI/badge.svg)
+[![CI](https://github.com/dpkg-s/ai-memory-template/workflows/CI/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![MCP](https://img.shields.io/badge/MCP-1.27-green)
+![MCP](https://img.shields.io/badge/MCP-1.x-green)
+
+> 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -381,17 +384,22 @@ clone 完成即可使用，所有 AI 的记忆自动同步。
 ```
 ai-memory-template/
 ├── README.md               # 本文档
-├── server.py               # MCP 服务器（~1940 行）
+├── CHANGELOG.md            # 版本变更记录
+├── server.py               # MCP 服务器：20 个工具注册 + 存储层 + 业务逻辑（~1600 行）
 ├── memory_index.py         # SQLite 元数据索引模块（标题 O(1) 定位）
+├── yaml_io.py              # YAML frontmatter 解析/序列化（无状态纯函数层）
+├── text_utils.py           # 文本/时间/热度工具（无状态纯函数层）
+├── locks.py                # 跨进程文件锁（线程内可重入 + 抗陈旧锁）
 ├── install.ps1             # Windows 一键安装脚本
 ├── install.sh              # Linux/macOS 一键安装脚本
 ├── requirements.txt        # 运行时依赖（mcp）
 ├── requirements-dev.txt    # 开发/测试依赖（pytest + ruff）
 ├── ruff.toml               # ruff lint 配置（聚焦真实错误 F 系列）
 ├── LICENSE                 # MIT 许可证
-├── tests/                  # 回归测试（round-trip / 反斜杠雪崩 / 索引层）
-│   └── test_roundtrip.py
-├── .github/workflows/      # CI（pytest 矩阵 + ruff lint）
+├── tests/                  # 测试（语义回归 + 全工具冒烟）
+│   ├── test_roundtrip.py   # 28 断言：写读无损 / 反斜杠 / 截断 / 索引层
+│   └── test_tools_smoke.py # 25 断言：20 个工具全量可调用 + 注册完整性
+├── .github/workflows/      # CI（Python 矩阵跑测试 + ruff lint）
 │   └── ci.yml
 ├── setup/                  # 各平台的 MCP 配置模板
 │   ├── codex.toml
@@ -411,7 +419,9 @@ ai-memory-template/
 
 ## 测试
 
-`tests/test_roundtrip.py` 是回归测试脚本（退出码 0 = 全绿，1 = 有失败），覆盖：
+测试分两层，互为补充：**语义正确性**（写读是否无损）与**覆盖面**（工具是否都能用）。
+
+### 1. 语义回归 — `tests/test_roundtrip.py`（28 断言）
 
 - frontmatter 写→读无损 round-trip（中文标题 / 多行 / tags 特殊字符 / 类型保持）
 - Windows 路径反斜杠不雪崩（连续 5 轮 update 回归）
@@ -420,14 +430,22 @@ ai-memory-template/
 - 文件名非法字符安全
 - SQLite 索引层（写入命中 / read 走索引 / miss 回退 / 外部改动自愈 / delete 清理）
 
-测试会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实的记忆库**。运行：
+### 2. 全工具冒烟 — `tests/test_tools_smoke.py`（25 断言）
+
+- 20 个 MCP 工具逐一调用，验证不抛异常且返回正常
+- 工具注册完整性：数量为 20、集合与预期完全一致（防重构时漏注册或误覆盖）
+
+两个脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实的记忆库**。运行：
 
 ```bash
 pip install -r requirements-dev.txt
 python tests/test_roundtrip.py
+python tests/test_tools_smoke.py
 ```
 
-CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵 + ruff lint。
+CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵（两个脚本）+ ruff lint。
+
+> 这两层测试是 `server.py` 能够安全模块化重构（P3）的前提：先有测试护航，再做结构调整。
 
 ---
 

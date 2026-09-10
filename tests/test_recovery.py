@@ -29,7 +29,6 @@ from __future__ import annotations
 import gc
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -346,16 +345,10 @@ _n2 = len(index_relpaths())
 check("R8 连续两次重建结果稳定（幂等且非空）", _n1 == _n2 and _n1 > 0, f"{_n1} vs {_n2}")
 
 # =====================================================================
-# cleanup
-shutil.rmtree(_TMP, ignore_errors=True)
-shutil.rmtree(_ART, ignore_errors=True)
-gc.collect()
-for _p in (server._IDX_FILE, Path(str(server._IDX_FILE) + "-wal"),
-           Path(str(server._IDX_FILE) + "-shm")):
-    try:
-        _p.unlink(missing_ok=True)
-    except OSError:
-        pass
+# cleanup：刻意不做目录级删除（rmtree）。
+# 原因同 test_concurrency.py：受限环境会把批量删除升级为需授权的操作甚至终止进程，
+# 那会让测试在收尾阶段失败、掩盖真实断言结果。临时库位于系统 temp，交给操作系统回收。
+print("\n(临时目录保留在系统 temp 下，不做批量删除：受限环境会拦截目录级删除)")
 
 print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")
 if _failed:

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -178,7 +177,7 @@ _b_jobs = [{"op": "write", "tag": f"b{i}", "title": TITLES_B[i],
 _b_res = run_parallel(_b_jobs)
 
 check("B1 10 个子进程全部成功", all(r["ok"] and "已创建记忆" in r.get("result", "") for r in _b_res),
-      f"{[(r['ok'], r.get('result', '')[:24]) for r in _b_res]}")
+      f"失败详情={[(r.get('result', '')[:30], r.get('error')) for r in _b_res if not (r['ok'] and '已创建记忆' in r.get('result', ''))]}")
 _b_missing = [t for t in TITLES_B if load_meta(t)[0] is None]
 check("B2 10 个文件全部落盘", not _b_missing, f"缺失={_b_missing}")
 
@@ -309,15 +308,12 @@ check("E6 索引条目数 == 磁盘文件数", len(_rows) == len(_disk),
       f"索引={len(_rows)} 磁盘={len(_disk)}")
 
 # =====================================================================
-# cleanup：临时库 + 临时索引 db（运行时缓存，删掉可重建）
-shutil.rmtree(_TMP, ignore_errors=True)
-shutil.rmtree(_ART, ignore_errors=True)
-for _p in (server._IDX_FILE, Path(str(server._IDX_FILE) + "-wal"),
-           Path(str(server._IDX_FILE) + "-shm")):
-    try:
-        _p.unlink(missing_ok=True)
-    except OSError:
-        pass
+# cleanup：刻意不做目录级删除（rmtree）。
+# 原因：部分受限环境（企业安全删除策略 / 沙箱 / DLP）会把「批量删除」升级为需
+# 人工授权的操作，甚至直接终止调用进程——那会让测试在收尾阶段失败，从而掩盖真实
+# 的断言结果。临时库位于系统 temp 目录且体积极小，交给操作系统回收即可；仓库目录
+# 下的索引 db 已被 .gitignore 覆盖，不污染版本库。
+print("\n(临时目录保留在系统 temp 下，不做批量删除：受限环境会拦截目录级删除)")
 
 print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")
 if _failed:

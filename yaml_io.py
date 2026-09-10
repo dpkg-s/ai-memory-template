@@ -34,6 +34,11 @@ __all__ = [
     "DEFAULT_MEMORY_TYPE",
     "DEFAULT_CONFIDENCE",
     "DEFAULT_VERIFIED",
+    "SCOPES",
+    "DEFAULT_SCOPE",
+    "LIFECYCLE_STATUSES",
+    "DEFAULT_STATUS",
+    "SCHEMA_VERSION",
 ]
 
 # ── P0 可信度字段取值域（2026-09-10） ─────────────────────────────────────
@@ -55,6 +60,27 @@ CONFIDENCE_LEVELS = ("high", "medium", "low")
 DEFAULT_MEMORY_TYPE = "fact"
 DEFAULT_CONFIDENCE = "medium"
 DEFAULT_VERIFIED = False
+
+# ── P1 作用域 / 生命周期 / 冲突字段取值域（2026-09-10） ───────────────────
+# scope 解决「项目记忆污染其他项目」。**只做字段层，不做目录分层**：
+# 目录分层（global/ projects/ temporary/）会打散既有 143+ 篇笔记的组织方式，
+# 且 server 的 15 处 glob 全为非递归，搬文件即脱离检索；字段层同样能满足
+# 「项目记忆不干扰其他项目」，且零迁移、可随时回退。
+SCOPES = ("global", "project", "temporary")
+DEFAULT_SCOPE = "global"
+
+# status 是**生命周期**维度，与 verified（可信度）正交，不可互相替代：
+#   candidate  候选 / 草稿，尚未确认
+#   active     生效中（默认）
+#   stale      可能过期，待复核（仍参与检索，但排序靠后）
+#   deprecated 已被取代（通常由 supersedes 指向它的条目出现）
+#   archived   已归档（冷存；默认不参与检索，需显式查询）
+LIFECYCLE_STATUSES = ("candidate", "active", "stale", "deprecated", "archived")
+DEFAULT_STATUS = "active"
+
+# frontmatter 结构版本：旧笔记缺失该字段时按 1 对待，被写入时升到 2。
+# 目的是给将来的结构迁移留下判定依据，而不是现在就要求全库迁移。
+SCHEMA_VERSION = 2
 
 
 def strip_bom(text: str) -> str:
@@ -339,12 +365,20 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
                       summary: str | None = None, tier: str | None = None, access_count: int = 0,
                       links: list[str] | None = None, version: int | None = None,
                       mem_type: str | None = None, confidence: str | None = None,
-                      verified: bool | None = None, verified_at: str | None = None) -> str:
+                      verified: bool | None = None, verified_at: str | None = None,
+                      scope: str | None = None, project: str | None = None,
+                      status: str | None = None, supersedes: str | None = None,
+                      conflicts: list[str] | None = None,
+                      source_context: str | None = None) -> str:
     """构造 frontmatter 文本（含 title/tags/created/updated/tier/access_count 等）。
 
-    P0 可信度字段（type/confidence/verified）**总是写出**，非法或缺失值回落到
-    模块级默认（fact / medium / false），使新笔记自带语义标签；旧笔记则在下次
-    被写入时渐进补齐（读取端的默认值注入见 server._apply_meta_defaults）。
+    P0 可信度字段（type/confidence/verified）与 P1 生命周期字段
+    （scope/status/schema_version）**总是写出**，非法或缺失值回落到模块级默认，
+    使新笔记自带完整语义标签；旧笔记则在下次被写入时渐进补齐（读取端的默认值
+    注入见 server._apply_meta_defaults）。
+
+    按需写出的字段（project / supersedes / conflicts / source_context）只在有值时
+    出现，避免给绝大多数条目增加无意义的空行。
     """
     now = datetime.now(timezone.utc).isoformat()
     meta: dict[str, Any] = {
@@ -358,6 +392,19 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
         "confidence": confidence if confidence in CONFIDENCE_LEVELS else DEFAULT_CONFIDENCE,
         "verified": bool(verified) if verified is not None else DEFAULT_VERIFIED,
     }
+    if verified_at:
+        meta["verified_at"] = verified_at
+    meta["scope"] = scope if scope in SCOPES else DEFAULT_SCOPE
+    if project:
+        meta["project"] = project
+    meta["status"] = status if status in LIFECYCLE_STATUSES else DEFAULT_STATUS
+    meta["schema_version"] = SCHEMA_VERSION
+    if supersedes:
+        meta["supersedes"] = supersedes
+    if conflicts:
+        meta["conflicts"] = conflicts
+    if source_context:
+        meta["source_context"] = source_context
     if source:
         meta["source"] = source
     if summary:
@@ -366,6 +413,4 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
         meta["links"] = links
     if version is not None:
         meta["version"] = version
-    if verified_at:
-        meta["verified_at"] = verified_at
     return dump_yaml_frontmatter(meta)

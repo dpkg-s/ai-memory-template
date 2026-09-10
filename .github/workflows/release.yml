@@ -1,0 +1,61 @@
+# 打 tag（v*）时自动发布 Release，并把 SHA256 校验和写进 Release 说明 + 作为附件上传。
+#
+# 为什么放在这里而不是把 SHA256SUMS.txt 提交进仓库：
+#   提交进仓库的哈希清单一旦忘记更新就会静默过期 —— 用户按它核对却对不上，
+#   只会得出「文件被篡改」的错误结论。由 tag 触发即时生成，则永远与所发布的
+#   代码一致，不存在过期问题。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release with checksums
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests before publishing
+        run: |
+          pip install -r requirements-dev.txt
+          for f in tests/test_*.py; do
+            echo "::group::$f"
+            python "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Generate SHA256SUMS
+        run: python scripts/make_checksums.py
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --title "$TAG" --generate-notes
+          {
+            gh release view "$TAG" --json body -q .body
+            printf '\n\n## SHA256 校验和\n\n'
+            printf '下载 `install.sh` / `install.ps1` 前可先核对哈希：\n\n'
+            printf '```\n'
+            cat SHA256SUMS.txt
+            printf '```\n\n'
+            printf '校验方式：\n\n'
+            printf '```bash\nsha256sum install.sh          # macOS: shasum -a 256 install.sh\n```\n\n'
+            printf '```powershell\nGet-FileHash install.ps1 -Algorithm SHA256\n```\n'
+          } > release_body.md
+          gh release edit "$TAG" --notes-file release_body.md
+          gh release upload "$TAG" SHA256SUMS.txt --clobber

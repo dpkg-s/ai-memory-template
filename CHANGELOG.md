@@ -59,6 +59,16 @@
   「当天更新」的条目塞进结果（负样本用例实测：查询「量子纠缠退相干」返回 10 条完全无关的记忆）。
   现改为零词法命中即非候选，新鲜度只作加权项。
 
+### Security
+
+- **修复两个安装脚本的真实缺陷**：
+  - `pip install mcp` **未带版本上界** —— 会装上 mcp 2.x，而 2.x 已把 `FastMCP` 更名为 `MCPServer`，装完启动即 `ImportError`。现固定为 `mcp>=1.27,<2`
+  - **只复制 `server.py`、不复制依赖模块** —— `server.py` 依赖 `memory_index` / `yaml_io` / `text_utils` / `locks` / `metrics`，按原脚本装完必然启动失败。现改为整组复制
+- **安装脚本顶部加安全声明**：明确列出脚本会做的三件事、不会做的事（不读写你的其他文件、不改 shell 配置或注册表、不请求 sudo/管理员权限、不常驻、除 pip 装依赖外不联网）
+- **README 安装章节改为三种方式对比**：下载后审阅再执行（推荐）/ 一行管道执行 / clone 后本地运行，并明确提示管道执行看不到脚本内容
+- **发布链路加入 SHA256 校验**：新增 `.github/workflows/release.yml`，打 `v*` tag 时**先跑完全部测试**再发布 Release，并把各文件的 SHA256 写进 Release 说明 + 作为附件上传（`scripts/make_checksums.py` 生成）。哈希取自 git blob 字节而非工作区 —— 仓库用 `.gitattributes` 把 `*.sh` / `*.py` 强制为 LF，而 Windows 工作区是 CRLF，直接哈希工作区文件会得出与用户下载内容不同的结果
+- 新增环境变量 `AI_MEMORY_SKIP_PIP=1`（依赖已就绪时跳过脚本里的 pip），安装脚本支持 `AI_MEMORY_DIR` 指定记忆库目录
+
 ### Changed
 
 - **CI 测试步骤改为遍历 `tests/test_*.py`**：新增回归测试无需再改 CI（子进程工人

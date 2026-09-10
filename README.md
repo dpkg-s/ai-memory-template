@@ -171,21 +171,55 @@ https://github.com/dpkg-s/ai-memory-template
 5. 告诉我怎么验证它是否正常工作
 ```
 
-### 方式二：一键脚本
+### 方式二：安装脚本
+
+脚本会依次：安装 `mcp` 包（`mcp>=1.27,<2`）→ 创建 `~/ai-memory/` → 复制初始模板与规则 → 复制 `server.py` 及其依赖模块 → 打印各平台的 MCP 配置片段。
+
+**安装脚本会改动你的系统状态，请选择你愿意承担的方式：**
+
+| 方式 | 命令 | 适用 |
+|------|------|------|
+| 下载后审阅再执行（**推荐**） | 见下方 | 想先看清脚本做了什么 |
+| 一行管道执行（最省事） | `curl -sSL ... \| bash` / `irm ... \| iex` | 已信任本仓库，或只是快速试一下 |
+| clone 后本地运行 | `git clone ... && bash install.sh` | 想同时保留完整的源码与测试 |
 
 **macOS / Linux：**
 
 ```bash
+# 推荐：先下载、读一遍，确认无误再执行
+curl -sSLO https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.sh
+less install.sh
+bash install.sh
+
+# 或者：一行管道执行（看不到脚本内容，谨慎使用）
 curl -sSL https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.sh | bash
 ```
 
 **Windows PowerShell：**
 
 ```powershell
+# 推荐：先下载、读一遍，确认无误再执行
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.ps1 -OutFile install.ps1
+Get-Content install.ps1
+.\install.ps1
+
+# 或者：一行管道执行（看不到脚本内容，谨慎使用）
 irm https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.ps1 | iex
 ```
 
-脚本会依次：安装 `mcp` 包 → 创建 `~/ai-memory/` → 复制初始模板文件 → 打印各平台的 MCP 配置片段。
+**脚本行为声明**（两个脚本顶部都有同样的注释块，可自行核对）：只做三件事 —— 用 pip 装 `mcp`、创建记忆库目录并写入模板、把 `server.py` 与依赖模块复制过去。**不会**读写你的其他文件、不会修改 shell 配置或注册表、不请求 sudo/管理员权限、不在后台常驻、除 pip 装依赖外不联网。
+
+**校验完整性**：每次打 tag 发布时，Release 说明里会自动附上各文件的 SHA256（由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在发布前跑完全部测试后生成）。把下载到的文件哈希与之比对：
+
+```bash
+sha256sum install.sh                       # macOS: shasum -a 256 install.sh
+```
+
+```powershell
+Get-FileHash install.ps1 -Algorithm SHA256
+```
+
+可用环境变量：`AI_MEMORY_DIR`（指定记忆库目录）、`AI_MEMORY_SKIP_PIP=1`（依赖已就绪、跳过 pip）。
 
 ### 方式三：手动安装
 
@@ -537,8 +571,11 @@ ai-memory-template/
 │   ├── test_recovery.py          # 35 断言：索引损坏 / 锁残留 / 进程强杀 / 畸形文件
 │   ├── test_search_quality.py    #  7 断言：检索质量护栏（recall@10 / MRR / 零结果率）
 │   └── test_metrics.py           # 44 断言：运行时可观测性
+├── scripts/
+│   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
 ├── .github/workflows/
-│   └── ci.yml               # CI：Python 矩阵测试 + ruff lint
+│   ├── ci.yml               # CI：Python 矩阵测试 + ruff lint
+│   └── release.yml          # 打 tag 时先跑全量测试，再发布 Release 并附 SHA256
 │
 ├── setup/                   # 各客户端 MCP 配置模板
 │   ├── workbuddy.json

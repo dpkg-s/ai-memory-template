@@ -12,6 +12,11 @@ server.bak.*
 # 对删除动作的拦截）。
 memory_index_*.db*
 
+# Release 校验和：由 .github/workflows/release.yml 在打 tag 时即时生成。
+# 刻意不提交进仓库 —— 提交的哈希清单一旦忘记更新就会静默过期，
+# 用户按它核对却对不上，只会误判为「文件被篡改」。
+SHA256SUMS.txt
+
 # 运行时指标快照 (generated at runtime by metrics.py)
 # 与索引同目录、按 MEMORY_DIR 哈希隔离；纯观测数据，删掉即从零重新累积。
 memory_metrics_*.json

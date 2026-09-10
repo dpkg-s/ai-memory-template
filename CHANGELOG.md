@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-10
+
+引入**记忆可信度字段**，区分「用户明说的事实」与「AI 自行推断」，遏制 Memory Poisoning（AI 推测被写入后被后续会话当成事实复用）。
+
+### Added
+
+- **记忆可信度字段**：frontmatter 新增 `type` / `confidence` / `verified` / `verified_at`
+  - `type`：9 种取值 —— `fact`（事实）/ `preference`（偏好）/ `decision`（决策）/ `experience`（经验）/ `episodic`（事件）/ `project`（项目）/ `constraint`（约束）/ `workflow`（工作流）/ `temporary`（临时）
+  - `confidence`：`high` / `medium` / `low`
+  - `verified` + `verified_at`：是否已由用户确认或事实核验。置 `true` 自动记录当日日期，置 `false` 自动清除日期（避免「未验证却有验证日期」的矛盾态）
+  - **零迁移向后兼容**：读取端为不含新字段的历史笔记注入默认值（`fact` / `medium` / `false`），磁盘文件保持原样，仅在下次被显式写入时渐进补齐 —— 无需一次性全库迁移
+- **`memory_write` / `memory_update_metadata` 新增参数**：`mem_type` / `confidence` / `verified`。非法取值直接拒绝并提示合法取值；更新未传字段时继承磁盘原值，不会把已有可信度重置为默认
+- **`memory_search` / `memory_list` / `memory_smart_search` 新增 `mem_type` 过滤**
+- **搜索结果行内可信度徽章**：形如 ` | type=decision conf=high ✓verified`，一行摘要即可判断来源与可信度，无需逐条读取
+- **`memory_stats` 新增两节统计**：记忆类型分布、可信度分布（含已核验计数）
+- **记忆可信度专项测试**（`tests/test_p0_credentials.py`）：24 条断言，覆盖写入落盘 / 更新继承 / 非法值拒绝 / 历史笔记兼容 / 检索过滤 / 统计 / 序列化边界
+
 ### Changed
 
 - **README 全量重写**：改为以仓库名 `ai-memory-template` 为标题（原为「多平台AI融合记忆库」，与仓库名不一致）；新增目录导航与「实际使用效果」对话示例；补充 FAQ 与「写入即自动化」「工程化保障」特性说明；工具速查表补齐全部真实默认参数
@@ -14,6 +31,12 @@
   - 依赖约束原写 `mcp>=1.27`，实际已锁定为 `mcp>=1.27,<2`（并补充 mcp 2.x 更名 `MCPServer` 的说明）
   - 自动标签规则原写「约 30 条」，实际 `_TAG_AUTO_MAP` 为 **68 条**
 - CI 徽章改用 GitHub Actions 原生 badge URL
+- CI 测试步骤加入 `tests/test_p0_credentials.py`（测试断言总数 53 → 77）
+
+### Fixed
+
+- **清除 `rules/` 与 `template/` 下 7 个 Markdown 文件的 UTF-8 BOM**：BOM 会顶掉 YAML frontmatter 的起始 `---`，使文件被当作无元数据解析（`rules/记忆写入格式规范.md` 受影响最直接）。`install.ps1` 刻意保留 BOM —— 旧版 Windows 终端依赖它以正确识别中文
+- **移除仓库内两处私有路径引用**：`rules/记忆写入格式规范.md` 的 vault 位置说明、`tests/test_roundtrip.py` 的注释，统一改为通用默认值（`~/ai-memory` / `AI_MEMORY_DIR` 环境变量）
 
 ## [2.0.0] - 2026-09-10
 
@@ -93,7 +116,8 @@
 - 跨平台安装脚本：Windows PowerShell + Linux/macOS bash
 - 零外部依赖：仅需 Python 3.10+ 与 `mcp` 包
 
-[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.1.0
 [2.0.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.0.0
 [1.1.0]: https://github.com/dpkg-s/ai-memory-template/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v1.0.0

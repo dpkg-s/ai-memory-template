@@ -4,8 +4,8 @@
 用途:
     每次改动 server.py 后运行一次, 确保 frontmatter 写→读无损、
     反斜杠不雪崩、read 不污染 updated 等关键语义不被破坏。
-    库本身是主人的真实记忆, 不能拿真库做实验——本脚本把
-    AI_MEMORY_DIR 指向临时目录, 绝不触碰 D:/ai记忆。
+    真实记忆库不能拿来做实验——本脚本把 AI_MEMORY_DIR
+    指向临时目录, 绝不触碰真实记忆库。
 
 运行:
     python tests/test_roundtrip.py        # 退出码 0=全绿, 1=有失败

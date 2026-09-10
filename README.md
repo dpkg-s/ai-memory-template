@@ -6,10 +6,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-53%20assertions-brightgreen)](#测试与-ci)
+[![Tests](https://img.shields.io/badge/tests-77%20assertions-brightgreen)](#测试与-ci)
 
 ---
 
@@ -90,6 +90,35 @@ AI 调用 `memory_write` 时，服务端自动完成：
 - **自动归档** —— 写入 `tier=cold` 的条目自动移入 `.archive/`，原位只留摘要 stub
 - **安全防护** —— 拒绝空内容；同标题自动 upsert；`expected_version` 乐观锁防并发覆盖
 
+### 记忆可信度
+
+AI 会写记忆，也会**推断**。若两者混在一起、默认可信，AI 的猜测迟早会被后续会话当成事实复用 —— 这就是 Memory Poisoning。因此每条记忆都带可信度标记：
+
+| 字段 | 取值 | 说明 |
+|------|------|------|
+| `type` | `fact` / `preference` / `decision` / `experience` / `episodic` / `project` / `constraint` / `workflow` / `temporary` | 这条记忆是什么性质 |
+| `confidence` | `high` / `medium` / `low` | 可信度 |
+| `verified` | `true` / `false` | 是否已由你确认或经事实核验 |
+| `verified_at` | 日期 | 核验日期（`verified=false` 时自动清除） |
+
+```yaml
+---
+title: 部署方式定案
+type: decision          # 这是一条决策，不是随口一提
+confidence: high
+verified: true          # 用户明确拍板过
+verified_at: 2026-09-10
+---
+```
+
+检索时可按 `mem_type` 过滤，命中结果行内直接带徽章：
+
+```
+- [warm] **部署方式定案** (score=12.0, workbuddy) | type=decision conf=high ✓verified
+```
+
+**两种来源不混淆**：AI 自行推断写入的内容应保持 `verified: false`，只有用户明确陈述或经核验才置 `true`。旧笔记无需迁移 —— 读取时自动按 `fact` / `medium` / 未核验处理，被写入时才渐进补齐。
+
 ### 显式双链，关系可追溯
 
 链接关系用 Obsidian 风格的 `[[Wiki Link]]` 在正文里显式标注，**正文双链是链接关系的唯一事实源**。
@@ -104,7 +133,7 @@ AI 调用 `memory_write` 时，服务端自动完成：
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **53 条断言**的两层测试（语义回归 28 + 全工具冒烟 25）
+- **77 条断言**的三层测试（语义回归 28 + 全工具冒烟 25 + 记忆可信度 24）
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`
 
@@ -243,22 +272,22 @@ args = ["/path/to/ai-memory/server.py"]
 
 | 工具 | 签名 | 说明 |
 |------|------|------|
-| `memory_write` | `(title, content, tags?, source?, summary?, tier?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁 |
+| `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁与可信度标记 |
 | `memory_read` | `(title, max_chars=8000)` | 按标题精确读取（含文件名回退，可命中 `.archive`）。默认截断正文 8000 字符，`max_chars=0` 取全文 |
 | `memory_delete` | `(title, trash=True, purge=False)` | 删除。默认软删到 `.trash` 可恢复，`purge=True` 永久删除 |
-| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?)` | 只改 frontmatter 元数据，不重写正文 |
+| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?)` | 只改 frontmatter 元数据（含可信度字段），不重写正文 |
 | `memory_recent` | `(days=7, limit=20)` | 列出近 N 天更新的记忆，最新优先 |
 
 ### 查询
 
 | 工具 | 说明 |
 |------|------|
-| `memory_search(keyword, tag?, limit=20)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮，可按标签过滤 |
-| `memory_smart_search(query, tag?, limit=10)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，额外加时效性加分 |
-| `memory_list(tag?, limit=20, tier?)` | 罗列记忆摘要 |
+| `memory_search(keyword, tag?, limit=20, mem_type?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮，可按标签或类型过滤 |
+| `memory_smart_search(query, tag?, limit=10, mem_type?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，额外加时效性加分 |
+| `memory_list(tag?, limit=20, tier?, mem_type?)` | 罗列记忆摘要 |
 | `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链与反向链接图谱，默认截断 10 条 |
 | `memory_orphans()` | 查找没有任何笔记引用的孤立笔记 |
-| `memory_stats()` | 健康度统计：各 tier 数量、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数 |
+| `memory_stats()` | 健康度统计：各 tier 数量、记忆类型分布、可信度分布、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数 |
 
 ### 维护
 
@@ -481,8 +510,9 @@ ai-memory-template/
 ├── .gitattributes           # 强制 LF 换行，避免 CRLF 污染
 │
 ├── tests/
-│   ├── test_roundtrip.py    # 28 断言：语义回归
-│   └── test_tools_smoke.py  # 25 断言：全工具冒烟 + 注册完整性
+│   ├── test_roundtrip.py       # 28 断言：语义回归
+│   ├── test_tools_smoke.py     # 25 断言：全工具冒烟 + 注册完整性
+│   └── test_p0_credentials.py  # 24 断言：记忆可信度字段
 ├── .github/workflows/
 │   └── ci.yml               # CI：Python 矩阵测试 + ruff lint
 │
@@ -504,7 +534,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分两层，互为补充：**语义正确性**（写读是否无损）与**覆盖面**（工具是否都能用）。
+测试分三层：**语义正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**字段语义**（可信度标记是否可靠）。
 
 ### 语义回归 —— `tests/test_roundtrip.py`（28 断言）
 
@@ -520,17 +550,28 @@ ai-memory-template/
 - 20 个 MCP 工具逐一调用，验证不抛异常且返回正常
 - 工具注册完整性：数量为 20 且集合与预期完全一致（防重构时漏注册或误覆盖）
 
-两个脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
+### 记忆可信度 —— `tests/test_p0_credentials.py`（24 断言）
+
+- 写入落盘：显式取值正确写入，缺省时回落 `fact` / `medium` / `false`
+- 更新语义：未传字段继承原值（不被重置），显式传入时覆盖生效
+- 非法取值被拒绝且不落盘
+- 向后兼容：无字段的历史笔记读取时注入默认值、被写入时渐进补齐
+- `verified_at` 生命周期：置 `true` 写入日期，置 `false` 清除日期
+- 检索过滤（`mem_type`）与统计分布输出
+- 序列化层边界：非法值防御性兜底、`false` 不被序列化为 `null`
+
+三个脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
 
 ```bash
 pip install -r requirements-dev.txt
 python tests/test_roundtrip.py
 python tests/test_tools_smoke.py
+python tests/test_p0_credentials.py
 ```
 
-CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵（两个脚本）+ ruff lint。
+CI（`.github/workflows/ci.yml`）在 push / PR 时自动跑 Python 3.10–3.13 矩阵（三个脚本）+ ruff lint。
 
-> 这两层测试是 `server.py` 能够安全模块化重构的前提 —— 先有测试护航，再动结构。
+> 这三层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。
 
 ---
 

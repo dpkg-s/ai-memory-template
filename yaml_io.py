@@ -29,7 +29,32 @@ __all__ = [
     "yaml_quote_scalar",
     "dump_yaml_frontmatter",
     "build_frontmatter",
+    "MEMORY_TYPES",
+    "CONFIDENCE_LEVELS",
+    "DEFAULT_MEMORY_TYPE",
+    "DEFAULT_CONFIDENCE",
+    "DEFAULT_VERIFIED",
 ]
+
+# ── P0 可信度字段取值域（2026-09-10） ─────────────────────────────────────
+# 目的：区分「事实 / 偏好 / 决策 / 经验」并标注可信度与验证状态，遏制 AI
+# 自身推断被后续会话当成事实复用（Memory Poisoning / Stale Memory）。
+# 取值域集中定义于此，解析端与序列化端共用，避免两边漂移。
+MEMORY_TYPES = (
+    "fact",        # 明确事实
+    "preference",  # 用户偏好
+    "decision",    # 项目/技术决策
+    "experience",  # 经验总结
+    "episodic",    # 事件记录
+    "project",     # 项目上下文
+    "constraint",  # 约束条件
+    "workflow",    # 工作流/习惯
+    "temporary",   # 临时信息
+)
+CONFIDENCE_LEVELS = ("high", "medium", "low")
+DEFAULT_MEMORY_TYPE = "fact"
+DEFAULT_CONFIDENCE = "medium"
+DEFAULT_VERIFIED = False
 
 
 def strip_bom(text: str) -> str:
@@ -312,8 +337,15 @@ def dump_yaml_frontmatter(meta: dict[str, Any]) -> str:
 
 def build_frontmatter(title: str, tags: list[str], source: str | None, created: str | None = None,
                       summary: str | None = None, tier: str | None = None, access_count: int = 0,
-                      links: list[str] | None = None, version: int | None = None) -> str:
-    """构造 frontmatter 文本（含 title/tags/created/updated/tier/access_count 等）。"""
+                      links: list[str] | None = None, version: int | None = None,
+                      mem_type: str | None = None, confidence: str | None = None,
+                      verified: bool | None = None, verified_at: str | None = None) -> str:
+    """构造 frontmatter 文本（含 title/tags/created/updated/tier/access_count 等）。
+
+    P0 可信度字段（type/confidence/verified）**总是写出**，非法或缺失值回落到
+    模块级默认（fact / medium / false），使新笔记自带语义标签；旧笔记则在下次
+    被写入时渐进补齐（读取端的默认值注入见 server._apply_meta_defaults）。
+    """
     now = datetime.now(timezone.utc).isoformat()
     meta: dict[str, Any] = {
         "title": title,
@@ -322,6 +354,9 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
         "updated": now,
         "tier": tier or "warm",
         "access_count": access_count,
+        "type": mem_type if mem_type in MEMORY_TYPES else DEFAULT_MEMORY_TYPE,
+        "confidence": confidence if confidence in CONFIDENCE_LEVELS else DEFAULT_CONFIDENCE,
+        "verified": bool(verified) if verified is not None else DEFAULT_VERIFIED,
     }
     if source:
         meta["source"] = source
@@ -331,4 +366,6 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
         meta["links"] = links
     if version is not None:
         meta["version"] = version
+    if verified_at:
+        meta["verified_at"] = verified_at
     return dump_yaml_frontmatter(meta)

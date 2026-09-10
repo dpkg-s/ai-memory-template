@@ -56,6 +56,11 @@ from text_utils import (
     safe_filename as _safe_filename,
 )
 from yaml_io import (
+    CONFIDENCE_LEVELS,
+    DEFAULT_CONFIDENCE,
+    DEFAULT_MEMORY_TYPE,
+    DEFAULT_VERIFIED,
+    MEMORY_TYPES,
     build_frontmatter as _build_frontmatter,
     dump_yaml_frontmatter as _dump_yaml_frontmatter,
     parse_frontmatter as _parse_frontmatter,
@@ -394,8 +399,48 @@ def _entry_bucket(meta: dict[str, Any], path: Path) -> tuple[str, str]:
 
     return "其他", "暂未明确归类"
 
+def _today_utc() -> str:
+    """当前 UTC 日期（YYYY-MM-DD），用于 P0 的 verified_at 字段。"""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _apply_meta_defaults(meta: dict[str, Any]) -> dict[str, Any]:
+    """为 frontmatter 缺失 P0 可信度字段的旧笔记注入默认值（内存态）。
+
+    向后兼容的关键：全库 140+ 篇历史笔记不含 type/confidence/verified，若要求
+    「先迁移再使用」则改动面过大。这里在**读取端**统一补默认值，使新逻辑对旧
+    笔记立即生效，而磁盘文件保持原样；旧笔记仅在下次被显式写入时渐进补齐。
+
+    默认语义：type=fact / confidence=medium / verified=False —— 即「未声明来源
+    与验证状态的内容按中等可信的事实看待」，既不轻信也不丢弃。
+    """
+    if not isinstance(meta, dict):
+        return meta
+    if meta.get("type") not in MEMORY_TYPES:
+        meta["type"] = DEFAULT_MEMORY_TYPE
+    if meta.get("confidence") not in CONFIDENCE_LEVELS:
+        meta["confidence"] = DEFAULT_CONFIDENCE
+    if not isinstance(meta.get("verified"), bool):
+        meta["verified"] = DEFAULT_VERIFIED
+    return meta
+
+
+def _credential_badge(meta: dict[str, Any]) -> str:
+    """把 P0 可信度字段压成紧凑标记，供搜索/列表行内展示。
+
+    例：` | type=decision conf=high ✓verified` —— 让调用方在一行摘要里就能看出
+    「这是决策、高可信、且已被用户确认」，无需再逐条 memory_read。
+    """
+    badge = (f" | type={meta.get('type', DEFAULT_MEMORY_TYPE)}"
+             f" conf={meta.get('confidence', DEFAULT_CONFIDENCE)}")
+    if meta.get("verified"):
+        badge += " ✓verified"
+    return badge
+
+
 def _load_memory(path: Path) -> tuple[dict[str, Any], str]:
-    return _parse_frontmatter(_read_text(path))
+    meta, body = _parse_frontmatter(_read_text(path))
+    return _apply_meta_defaults(meta), body
 
 def _invalidate_cache() -> None:
     global _CACHE_VALID
@@ -430,20 +475,37 @@ def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
 def _write_memory(path: Path, title: str, tags: list[str], source: str | None, content: str,
                   created: str | None = None, summary: str | None = None,
                   tier: str | None = None, access_count: int = 0,
-                  links: list[str] | None = None, version: int | None = None) -> None:
+                  links: list[str] | None = None, version: int | None = None,
+                  mem_type: str | None = None, confidence: str | None = None,
+                  verified: bool | None = None, verified_at: str | None = None) -> None:
     # Merge cached access_count increments into the written count
     cached = _ACCESS_CACHE.pop(title, 0)
     if cached:
         access_count += cached
-    # 若未显式传入 version，尝试保留已有 version（避免批量/刷新操作清掉，改进#10）
-    if version is None:
+    # 未显式传入的字段尝试从磁盘既有条目继承（version 防批量刷新清空，改进#10；
+    # P0 可信度字段同理：更新正文不应把 type/confidence/verified 重置为默认值）。
+    if version is None or mem_type is None or confidence is None or verified is None:
         try:
             em, _ = _load_memory(path)
-            version = em.get("version")
+            if version is None:
+                version = em.get("version")
+            if mem_type is None:
+                mem_type = em.get("type")
+            if confidence is None:
+                confidence = em.get("confidence")
+            if verified is None:
+                verified = em.get("verified")
+            if verified_at is None:
+                verified_at = em.get("verified_at")
         except Exception:
-            version = None
+            pass
+    # verified 为假时不应残留验证时间戳（避免"未验证却有 verified_at"的矛盾态）
+    if not verified:
+        verified_at = None
     frontmatter = _build_frontmatter(title, tags, source, created=created, summary=summary,
-                                     tier=tier, access_count=access_count, links=links, version=version)
+                                     tier=tier, access_count=access_count, links=links, version=version,
+                                     mem_type=mem_type, confidence=confidence, verified=verified,
+                                     verified_at=verified_at)
     _atomic_write_text(path, f"---\n{frontmatter}\n---\n\n{content}")
 
 
@@ -488,8 +550,22 @@ def _refresh_index() -> None:
 @mcp.tool()
 def memory_write(title: str, content: str, tags: list[str] | None = None, source: str | None = None,
                  summary: str | None = None, tier: str | None = None,
+                 mem_type: str | None = None, confidence: str | None = None,
+                 verified: bool | None = None,
                  expected_version: int | None = None) -> str:
     """Write a memory entry, updating an existing one with the same title if found.
+
+    mem_type (optional): 记忆类型，写入 frontmatter 的 type 字段。
+        合法取值：fact（明确事实）/ preference（用户偏好）/ decision（决策）/
+        experience（经验）/ episodic（事件记录）/ project（项目上下文）/
+        constraint（约束）/ workflow（工作流）/ temporary（临时）。
+        非法值将被拒绝。省略时：新建条目取默认 fact，更新条目保留原值。
+
+    confidence (optional): 可信度，high / medium / low。
+        省略时：新建取 medium，更新保留原值。
+
+    verified (optional): 是否已由用户确认或事实核验，true / false。
+        **AI 自行推断出的信息必须保持 false**，只有用户明确陈述或经核验才置 true。
 
     expected_version (optional): optimistic concurrency check. If provided and the
     entry's current on-disk version does not match, the write is rejected to prevent
@@ -502,6 +578,14 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         return "错误：标题为空，已拒绝写入。"
     if not content or not content.strip():
         return "错误：内容为空，已拒绝创建空壳记忆（改进#5）。如为更新且需保留正文，请勿传空 content。"
+
+    # P0 可信度字段：非法取值直接拒绝，避免脏数据进入记忆库
+    if mem_type is not None and mem_type not in MEMORY_TYPES:
+        return (f"错误：mem_type 取值非法（'{mem_type}'）。"
+                f"合法取值：{', '.join(MEMORY_TYPES)}。")
+    if confidence is not None and confidence not in CONFIDENCE_LEVELS:
+        return (f"错误：confidence 取值非法（'{confidence}'）。"
+                f"合法取值：{', '.join(CONFIDENCE_LEVELS)}。")
 
     # auto-generate summary from first 100 chars of content if not provided
     if not summary:
@@ -567,6 +651,10 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                 tier=old_tier,
                 access_count=old_count if isinstance(old_count, int) else 0,
                 version=new_version,
+                mem_type=mem_type,
+                confidence=confidence,
+                verified=verified,
+                verified_at=_today_utc() if verified else None,
             )
             # Auto-archive: if tier is cold or very-low-heat, move to archive
             _maybe_auto_archive(title, existing_path)
@@ -575,7 +663,9 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         else:
             filepath = _resolve_unique_path(MEMORY_DIR, title)
             _write_memory(filepath, title=title, tags=tags, source=effective_source, content=content,
-                          summary=summary, tier=tier or "warm", version=new_version)
+                          summary=summary, tier=tier or "warm", version=new_version,
+                          mem_type=mem_type, confidence=confidence, verified=verified,
+                          verified_at=_today_utc() if verified else None)
             _maybe_auto_archive(title, filepath)
             logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
             result_msg = f"已创建记忆: {title} ({filepath.name})"
@@ -589,7 +679,10 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
 
 # 2026-09-06 links 优化（Step4）：memory_read 只回检索必需的核心元数据，
 # 不再回传 links/version 等（links 已取消持久化，即使历史文件残留也不输出）。
-CORE_META_KEYS = ["title", "tags", "summary", "created", "updated", "tier", "access_count", "source"]
+# 2026-09-10 P0：新增 type/confidence/verified/verified_at —— 让读取方一眼判断
+# 「这是用户明说的还是 AI 推断的、可信度如何」，遏制 Memory Poisoning。
+CORE_META_KEYS = ["title", "tags", "summary", "created", "updated", "tier", "access_count", "source",
+                  "type", "confidence", "verified", "verified_at"]
 BODY_TRUNCATE_CHARS = 8000  # memory_read 默认正文截断阈值，防超长笔记(如 近期工作动态 21KB)吃 token
 
 @mcp.tool()
@@ -681,11 +774,14 @@ def memory_rebuild_links() -> str:
 
 
 @mcp.tool()
-def memory_search(keyword: str, tag: str | None = None, limit: int = 20) -> str:
+def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
+                  mem_type: str | None = None) -> str:
     """Search memories by keyword across title, tags, and body (recent-first).
 
     limit caps the number of returned matches (default 20). Keyword occurrences
     in the body snippet are wrapped in ** for visibility.
+    mem_type (optional): 仅返回该 type 的记忆（fact/preference/decision/experience/
+    episodic/project/constraint/workflow/temporary）。旧笔记无该字段时按 fact 处理。
     """
     if not keyword or not keyword.strip():
         return "错误：搜索关键词不能为空。"
@@ -706,6 +802,8 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20) -> str:
 
             entry_tags = _entry_tags(meta)
             if tag and tag.lower() not in [t.lower() for t in entry_tags]:
+                continue
+            if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
                 continue
 
             title = _entry_title(meta, f)
@@ -733,11 +831,12 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20) -> str:
 
                 source = meta.get("source", "")
                 source_info = f" | 来源: {source}" if source else ""
+                cred_info = _credential_badge(meta)
                 tags_display = ", ".join(entry_tags)
                 summary_display = f"\n  {summary}" if summary else ""
 
                 results.append(
-                    f"- [{title}] ({f.name}) | {tags_display} | tier={tier} | reads={count}{source_info}{summary_display}{context}"
+                    f"- [{title}] ({f.name}) | {tags_display} | tier={tier} | reads={count}{source_info}{cred_info}{summary_display}{context}"
                 )
 
     if not results:
@@ -749,8 +848,12 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20) -> str:
     return header + "\n\n".join(shown)
 
 @mcp.tool()
-def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None) -> str:
-    """List memory entries with a small preview."""
+def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None,
+                mem_type: str | None = None) -> str:
+    """List memory entries with a small preview.
+
+    mem_type (optional): 仅列出该 type 的条目（fact/preference/decision/...）。
+    """
     entries: list[str] = []
 
     for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
@@ -764,6 +867,8 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
             continue
         if tier and meta.get("tier", "warm") != tier:
             continue
+        if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
+            continue
 
         title = _entry_title(meta, f)
         tags_display = ", ".join(entry_tags)
@@ -772,6 +877,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
         tier_val = meta.get("tier", "warm")
         reads = meta.get("access_count", 0)
         source_info = f" | {source}" if source else ""
+        cred_info = _credential_badge(meta)
 
         # prefer summary field, fallback to body[:40]
         summary = meta.get("summary", "")
@@ -781,7 +887,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
             preview = body[:40].replace("\n", " ").strip()
         preview += "..." if len(preview) >= (40 if not summary else 80) else ""
 
-        entries.append(f"- [{created}] {title} [{tier_val}|{reads}]{source_info} | {tags_display}\n  {preview}")
+        entries.append(f"- [{created}] {title} [{tier_val}|{reads}]{source_info}{cred_info} | {tags_display}\n  {preview}")
 
     if not entries:
         return "记忆库为空"
@@ -844,13 +950,25 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False) -> str:
 @mcp.tool()
 @_locked_write
 def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] | None = None,
-                           summary: str | None = None, source: str | None = None) -> str:
+                           summary: str | None = None, source: str | None = None,
+                           mem_type: str | None = None, confidence: str | None = None,
+                           verified: bool | None = None) -> str:
     """Update only the frontmatter metadata of an entry without rewriting its body.
 
     Useful for changing tier/tags/summary/source of an existing note while keeping
     its full content intact (avoids the full rewrite that memory_write requires).
     Pass None to leave a field unchanged; pass an empty list to clear tags.
+
+    P0 可信度字段（mem_type / confidence / verified）同样支持在此单独修正 —— 典型
+    用途是把 AI 早先推断写入的内容由 verified=false 提升为 true（用户事后确认），
+    或修正 type 归类错误，而无需重写正文。
     """
+    if mem_type is not None and mem_type not in MEMORY_TYPES:
+        return (f"错误：mem_type 取值非法（'{mem_type}'）。"
+                f"合法取值：{', '.join(MEMORY_TYPES)}。")
+    if confidence is not None and confidence not in CONFIDENCE_LEVELS:
+        return (f"错误：confidence 取值非法（'{confidence}'）。"
+                f"合法取值：{', '.join(CONFIDENCE_LEVELS)}。")
     for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
         try:
             meta, body = _load_memory(f)
@@ -865,6 +983,16 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
                 meta["summary"] = summary
             if source is not None:
                 meta["source"] = source
+            if mem_type is not None:
+                meta["type"] = mem_type
+            if confidence is not None:
+                meta["confidence"] = confidence
+            if verified is not None:
+                meta["verified"] = bool(verified)
+                if verified:
+                    meta["verified_at"] = _today_utc()
+                else:
+                    meta.pop("verified_at", None)
             old_version = meta.get("version", 0)
             meta["version"] = (old_version + 1) if isinstance(old_version, int) else 1
             meta["updated"] = datetime.now(timezone.utc).isoformat()
@@ -1398,8 +1526,12 @@ def memory_archive_old(days: int = 90) -> str:
     return "没有超过 {} 天未更新的条目需要归档".format(days)
 
 @mcp.tool()
-def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> str:
-    """Multi-field scored search across titles, tags, summaries, and bodies."""
+def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
+                        mem_type: str | None = None) -> str:
+    """Multi-field scored search across titles, tags, summaries, and bodies.
+
+    mem_type (optional): 仅检索该 type 的条目（fact/preference/decision/...）。
+    """
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
     now = datetime.now(timezone.utc)
 
@@ -1418,7 +1550,7 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
     if not keywords:
         return "查询词无效"
 
-    scored: list[tuple[float, str, str, str, str]] = []
+    scored: list[tuple[float, str, str, str, str, str]] = []
 
     for f, meta, body in all_entries:
         title = _entry_title(meta, f)
@@ -1429,6 +1561,8 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
         updated_str = str(meta.get("updated", ""))
 
         if tag and tag not in tags:
+            continue
+        if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
             continue
 
         title_lower = title.lower()
@@ -1460,7 +1594,7 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
                 score += max(0, 2.0 - days_since * 0.02)
 
         if score > 0:
-            scored.append((score, title, tier, summary[:80], source))
+            scored.append((score, title, tier, summary[:80], source, _credential_badge(meta)))
 
     scored.sort(key=lambda x: -x[0])
 
@@ -1468,8 +1602,8 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10) -> 
         return '未找到与 "{}" 相关的结果'.format(query)
 
     lines = ["# 搜索结果: {}".format(query), "共找到 {} 条相关记忆".format(len(scored)), ""]
-    for score, title, tier, summary, source in scored[:limit]:
-        lines.append("- [{}] **{}** (score={:.1f}, {})".format(tier, title, score, source))
+    for score, title, tier, summary, source, cred in scored[:limit]:
+        lines.append("- [{}] **{}** (score={:.1f}, {}){}".format(tier, title, score, source, cred))
         if summary:
             lines.append("  {}".format(summary))
 
@@ -1514,6 +1648,9 @@ def memory_stats() -> str:
     total = len(all_entries)
     tier_count: dict[str, int] = {"hot": 0, "warm": 0, "cold": 0}
     tag_counter: Counter = Counter()
+    type_counter: Counter = Counter()        # P0：记忆类型分布
+    confidence_counter: Counter = Counter()  # P0：可信度分布
+    verified_count = 0                       # P0：已核验条目数
     reads_list: list[tuple[int, str]] = []
     zero_reads: list[str] = []
     orphan_count = 0
@@ -1525,6 +1662,10 @@ def memory_stats() -> str:
     for f, meta, body in all_entries:
         t = meta.get("tier", "warm")
         tier_count[t] = tier_count.get(t, 0) + 1
+        type_counter[meta.get("type", DEFAULT_MEMORY_TYPE)] += 1
+        confidence_counter[meta.get("confidence", DEFAULT_CONFIDENCE)] += 1
+        if meta.get("verified"):
+            verified_count += 1
         tag_counter.update(_entry_tags(meta))
         reads = meta.get("access_count", 0)
         if not isinstance(reads, int):
@@ -1571,8 +1712,20 @@ def memory_stats() -> str:
     lines.append(f"- 活跃 hot: {tier_count.get('hot', 0)}")
     lines.append(f"- 常温 warm: {tier_count.get('warm', 0)}")
     lines.append(f"- 已归档 cold: {tier_count.get('cold', 0)}")
+    lines.append(f"- 已核验 verified: {verified_count} 条")
     lines.append(f"- 孤立笔记: {orphan_count}（无反向链接）")
     lines.append(f"- 总双向链接数: {total_links}")
+    lines.append("")
+    lines.append("## 记忆类型分布（P0）")
+    for mtype in MEMORY_TYPES:
+        c = type_counter.get(mtype, 0)
+        if c:
+            lines.append(f"- {mtype}: {c} 条")
+    lines.append("")
+    lines.append("## 可信度分布（P0）")
+    for lvl in CONFIDENCE_LEVELS:
+        lines.append(f"- {lvl}: {confidence_counter.get(lvl, 0)} 条")
+    lines.append(f"- 未核验（含 AI 推断待确认）: {total - verified_count} 条")
     lines.append("")
     lines.append(f"## 访问频率")
     lines.append(f"- 从未读取: {len(zero_reads)} 条")

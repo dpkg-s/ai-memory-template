@@ -33,6 +33,7 @@ jobs:
         run: |
           python tests/test_roundtrip.py
           python tests/test_tools_smoke.py
+          python tests/test_p0_credentials.py
 
   lint:
     name: Lint (ruff)

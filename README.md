@@ -340,7 +340,7 @@ args = ["/path/to/ai-memory/server.py"]
 |------|------|------|
 | `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁、可信度与作用域/生命周期标记 |
 | `memory_read` | `(title, max_chars=8000)` | 按标题精确读取（含文件名回退，可命中 `.archive`）。默认截断正文 8000 字符，`max_chars=0` 取全文 |
-| `memory_delete` | `(title, trash=True, purge=False)` | 删除。默认软删到 `.trash` 可恢复，`purge=True` 永久删除 |
+| `memory_delete` | `(title, trash=True, purge=False, empty_trash=False)` | 删除。默认软删到 `.trash/` 可恢复，`purge=True` 永久删除，`empty_trash=True` 清空回收站 |
 | `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?)` | 只改 frontmatter 元数据（含可信度、作用域、生命周期字段），不重写正文。传空串 / 空列表可清除 |
 | `memory_recent` | `(days=7, limit=20)` | 列出近 N 天更新的记忆，最新优先 |
 
@@ -350,7 +350,7 @@ args = ["/path/to/ai-memory/server.py"]
 |------|------|
 | `memory_search(keyword, tag?, limit=20, mem_type?, scope?, project?, status?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮；可按标签 / 类型 / 作用域 / 项目过滤。**省略 `status` 时默认隐藏 `archived`**，隐藏条数会在末尾提示 |
 | `memory_smart_search(query, tag?, limit=10, mem_type?, scope?, project?, status?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，另加时效性加权。**零词法命中即非候选**，时效性不能单独决定入选 |
-| `memory_list(tag?, limit=20, tier?, mem_type?, scope?, project?, status?)` | 罗列记忆摘要，过滤语义同上 |
+| `memory_list(tag?, limit=20, tier?, mem_type?, scope?, project?, status?, include_trash?)` | 罗列记忆摘要，过滤语义同上；`include_trash=True` 改为列出回收站内容 |
 | `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链与反向链接图谱，默认截断 10 条 |
 | `memory_orphans()` | 查找没有任何笔记引用的孤立笔记 |
 | `memory_stats()` | 健康度统计：各 tier 数量、记忆类型 / 可信度 / 作用域 / 生命周期 / 写入方上下文 / 结构版本分布、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数，以及**运行时指标**（检索零结果率 / 锁等待 / 索引重建） |
@@ -361,7 +361,7 @@ args = ["/path/to/ai-memory/server.py"]
 |------|------|
 | `memory_archive(title)` | 归档：正文移入 `.archive/`，原位留摘要 stub |
 | `memory_archive_old(days=90)` | 批量归档 N 天未更新的条目，自动跳过核心页 |
-| `memory_restore(title)` | 从 `.archive/` 恢复，tier 重置为 warm |
+| `memory_restore(title, source="archive")` | 恢复。默认从 `.archive/` 取回并把 tier 重置为 warm；`source="trash"` 从回收站取回（根目录已有同名条目则拒绝，不静默覆盖） |
 | `memory_batch_tag(old_tag, new_tag)` | 全库标签重命名 |
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
 | `memory_heat_suggest()` | 按访问频次与陈旧度给出 tier 升降建议 |

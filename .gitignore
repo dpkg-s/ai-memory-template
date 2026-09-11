@@ -20,3 +20,7 @@ SHA256SUMS.txt
 # 运行时指标快照 (generated at runtime by metrics.py)
 # 与索引同目录、按 MEMORY_DIR 哈希隔离；纯观测数据，删掉即从零重新累积。
 memory_metrics_*.json*
+
+# 回收站：memory_delete 默认把条目软删除到此目录（误删可恢复），不参与检索。
+# 仅当用户把 vault 直接放在仓库目录内时才会出现，属防御性忽略。
+.trash/

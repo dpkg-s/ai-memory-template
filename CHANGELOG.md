@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- **回收站闭环**（`.trash/`）：`memory_delete` 自 2.0 起默认软删除，但此前**只进不出** —— 文件移进 `.trash/` 后没有任何工具能列出来或取回去，「可恢复」一直停留在纸面。本次补齐三步：
+  - `memory_list(include_trash=True)`：列出回收站内容（标题、移入时间、体积）
+  - `memory_restore(title, source="trash")`：从回收站取回。**根目录已存在同标题条目时拒绝**并说明原因 —— 回收站里那份可能是被新版取代的旧内容，静默覆盖比不恢复更危险
+  - `memory_delete(title, empty_trash=True)`：一键清空回收站（唯一会批量删除的路径，需显式传入，`title` 被忽略）
+  - 软删除时把文件 `mtime` 置为移入时刻，回收站列表因而能显示真实的删除时间
+  - `.trash/` 天然不参与检索（读取端 glob 非递归）；恢复后 `status` 回到 `active`、`schema_version` 升到当前版本
+  - 与既有 `.archive/` 恢复路径互不干扰：`memory_restore` 的 `source` 默认 `"archive"`，行为完全向后兼容
+  - 专项测试 `tests/test_trash.py`（34 断言）：软删除退出检索、恢复后索引与字段正确、同名冲突拒绝、同名两条并存、`purge` 与清空、既有归档路径无回归
+
 ### Fixed
 
 - **索引自动生成死链**（`_refresh_index` / `memory_index_draft`）：两处生成 `记忆索引.md` 与索引草稿时直接输出 `- [[{title}]]`，而 Obsidian 解析双链以**文件名 stem** 为准 —— `safe_filename()` 会把标题里的空格等字符归一化成下划线，于是凡标题含空格的笔记（如「2026-07-06 记忆库半自动审计」对应 `2026-07-06_记忆库半自动审计.md`）在索引中全是**渲染死链**；更糟的是 `_refresh_index` 在每次 `memory_write` 后都会重建索引，会把人工修复**覆盖回去**（实测 148 篇的库中稳定复现 36 条）。新增 `_wiki_link(path, title)`：target 恒用 `path.stem`，人类可读标题只放别名位（`[[stem|title]]`），两处生成器统一改走它；`memory_index_draft` 中形如 `f"{title}|{path.stem}"` 的错误别名计算（方向反了且从未被使用）一并删除。新增回归测试 `tests/test_index_links.py`（18 断言）：判定口径为「索引与草稿里的每一条链接，其 target 都必须能解析到库中真实存在的文件」，并覆盖幂等重建与含非法字符标题。

@@ -492,6 +492,32 @@ CORE_PAGES = {"记忆索引", "近期工作动态", "用户画像", "AI身份档
                   "记忆半自动整理流程", "AI交互配置", "AI 对话自动归档提示词",
                   "本地共享记忆库 MCP Server", "工具_记忆库MCP服务器"}
 
+# ---- 回收站 (.trash) -------------------------------------------------
+# memory_delete 默认软删除：文件移入 .trash/ 而非 unlink，误删可恢复。
+# .trash/ 不参与任何检索（读取端只 glob MEMORY_DIR/*.md），取回走
+# memory_restore(source="trash")，查看走 memory_list(include_trash=True)。
+TRASH_DIR_NAME = ".trash"
+
+
+def _trash_dir() -> Path:
+    return MEMORY_DIR / TRASH_DIR_NAME
+
+
+def _free_path_in(directory: Path, name: str) -> Path:
+    """在 directory 内取一个**严格空闲**的路径（重名则追加 _2 / _3 ...）。
+
+    与 `_resolve_unique_path` 的区别：后者在「已存在文件且 frontmatter title
+    相同」时会复用该路径（覆盖语义，服务于 memory_write 的 upsert）；回收站
+    场景下同名的两条软删除必须并存，所以这里一律避让，绝不覆盖。
+    """
+    dest = directory / name
+    n = 2
+    while dest.exists():
+        dest = directory / f"{Path(name).stem}_{n}{Path(name).suffix}"
+        n += 1
+    return dest
+
+
 def _maybe_auto_archive(title: str, path: Path) -> None:
     """Auto-archive entries that are cold enough."""
     if title in CORE_PAGES:
@@ -1316,18 +1342,51 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     header = f"找到 {total} 条记忆" + (f"，显示前 {limit} 条" if total > limit else "") + ":\n\n"
     return header + "\n\n".join(shown) + _filter_hint(hidden)
 
+def _list_trash(limit: int = 20) -> str:
+    """列出回收站内容（memory_list(include_trash=True) 的实现）。"""
+    tdir = _trash_dir()
+    if not tdir.exists():
+        return "回收站为空"
+    rows = sorted(tdir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not rows:
+        return "回收站为空"
+    lines: list[str] = []
+    for f in rows[:limit]:
+        try:
+            meta, _ = _load_memory(f)
+            t = _entry_title(meta, f)
+        except Exception:
+            t = f.stem
+        try:
+            st = f.stat()
+            when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            size = st.st_size
+        except OSError:
+            when, size = "?", 0
+        lines.append(f"- {t}（{when} 移入, {size} B）")
+    tail = f"\n\n... 共 {len(rows)} 条，显示前 {limit} 条" if len(rows) > limit else ""
+    return (f"回收站共 {len(rows)} 条 —— 取回: memory_restore(source=\"trash\")；"
+            f"清空: memory_delete(empty_trash=True)\n" + "\n".join(lines) + tail)
+
+
 @mcp.tool()
 def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None,
                 mem_type: str | None = None,
                 scope: str | None = None, project: str | None = None,
-                status: str | None = None) -> str:
+                status: str | None = None,
+                include_trash: bool = False) -> str:
     """List memory entries with a small preview.
 
     mem_type (optional): 仅列出该 type 的条目（fact/preference/decision/...）。
     scope / project (optional): 仅列出该作用域 / 项目的条目；传 "any" 表示不过滤。
     status (optional): 生命周期过滤。**省略时默认排除 archived**（归档条目不再出现
     在日常列表中）；传 "any" 查看全部，传具体值精确过滤。被隐藏的条目数会在末尾提示。
+    include_trash (optional): 改为列出**回收站**（.trash/）内容，此时其余过滤参数
+    不生效。配合 memory_restore(source="trash") 取回、memory_delete(empty_trash=True) 清空。
     """
+    if include_trash:
+        return _list_trash(limit)
+
     _t0 = time.perf_counter()
     entries: list[str] = []
     hidden = 0
@@ -1382,20 +1441,43 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
 
 @mcp.tool()
 @_locked_write
-def memory_delete(title: str, trash: bool = True, purge: bool = False) -> str:
+def memory_delete(title: str, trash: bool = True, purge: bool = False,
+                  empty_trash: bool = False) -> str:
     """Delete a memory entry by exact title, with filename fallback for legacy files.
 
     trash=True (default) moves the file to .trash/ instead of unlinking, so a
     mistaken delete can be recovered. Pass purge=True (or trash=False) to
     permanently remove it (including a previously soft-deleted copy in .trash/).
     Archive entries (.archive/) are also matched.
+
+    empty_trash=True: 清空整个回收站（此时 title 被忽略）。这是唯一会一次性
+    删除多条的路径，必须显式传入。查看回收站用 memory_list(include_trash=True)，
+    取回用 memory_restore(source="trash")。
     """
+    if empty_trash:
+        tdir = _trash_dir()
+        if not tdir.exists():
+            return "回收站为空，无需清理"
+        files = sorted(tdir.glob("*.md"))
+        if not files:
+            return "回收站为空，无需清理"
+        removed = 0
+        for f in files:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError as e:
+                logger.warning("empty_trash(%s): %s", f.name, e)
+        _invalidate_cache()
+        logger.info("DELETE(empty_trash) removed=%d", removed)
+        return f"已清空回收站：永久删除 {removed} 条（不可恢复）"
+
     search_dirs = [MEMORY_DIR]
     archive_dir = MEMORY_DIR / ".archive"
     if archive_dir.exists():
         search_dirs.append(archive_dir)
     if not trash or purge:
-        trash_dir = MEMORY_DIR / ".trash"
+        trash_dir = _trash_dir()
         if trash_dir.exists():
             search_dirs.append(trash_dir)
     for f in [p for d in search_dirs for p in d.glob("*.md")]:
@@ -1405,20 +1487,21 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False) -> str:
             continue
         if _entry_title(meta, f) == title or f.stem == title:
             if trash and not purge:
-                trash_dir = MEMORY_DIR / ".trash"
+                trash_dir = _trash_dir()
                 trash_dir.mkdir(parents=True, exist_ok=True)
-                dest = trash_dir / f.name
-                n = 2
-                while dest.exists():
-                    dest = trash_dir / f"{f.stem}_{n}{f.suffix}"
-                    n += 1
+                dest = _free_path_in(trash_dir, f.name)
                 f.replace(dest)
+                try:
+                    os.utime(dest, None)  # mtime=进入回收站的时刻，供列表显示
+                except OSError:
+                    pass
                 _idx_remove_path(f)  # 软删移出库, 清索引行
                 logger.info("DELETE(soft) title=%s -> %s", title, dest.name)
                 _invalidate_cache()
                 if title != "记忆索引":
                     _refresh_index()
-                return f"已软删除记忆: {title} -> .trash/{dest.name}（如需彻底删除，用 purge=true）"
+                return (f"已软删除记忆: {title} -> .trash/{dest.name}"
+                        f"（用 memory_restore(source=\"trash\") 可恢复，purge=true 彻底删除）")
             f.unlink()
             _idx_remove_path(f)  # 永久删除, 清索引行
             logger.info("DELETE(purge) title=%s", title)
@@ -1774,14 +1857,74 @@ def memory_archive(title: str) -> str:
     _invalidate_cache()
     return "已归档: {0} -> .archive/{1}".format(title, archive_path.name)
 
+def _restore_from_trash(title: str) -> str:
+    """从 .trash/ 恢复软删除的条目（memory_restore(source="trash") 的实现）。"""
+    trash_dir = _trash_dir()
+    if not trash_dir.exists():
+        return "回收站为空，无内容可恢复"
+
+    target_path: Path | None = None
+    target_meta: dict[str, Any] = {}
+    target_body = ""
+    for f in sorted(trash_dir.glob("*.md")):
+        try:
+            meta, body = _load_memory(f)
+        except Exception:
+            continue
+        if _entry_title(meta, f) == title or f.stem == title:
+            target_path, target_meta, target_body = f, meta, body
+            break
+    if not target_path:
+        return (f"回收站中未找到标题为 '{title}' 的记忆"
+                f"（用 memory_list(include_trash=True) 查看全部）")
+
+    target_title = str(target_meta.get("title") or title)
+    if target_title in CORE_PAGES:
+        return f"错误：'{target_title}' 是核心页面，不允许恢复覆盖。"
+
+    # 根目录已有同标题条目 => 拒绝，避免静默覆盖现存内容（回收站里的可能是旧版）
+    for f in MEMORY_DIR.glob("*.md"):
+        try:
+            m, _ = _load_memory(f)
+        except Exception:
+            continue
+        if _entry_title(m, f) == target_title or f.stem == target_title:
+            return (f"未恢复：根目录已存在同标题记忆 '{target_title}'（{f.name}）。"
+                    f"请先处理现存条目，再取回回收站中的这份。")
+
+    dest = MEMORY_DIR / _safe_filename(target_title)
+    restored_meta = dict(target_meta)
+    restored_meta["status"] = "active"          # 取回 => 生命周期回到生效中
+    restored_meta["schema_version"] = SCHEMA_VERSION
+    restored_meta["updated"] = datetime.now(timezone.utc).isoformat()
+    restored_meta.pop("deleted_at", None)
+    _atomic_write_text(dest, f"---\n{_dump_yaml_frontmatter(restored_meta)}\n---\n\n{target_body}")
+    _idx_remove_path(target_path)  # 清 .trash 行的索引（新行已由 atomic_write 同步）
+    target_path.unlink(missing_ok=True)
+    _invalidate_cache()
+    if target_title != "记忆索引":
+        _refresh_index()
+    logger.info("RESTORE(trash) title=%s", target_title)
+    return f"已恢复记忆: {target_title}（从 .trash/{target_path.name}）"
+
+
 @mcp.tool()
 @_locked_write
-def memory_restore(title: str) -> str:
-    """Restore an archived entry back to the vault root (P1-7).
+def memory_restore(title: str, source: str = "archive") -> str:
+    """Restore an entry back to the vault root (P1-7).
 
-    Moves the full content from .archive/ back to MEMORY_DIR, replacing the stub
-    left behind by memory_archive, and bumps tier back to warm.
+    source="archive"（默认）: 从 .archive/ 恢复 —— 把完整内容搬回 MEMORY_DIR，
+    替换掉 memory_archive 留下的 stub，并把 tier 回到 warm。
+
+    source="trash": 从 .trash/ 取回 memory_delete 软删除的条目。若根目录已存在
+    同标题条目则**拒绝**（回收站里的可能是被新版替代的旧内容，静默覆盖更危险）。
     """
+    src = (source or "archive").strip().lower()
+    if src not in ("archive", "trash"):
+        return f"错误：source 只能是 'archive' 或 'trash'（收到 {source!r}）"
+    if src == "trash":
+        return _restore_from_trash(title)
+
     archive_dir = MEMORY_DIR / ".archive"
     if not archive_dir.exists():
         return "归档目录不存在，无内容可恢复"

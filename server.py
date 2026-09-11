@@ -599,6 +599,21 @@ def _entry_title(meta: dict[str, Any], path: Path) -> str:
         return title.strip()
     return path.stem
 
+
+def _wiki_link(path: Path, title: str | None = None) -> str:
+    """渲染一条指向 path 的 Obsidian 双链。
+
+    Obsidian 解析双链时以**文件名 stem** 为准，因此 link target 必须是
+    path.stem，人类可读标题只能放别名位（`[[stem|title]]`）。早期实现直接输出
+    `[[title]]`：凡标题含空格等会被 _safe_filename 归一化的字符 —— 例如标题
+    "2026-07-06 记忆库半自动审计" 对应文件 2026-07-06_记忆库半自动审计.md ——
+    链接一律变成渲染死链，而且每次 _refresh_index 都会把手工修复覆盖回去。
+    """
+    stem = path.stem
+    if title and title != stem:
+        return f"[[{stem}|{title}]]"
+    return f"[[{stem}]]"
+
 def _entry_tags(meta: dict[str, Any]) -> list[str]:
     tags = meta.get("tags", [])
     if isinstance(tags, list):
@@ -902,11 +917,11 @@ def _refresh_index() -> None:
         entries = _iter_entries()
         order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复",
                  "时间线", "模板", "AI相关", "其他"]
-        groups: dict[str, list[str]] = {b: [] for b in order}
+        groups: dict[str, list[tuple[Path, str]]] = {b: [] for b in order}
         for path, meta, _body in entries:
             title = _entry_title(meta, path)
             bucket, _reason = _entry_bucket(meta, path)
-            groups.setdefault(bucket, []).append(title)
+            groups.setdefault(bucket, []).append((path, title))
         lines = ["# 记忆索引（自动维护）", "",
                  "> 本索引由 ai-memory MCP 在每次写入后自动更新。如确需手工调整，请改各笔记自身而非此处。", ""]
         for bucket in order:
@@ -914,8 +929,12 @@ def _refresh_index() -> None:
             if not items:
                 continue
             lines.append(f"## {bucket}")
-            for title in sorted(set(items), key=lambda x: x.lower()):
-                lines.append(f"- [[{title}]]")
+            uniq: dict[str, tuple[Path, str]] = {}
+            for path, title in items:
+                uniq.setdefault(path.stem, (path, title))
+            for stem in sorted(uniq, key=lambda s: uniq[s][1].lower()):
+                path, title = uniq[stem]
+                lines.append("- " + _wiki_link(path, title))
             lines.append("")
         body = "\n".join(lines).rstrip()
         idx_path = MEMORY_DIR / "记忆索引.md"
@@ -1648,7 +1667,7 @@ def memory_index_draft() -> str:
     if not entries:
         return "记忆库为空"
 
-    groups: dict[str, list[tuple[str, str]]] = {
+    groups: dict[str, list[tuple[Path, str]]] = {
         "索引": [],
         "规则": [],
         "项目": [],
@@ -1665,8 +1684,7 @@ def memory_index_draft() -> str:
     for path, meta, _body in entries:
         title = _entry_title(meta, path)
         bucket, _reason = _entry_bucket(meta, path)
-        display = title if title == path.stem else f"{title}|{path.stem}"
-        groups.setdefault(bucket, []).append((title, display))
+        groups.setdefault(bucket, []).append((path, title))
 
     order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复", "时间线", "模板", "AI相关", "其他"]
     lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `记忆索引.md`。", ""]
@@ -1676,8 +1694,8 @@ def memory_index_draft() -> str:
         if not items:
             continue
         lines.append(f"## {bucket}")
-        for title, _display in sorted(items, key=lambda item: item[0].lower()):
-            lines.append(f"- [[{title}]]")
+        for path, title in sorted(items, key=lambda item: item[1].lower()):
+            lines.append("- " + _wiki_link(path, title))
         lines.append("")
 
     return "\n".join(lines).rstrip()

@@ -6,6 +6,7 @@
     - 正文相近（不同结论，模拟冲突）→ 「疑似重复/冲突内容」
     - 完全无关 → 不触发
     - 同名 upsert（更新自己）→ 不触发
+    - 核心页（CORE_PAGES）标题变体 → 同样触发
     - 防护逻辑异常时不影响正常写入（容错）
 
 脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
@@ -98,6 +99,17 @@ def main() -> int:
         check("E1 防护异常时写入仍成功", "已创建记忆" in out, out[:160])
     finally:
         server._find_duplicate_hints = _orig
+
+    print("\n== F. 核心页（CORE_PAGES）标题变体同样受防护 ==")
+    # 回归：曾经无条件跳过 CORE_PAGES，导致「新建『近期工作动态记录』而不是
+    # 更新原页」这类最典型的重复写入静默通过 —— 与防护目标正好背离。
+    server.memory_write("近期工作动态", "本页汇总近期的工作进展。")
+    out = server.memory_write("近期工作动态记录", "本页汇总近期的开发与整理工作进展。")
+    check("F1 核心页标题变体触发重复提示", "疑似重复标题" in out, out[:200])
+    check("F2 提示指向核心页", "近期工作动态" in out, out[:200])
+    # 唯一豁免仍是「完全同名」：同名写入属于更新，不该提示"指向自身"。
+    out = server.memory_write("近期工作动态", "本页汇总近期的工作进展（更新）。")
+    check("F3 核心页同名 upsert 不指向自身", "[[近期工作动态]]" not in out, out[:240])
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")

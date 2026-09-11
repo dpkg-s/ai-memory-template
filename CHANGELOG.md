@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- **冲突防护漏掉核心页**（`_find_duplicate_hints`）：防护上线时无条件跳过 `CORE_PAGES`（`近期工作动态` / `用户画像` / `记忆库总规范` 等），结果「新建『近期工作动态记录』而不是更新原页」这类**最典型的重复写入恰恰静默通过**——与防护目标正好背离。现已让核心页同样参与比对；真正需要豁免的只有「完全同名」（同名写入属于更新而非重复），而该情形本已由 `other == title` 分支处理，无需二次排除。`tests/test_dup_guard.py` 新增 F 组 3 断言覆盖。
 - **索引自动生成死链**（`_refresh_index` / `memory_index_draft`）：两处生成 `记忆索引.md` 与索引草稿时直接输出 `- [[{title}]]`，而 Obsidian 解析双链以**文件名 stem** 为准 —— `safe_filename()` 会把标题里的空格等字符归一化成下划线，于是凡标题含空格的笔记（如「2026-07-06 记忆库半自动审计」对应 `2026-07-06_记忆库半自动审计.md`）在索引中全是**渲染死链**；更糟的是 `_refresh_index` 在每次 `memory_write` 后都会重建索引，会把人工修复**覆盖回去**（实测 148 篇的库中稳定复现 36 条）。新增 `_wiki_link(path, title)`：target 恒用 `path.stem`，人类可读标题只放别名位（`[[stem|title]]`），两处生成器统一改走它；`memory_index_draft` 中形如 `f"{title}|{path.stem}"` 的错误别名计算（方向反了且从未被使用）一并删除。新增回归测试 `tests/test_index_links.py`（18 断言）：判定口径为「索引与草稿里的每一条链接，其 target 都必须能解析到库中真实存在的文件」，并覆盖幂等重建与含非法字符标题。
 - **跨进程缓存失效在 Windows 上不生效**（`_iter_entries`）：缓存失效键原先只比对记忆库**目录**的 `st_mtime`，而 Windows/NTFS 下改写已存在文件的**内容**不会更新父目录 mtime（只有新建 / 重命名 / 删除才会）——于是 Obsidian 保存、其它 MCP 客户端写入、`git` 改文件内容这类外部编辑**永远触发不了缓存重建**，服务端持续返回陈旧条目（`memory_search` / `memory_list` / `memory_audit` 均受影响），恰好命中「多 AI 工具共享同一记忆库」这一核心场景。现改为 `_vault_fingerprint()`：**目录 mtime + 逐文件 `(name, size, mtime_ns)` 指纹**，任何内容变更都会令缓存失效。147 篇规模下额外开销约 1~3 ms。
 

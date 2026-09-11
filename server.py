@@ -566,7 +566,7 @@ def _find_duplicate_hints(title: str, content: str,
     匹配逻辑：
       1. 标题 bigram Jaccard >= _DUP_TITLE_JACCARD → 「疑似重复标题」
       2. 否则正文 bigram Jaccard >= _DUP_BODY_JACCARD → 「疑似重复/冲突内容」
-    排除：标题完全相同（那就是 upsert 自己）、核心页面、归档 stub。
+    排除：标题完全相同（那就是 upsert 自己，同名写入属于更新而非重复）。
     纯提示，不改任何数据 —— 是否合并/标注 supersedes 由调用方（AI/主人）决定。
     """
     if not title or not content:
@@ -583,9 +583,11 @@ def _find_duplicate_hints(title: str, content: str,
         if not other or other in seen_titles:
             continue
         if other == title:
-            continue                      # upsert 自己
-        if other in CORE_PAGES:
-            continue
+            continue                      # upsert 自己（同名即更新，不算重复）
+        # 2026-09-11 修正：核心页（CORE_PAGES）同样参与比对。
+        # 原先无条件跳过核心页，结果「新建『近期工作动态记录』而不是更新原页」
+        # 这类最典型的重复写入恰恰静默通过 —— 与防护目标正好背离。
+        # 真正需要豁免的只有"完全同名"，已由上面的 other == title 分支处理。
         seen_titles.add(other)
 
         o_t_bi = _bigrams(other)

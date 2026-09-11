@@ -532,6 +532,80 @@ def _maybe_auto_archive(title: str, path: Path) -> None:
         logger.warning("_maybe_auto_archive(%s): %s", title, e)
 
 
+# ---- 冲突 / 重复主动防护（演进 #1） ---------------------------------
+# memory_write 写入后据此做「疑似重复/冲突」提示（不阻断写入）。
+# 相似度用字符 bigram 集合的 Jaccard 系数 —— 零依赖、对中文天然友好
+# （FTS5 分词坑未解，但 bigram 不需要分词，直接滑窗取相邻字符对）。
+_DUP_TITLE_JACCARD = 0.6    # 标题相似度阈值：>= 判「疑似重复标题」
+_DUP_BODY_JACCARD = 0.5     # 正文相似度阈值：>= 判「疑似重复/冲突内容」
+_DUP_MAX_HINTS = 3          # 最多返回几条提示，避免刷屏
+
+
+def _bigrams(text: str) -> set[str]:
+    """字符 bigram 集合（用于相似度）。空/过短文本返回空集。"""
+    t = re.sub(r"\s+", "", text)
+    if len(t) < 2:
+        return set()
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Jaccard 相似度；空集时返回 0（避免除零）。"""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    return inter / len(a | b)
+
+
+def _find_duplicate_hints(title: str, content: str,
+                          existing: list[tuple[Path, dict[str, Any], str]]) -> list[str]:
+    """在现有条目里找疑似重复/冲突，返回最多 _DUP_MAX_HINTS 条提示。
+
+    匹配逻辑：
+      1. 标题 bigram Jaccard >= _DUP_TITLE_JACCARD → 「疑似重复标题」
+      2. 否则正文 bigram Jaccard >= _DUP_BODY_JACCARD → 「疑似重复/冲突内容」
+    排除：标题完全相同（那就是 upsert 自己）、核心页面、归档 stub。
+    纯提示，不改任何数据 —— 是否合并/标注 supersedes 由调用方（AI/主人）决定。
+    """
+    if not title or not content:
+        return []
+    t_bi = _bigrams(title)
+    c_bi = _bigrams(content)
+    if not t_bi and not c_bi:
+        return []
+
+    hints: list[tuple[float, str]] = []
+    seen_titles: set[str] = set()
+    for f, meta, body in existing:
+        other = _entry_title(meta, f)
+        if not other or other in seen_titles:
+            continue
+        if other == title:
+            continue                      # upsert 自己
+        if other in CORE_PAGES:
+            continue
+        seen_titles.add(other)
+
+        o_t_bi = _bigrams(other)
+        title_sim = _jaccard(t_bi, o_t_bi)
+        body_sim = _jaccard(c_bi, _bigrams(body))
+
+        if title_sim >= _DUP_TITLE_JACCARD:
+            kind = "疑似重复标题"
+            score = title_sim
+        elif body_sim >= _DUP_BODY_JACCARD:
+            kind = "疑似重复/冲突内容"
+            score = body_sim
+        else:
+            continue
+        hints.append((score, f"{kind}：[[{other}]]（相似度 {score:.0%}）"))
+
+    hints.sort(key=lambda x: -x[0])
+    return [h for _, h in hints[:_DUP_MAX_HINTS]]
+
+
 def _flush_access_counts() -> int:
     """Flush pending access_count increments to disk. Returns number of entries flushed.
 
@@ -1148,6 +1222,17 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
             _refresh_index()
         _m_inc("write_calls")
         _m_inc("write_updates" if existing_path else "write_creates")
+
+        # 演进 #1：冲突/重复主动防护 —— 纯提示，不阻断。让写入方（AI/主人）
+        # 自己决定是否合并或标注 supersedes/conflicts。
+        try:
+            dup_hints = _find_duplicate_hints(title, content, _iter_entries())
+        except Exception as e:  # 防护绝不干扰主流程
+            logger.warning("_find_duplicate_hints failed: %s", e)
+            dup_hints = []
+        if dup_hints:
+            result_msg += "\n\n⚠️ 疑似重复/冲突（未阻断，供你判断是否合并或标注 supersedes/conflicts）：\n- " + \
+                          "\n- ".join(dup_hints)
         return result_msg
     finally:
         _flush_access_counts()

@@ -1341,6 +1341,86 @@ def memory_rebuild_links() -> str:
     return "\n".join(lines)
 
 
+# ---- 检索兜底用的字符 bigram（演进 #4） -----------------------------
+# 与演进 #1 冲突检测的 `_bigrams`（全字符集合、用于 Jaccard 相似度）用途不同：
+# 这里是**检索**用的，只取中文 2-gram 并另算英文整词，两者不可混用，故另起名字。
+_RETRIEVAL_MIN_HITS = 2        # 共同 bigram 数下限
+_RETRIEVAL_MIN_COVERAGE = 0.15  # query bigram 覆盖率下限
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_LATIN_RE = re.compile(r"[a-z0-9]{2,}")
+
+
+def _cjk_bigrams(text: str) -> set[str]:
+    """只取中文 2-gram。英文/数字不参与 —— 否则会把覆盖率分母撑大。"""
+    out: set[str] = set()
+    for run in _CJK_RUN_RE.findall(text):
+        if len(run) == 1:
+            out.add(run)
+        else:
+            out.update(run[i:i + 2] for i in range(len(run) - 1))
+    return out
+
+
+def _retrieval_hits(query_lower: str, doc_lower: str) -> tuple[int, float]:
+    """返回 (共同命中数, query 覆盖率)。
+
+    命中数 = 共同中文 bigram 数；若英文/数字整词也有交集则额外 +1
+    （英文标识符是强信号，不该被中文 bigram 的稀释效应吃掉）。
+    """
+    qb = _cjk_bigrams(query_lower)
+    shared = len(qb & _cjk_bigrams(doc_lower))
+    coverage = (shared / len(qb)) if qb else 0.0
+    if set(_LATIN_RE.findall(query_lower)) & set(_LATIN_RE.findall(doc_lower)):
+        shared += 1
+    return shared, coverage
+
+
+def _bigram_fallback(keyword_lower: str, tag: str | None, mem_type: str | None,
+                     status: str | None, scope: str | None, project: str | None,
+                     limit: int) -> tuple[list[str], int, int]:
+    """整串子串零命中时的 bigram 兜底（#4 检索增强）。
+
+    中文没有空格，自然语言长句（「怎么在路由器上跑容器」）作为一个**整体子串**
+    永远匹配不上，而长句恰恰是真实提问最常见的形态 —— 这正是 memory_search
+    此前的能力缺口（memory_smart_search 早已用 bigram 分词，两者不一致）。
+
+    只在精确路径零命中时才被调用：常态查询不为这条罕见路径付出任何开销。
+    判据「共同 bigram ≥ 2 且覆盖率 ≥ 0.15」刻意偏严 —— 兜底是**补漏**，
+    不是宽泛召回；宁可漏一条，也不能让无关条目混进日常检索。
+    """
+    hidden = 0
+    ranked: list[tuple[int, float, Path, dict[str, Any], str]] = []
+    for f, meta, body in _iter_entries():
+        entry_tags = _entry_tags(meta)
+        if tag and tag.lower() not in [t.lower() for t in entry_tags]:
+            continue
+        if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
+            continue
+        if not _passes_lifecycle_filters(meta, status=status, scope=scope, project=project):
+            hidden += 1
+            continue
+        title = _entry_title(meta, f)
+        searchable = "{} {} {}".format(title, " ".join(entry_tags), body).lower()
+        hits, coverage = _retrieval_hits(keyword_lower, searchable)
+        if hits < _RETRIEVAL_MIN_HITS or coverage < _RETRIEVAL_MIN_COVERAGE:
+            continue
+        ranked.append((hits, coverage, f, meta, title))
+
+    ranked.sort(key=lambda x: (-x[0], -x[1]))
+    lines: list[str] = []
+    for hits, coverage, f, meta, title in ranked[:limit]:
+        tier = meta.get("tier", "warm")
+        count = meta.get("access_count", 0)
+        source = meta.get("source", "")
+        source_info = " | 来源: {}".format(source) if source else ""
+        summary = meta.get("summary", "")
+        summary_display = "\n  {}".format(summary) if summary else ""
+        lines.append("- [{}] ({}) | tier={} | reads={}{}{}{}".format(
+            title, f.name, tier, count, source_info,
+            _credential_badge(meta), summary_display))
+    return lines, len(ranked), hidden
+
+
 @mcp.tool()
 def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                   mem_type: str | None = None,
@@ -1420,6 +1500,15 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                 )
 
     if not results:
+        # #4 检索增强：精确子串零命中 → 用字符 bigram 兜底（覆盖自然语言长句），
+        # 兜底也零命中才算真的没有。常态查询走不到这里，故无额外开销。
+        fb_lines, fb_total, fb_hidden = _bigram_fallback(
+            keyword_lower, tag, mem_type, status, scope, project, limit)
+        if fb_lines:
+            _m_search("search", fb_total, _t0)
+            header = ("未找到与 '{0}' **精确匹配**的记忆 —— 以下为 bigram 模糊匹配结果"
+                      "（共 {1} 条）:\n\n").format(keyword, fb_total)
+            return header + "\n\n".join(fb_lines) + _filter_hint(hidden + fb_hidden)
         _m_search("search", 0, _t0)
         return f"未找到与 '{keyword}' 相关的记忆" + _filter_hint(hidden)
 
@@ -2063,16 +2152,44 @@ def memory_restore(title: str, source: str = "archive") -> str:
     logger.info("RESTORE title=%s", target_title)
     return f"已恢复记忆: {target_title}（从 .archive/{target_path.name}）"
 
-@mcp.tool()
-def memory_heat_suggest() -> str:
-    """Scan entries and suggest tier changes based on access_count and staleness."""
-    now = datetime.now(timezone.utc)
-    suggestions: list[str] = []
+# ---- 热度驱动自动升降级（演进 #3） --------------------------------
+# 「预览」与「执行」必须共用同一判据：若两处各写一套阈值，dry-run 说的和
+# 实际改的就会漂移，而这种漂移是静默的（预览说改 3 条、实改 5 条）——比
+# 没有预览更危险。故判据抽成单一函数 _heat_tier_decision，两处都调它。
+_HEAT_COLD_MAX = 0.1         # 低于此分且非 cold → 降为 cold
+_HEAT_DEMOTE_HOT_MAX = 0.5   # 低于此分且是 hot  → 降为 warm
+_HEAT_HOT_MIN = 3.0          # 高于此分且非 hot  → 升为 hot
+
+
+def _heat_tier_decision(title: str, current_tier: str, score: float) -> str | None:
+    """按热度分数给出该条应有的 tier；返回 None 表示维持现状。
+
+    核心页（CORE_PAGES）一律豁免：它们由人工或生成器维护（如 `记忆索引.md`
+    每次写入都会重建），自动改 tier 没有意义。这与 `_maybe_auto_archive`
+    的核心页保护同源，也避免出现「预览清单里有核心页、执行时却被跳过」的
+    不一致 —— 豁免发生在判据内部，两处行为天然一致。
+    """
+    if title in CORE_PAGES:
+        return None
+    if score < _HEAT_COLD_MAX and current_tier != "cold":
+        return "cold"
+    if score < _HEAT_DEMOTE_HOT_MAX and current_tier == "hot":
+        return "warm"
+    if score > _HEAT_HOT_MIN and current_tier != "hot":
+        return "hot"
+    return None
+
+
+def _heat_report(apply: bool) -> str:
+    """热度分析主体；apply=True 时真正把 tier 写盘。"""
+    _invalidate_cache()
+    pending: list[tuple[Path, str, str, str, float, int]] = []
     stats: list[tuple[str, str, str, int, str, str]] = []
+    core_skipped = 0
 
     for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
         try:
-            meta, body = _load_memory(f)
+            meta, _body = _load_memory(f)
         except Exception:
             continue
         title = _entry_title(meta, f)
@@ -2085,34 +2202,90 @@ def memory_heat_suggest() -> str:
         source = str(meta.get("source", "")) or "?"
         stats.append((title, tier_val, source, reads, updated_str, created_str))
 
-        updated_raw = meta.get("updated", "")
-        days_since_update = _days_since_utc(updated_raw)
-
         score = _heat_score(reads, str(meta.get("updated", "")))
-        if score < 0.1 and tier_val != "cold":
-            suggestions.append("- [{0}] {1}->cold | heat_score={2:.2f}, {3}d 未更新".format(title, tier_val, score, days_since_update))
-        elif score < 0.5 and tier_val == "hot":
-            suggestions.append("- [{0}] hot->warm | heat_score={1:.2f}, {2}d 未更新".format(title, score, days_since_update))
-        elif score > 3.0 and tier_val != "hot":
-            suggestions.append("- [{0}] {1}->hot | heat_score={2:.2f}, 访问频繁".format(title, tier_val, score))
+        to_tier = _heat_tier_decision(title, tier_val, score)
+        if to_tier is None:
+            if title in CORE_PAGES:
+                core_skipped += 1
+            continue
+        pending.append((f, title, tier_val, to_tier, score,
+                        _days_since_utc(meta.get("updated", ""))))
 
-    lines = ["# 热度分析建议", ""]
-    lines.append("共 {0} 条记忆\n".format(len(stats)))
+    # 按 heat_score 升序：降级类（分数低）排在前面，先看更需要确认的部分
+    pending.sort(key=lambda x: x[4])
+
+    lines: list[str] = []
+    lines.append("# 热度分析与自动升降级" if not apply else "# 热度分析与自动升降级（已执行）")
+    lines.append("")
+    lines.append("共 {0} 条记忆（核心页豁免 {1} 条）\n".format(len(stats), core_skipped))
 
     lines.append("## 按访问次数排序")
     for title, tier_val, source, reads, updated_str, created_str in sorted(stats, key=lambda x: -x[3]):
         score = _heat_score(reads, updated_str)
-        lines.append("- [{0}] {1} | {2} | score={3:.1f}, {4} 次读取 | {5}".format(created_str, title, tier_val, score, reads, source))
-
+        lines.append("- [{0}] {1} | {2} | score={3:.1f}, {4} 次读取 | {5}".format(
+            created_str, title, tier_val, score, reads, source))
     lines.append("")
-    if suggestions:
-        lines.append("## 建议调整")
-        lines.extend(suggestions[:30])
-    else:
-        lines.append("## 建议调整")
-        lines.append("- 暂无需要调整的条目")
 
+    if not pending:
+        lines.append("## 调整清单")
+        lines.append("- 暂无需要调整的条目")
+        return "\n".join(lines)
+
+    if apply:
+        applied: list[str] = []
+        for path, title, from_tier, to_tier, _score, _days in pending:
+            try:
+                em, ebody = _load_memory(path)
+            except Exception as e:      # 单条失败不影响整批
+                logger.warning("heat_apply load failed title=%s: %s", title, e)
+                continue
+            _write_memory(
+                path, title=title, tags=_entry_tags(em), source=em.get("source"),
+                content=ebody, created=str(em.get("created", "")),
+                summary=em.get("summary"), tier=to_tier,
+                access_count=em.get("access_count", 0), links=em.get("links"),
+            )
+            applied.append("{}: {}->{}".format(title, from_tier, to_tier))
+        if applied:
+            _refresh_index()
+        logger.info("HEAT_APPLY applied=%d skipped_core=%d", len(applied), core_skipped)
+        lines.append("## 已执行（{0} 条）".format(len(applied)))
+        lines.extend("- " + item for item in applied)
+        lines.append("")
+        lines.append("tier 已写盘，记忆索引已重建。")
+        return "\n".join(lines)
+
+    lines.append("## 待调整（未执行，共 {0} 条）".format(len(pending)))
+    for _path, title, from_tier, to_tier, score, days in pending:
+        tail = "访问频繁" if to_tier == "hot" else "{0}d 未更新".format(days)
+        lines.append("- [{0}] {1}->{2} | heat_score={3:.2f}, {4}".format(
+            title, from_tier, to_tier, score, tail))
+    lines.append("")
+    lines.append("以上仅为预览，**未改动任何数据**。确认无误后传 `apply=True` 执行。")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def memory_heat_suggest(apply: bool = False) -> str:
+    """Scan entries and suggest tier changes based on access_count and staleness.
+
+    apply=False（默认）**只预览**，不改任何数据；apply=True 才真正把 tier
+    写盘（并重建索引）。默认不执行是刻意的：自动升降级一次会改动全库 tier，
+    误伤的代价远高于「多看一次预览」；预览结果也因此明确标注「未执行」，
+    以免被误读为已完成。
+
+    预览与执行共用 `_heat_tier_decision` 判据 —— 所见即所改。
+    核心页（`CORE_PAGES`）一律豁免，不参与自动调整。
+    """
+    if not apply:
+        return _heat_report(apply=False)
+    # 仅在实际写盘时加锁：默认的预览是纯读，不该为它引入锁开销
+    locked = _acquire_lock()
+    try:
+        return _heat_report(apply=True)
+    finally:
+        if locked:
+            _release_lock()
 
 @mcp.tool()
 def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:

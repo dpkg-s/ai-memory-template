@@ -190,6 +190,54 @@ _fp_bad = {q: t for q, t in _false_positives.items() if t}
 check("Q6 负样本查询全部返回空（不过度召回）", not _fp_bad,
       f"误召回={_fp_bad}")
 
+# =====================================================================
+# #4 检索增强：memory_search 此前是**纯子串匹配** —— 整句长查询（「怎么在路由器
+# 上跑容器」）作为一个整体子串必然零命中，而长句恰恰是真实提问最常见的形态。
+# 现已加字符 bigram 兜底。以下护栏覆盖：短关键词零回归、精确命中不误标、
+# 长句能命中、兜底结果可辨识、负样本仍不误召回。
+section("H. memory_search 长句覆盖（#4 bigram 兜底）")
+
+_SEARCH_TITLE_RE = re.compile(r"^-\s+\[(.+?)\]\s+\(", re.MULTILINE)
+
+
+def search_titles(q: str) -> list[str]:
+    """调用 memory_search（精确子串入口）并解析标题。"""
+    return _SEARCH_TITLE_RE.findall(server.memory_search(q, limit=_TOPK, status="any"))
+
+
+_SHORT_KEYWORDS = ["PyInstaller", "busy_timeout", "wikilink", "最左前缀", "overlay"]
+_short_miss = [q for q in _SHORT_KEYWORDS if not search_titles(q)]
+check("H1 短关键词仍精确命中（零回归）", not _short_miss, f"未命中={_short_miss}")
+
+_out_exact = server.memory_search("PyInstaller", limit=_TOPK, status="any")
+check("H2 精确命中时不追加模糊匹配标注", "模糊匹配" not in _out_exact, _out_exact[:120])
+
+_LONG_CASES: list[tuple[str, set[str]]] = [
+    ("怎么在路由器上跑容器", {"检索_路由器Docker"}),
+    ("多进程同时读写数据库", {"检索_SQLite并发"}),
+    ("把多个分片合成一个视频", {"检索_ffmpeg合并"}),
+    ("小程序的支付回调怎么验签", {"检索_微信小程序支付"}),
+    ("正则把 CPU 打满", {"检索_正则回溯"}),
+]
+_hit_n = 0
+_long_miss: list[str] = []
+for _q, _exp in _LONG_CASES:
+    if set(search_titles(_q)) & _exp:
+        _hit_n += 1
+    else:
+        _long_miss.append(_q)
+_long_recall = _hit_n / len(_LONG_CASES)
+check(f"H3 长句兜底召回 ≥ 0.80（实测 {_long_recall:.2f}；本改造前为 0.00）",
+      _long_recall >= 0.80, f"未命中={_long_miss}")
+
+_out_fb = server.memory_search("怎么在路由器上跑容器", limit=_TOPK, status="any")
+check("H4 兜底结果明确标注为模糊匹配", "bigram 模糊匹配结果" in _out_fb, _out_fb[:160])
+
+_fb_neg = {q: search_titles(q) for q in _NEGATIVE_QUERIES}
+_fb_neg_bad = {q: t for q, t in _fb_neg.items() if t}
+check("H5 负样本在 memory_search 中同样不误召回", not _fb_neg_bad,
+      f"误召回={_fb_neg_bad}")
+
 print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")
 if _failed:
     print("失败项:")

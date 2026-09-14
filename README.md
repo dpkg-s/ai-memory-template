@@ -154,6 +154,17 @@ supersedes: 项目_xxx_旧索引方案
 
 提示**不阻断写入** —— 是否合并、是否给旧条目标注 `supersedes`/`conflicts` 由写入方决定。检测异常时静默跳过，绝不影响正常写入。
 
+### 长句检索兜底
+
+`memory_smart_search` 一直用 bigram 分词，但 `memory_search` 是**纯子串匹配** —— 短关键词（「路由器」）没问题，长句（「怎么在路由器上跑容器」）作为整体子串必然零命中，「查不到」和「不存在」就被混为一谈。
+
+现在 `memory_search` 在**精确路径零命中时**才降级到 bigram 兜底，命中门槛为「共享中文 bigram ≥ 2 且 query 覆盖率 ≥ 0.15」。两个好处：
+
+- **常态零开销**：只在精确匹配颗粒无收时才做兜底扫描，日常查询不多花一毫秒
+- **不硬凑**：弱相关条目达不到门槛就不进结果，避免「搜什么都有一堆似是而非的命中」
+
+兜底结果会在首行显式标注「以下为 bigram 模糊匹配结果」，**不伪装成精确命中**。长句召回实测 0.00 → 1.00。
+
 ### 显式双链，关系可追溯
 
 链接关系用 Obsidian 风格的 `[[Wiki Link]]` 在正文里显式标注，**正文双链是链接关系的唯一事实源**。
@@ -174,7 +185,7 @@ supersedes: 项目_xxx_旧索引方案
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **339 条断言的十一层测试**：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 7 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15
+- **373 条断言的十二层测试**：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`，可观测层拆为 `metrics.py`
 
@@ -357,7 +368,7 @@ args = ["/path/to/ai-memory/server.py"]
 
 | 工具 | 说明 |
 |------|------|
-| `memory_search(keyword, tag?, limit=20, mem_type?, scope?, project?, status?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮；可按标签 / 类型 / 作用域 / 项目过滤。**省略 `status` 时默认隐藏 `archived`**，隐藏条数会在末尾提示 |
+| `memory_search(keyword, tag?, limit=20, mem_type?, scope?, project?, status?)` | 关键词搜索标题 / 标签 / 正文，命中处 `**` 高亮；可按标签 / 类型 / 作用域 / 项目过滤。**省略 `status` 时默认隐藏 `archived`**，隐藏条数会在末尾提示。精确零命中时自动降级为中文 bigram 模糊匹配（结果会显式标注） |
 | `memory_smart_search(query, tag?, limit=10, mem_type?, scope?, project?, status?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，另加时效性加权。**零词法命中即非候选**，时效性不能单独决定入选 |
 | `memory_list(tag?, limit=20, tier?, mem_type?, scope?, project?, status?, include_trash?)` | 罗列记忆摘要，过滤语义同上；`include_trash=True` 改为列出回收站内容 |
 | `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链与反向链接图谱，默认截断 10 条 |
@@ -373,7 +384,7 @@ args = ["/path/to/ai-memory/server.py"]
 | `memory_restore(title, source="archive")` | 恢复。默认从 `.archive/` 取回并把 tier 重置为 warm；`source="trash"` 从回收站取回（根目录已有同名条目则拒绝，不静默覆盖） |
 | `memory_batch_tag(old_tag, new_tag)` | 全库标签重命名 |
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
-| `memory_heat_suggest()` | 按访问频次与陈旧度给出 tier 升降建议 |
+| `memory_heat_suggest(apply=False)` | 按访问频次与陈旧度给出 tier 升降建议。默认 `apply=False` **只预览不写盘**；`apply=True` 才真正批量落地（核心页豁免，预览与执行共用同一判据函数，不会漂移） |
 
 ### 审计
 
@@ -443,7 +454,7 @@ python server.py
 | `warm` | 一般 | 常驻根目录（默认） |
 | `cold` | 冷数据 | **写入时自动归档**到 `.archive/`，原位留摘要 stub |
 
-`memory_archive_old(days=90)` 可按时间批量归档，自动跳过 `CORE_PAGES` 保护名单（`记忆索引`、`近期工作动态`、`用户画像` 等 13 个核心页）。`memory_heat_suggest()` 会依据实际访问频次与陈旧度给出升降建议。
+`memory_archive_old(days=90)` 可按时间批量归档，自动跳过 `CORE_PAGES` 保护名单（`记忆索引`、`近期工作动态`、`用户画像` 等 13 个核心页）。`memory_heat_suggest()` 会依据实际访问频次与陈旧度给出升降建议；加 `apply=True` 即可让它**直接落地** —— 先跑一次预览确认名单，再带 `apply=True` 执行，两个模式共用同一判据函数，不会出现「预览说升、执行说降」。
 
 ---
 
@@ -604,10 +615,11 @@ ai-memory-template/
 │   ├── test_concurrency.py       # 38 断言：跨进程并发（乐观锁 / 混合操作 / 读写并发）
 │   ├── concurrency_worker.py     # 并发测试的子进程工人（非测试脚本，不被 CI 执行）
 │   ├── test_recovery.py          # 35 断言：索引损坏 / 锁残留 / 进程强杀 / 畸形文件
-│   ├── test_search_quality.py    #  7 断言：检索质量护栏（recall@10 / MRR / 零结果率）
+│   ├── test_search_quality.py    # 12 断言：检索质量护栏（recall@10 / MRR / 零结果率 / 长句兜底）
 │   ├── test_index_links.py       # 18 断言：索引链接可解析性（防自动生成死链）
 │   ├── test_trash.py             # 34 断言：回收站闭环（列出 / 取回 / 清空 / 同名拒绝）
 │   ├── test_dup_guard.py         # 15 断言：冲突重复防护（标题 / 正文 / 核心页 / 容错）
+│   ├── test_heat_apply.py        # 29 断言：热度自动升降级（判据 / 预览 / 执行 / 字段不丢）
 │   └── test_metrics.py           # 45 断言：运行时可观测性
 ├── scripts/
 │   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
@@ -633,7 +645,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 339 条断言。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 373 条断言。
 
 ### 语义回归 —— `tests/test_roundtrip.py`（28 断言）
 
@@ -687,9 +699,11 @@ ai-memory-template/
 - 七类畸形 Markdown（0 字节 / 无 frontmatter / 半截 `---` / 非法 YAML 等）→ 10 个工具全部降级不崩
 - 重复重建幂等
 
-### 检索质量 —— `tests/test_search_quality.py`（7 断言）
+### 检索质量 —— `tests/test_search_quality.py`（12 断言）
 
 15 篇 fixture（中文 / 英文 / 代码标识符 / 专有名词）× 20 条查询 + 3 条负样本，以 **recall@10 ≥ 0.95、MRR ≥ 0.80、零结果率为 0、负样本必须全空** 作为护栏。检索相关改动必须过这道闸。
+
+后半段（H 组 5 断言）专测 `memory_search` 的**长句兜底**：长句召回 ≥ 0.80（改造前恒为 0.00）、短关键词零回归、精确命中不得被误标为模糊、负样本不得被兜底误召回。
 
 ### 索引链接可解析性 —— `tests/test_index_links.py`（18 断言）
 
@@ -701,6 +715,36 @@ ai-memory-template/
 - 标题含空格（原缺陷场景）与含 `/ : * ?` 等归一化字符的标题均须可解析
 - 连续三次 `_refresh_index()` 后链接集合不变（幂等，防覆盖）
 - `memory_index_draft` 走同一口径；索引条目数不缺不漏
+
+### 回收站闭环 —— `tests/test_trash.py`（34 断言）
+
+`memory_delete` 默认软删到 `.trash/`，但「可恢复」要真的能恢复才算数。覆盖：
+
+- 软删除后条目立即退出检索与列表，且**仍可被 `include_trash=True` 列出**
+- 从回收站取回后：文件回到根目录、字段（tier / status / schema_version）正确、索引重新可见
+- **根目录已有同名条目时拒绝覆盖**（回收站里那份可能是被新版取代的旧内容，静默覆盖比不恢复更危险）
+- 回收站内同名两条并存时不误取
+- `purge=True` 永久删除、`empty_trash=True` 清空回收站
+- 既有 `.archive/` 恢复路径零回归
+
+### 冲突 / 重复防护 —— `tests/test_dup_guard.py`（15 断言）
+
+- 标题相近（≥ 0.6）判「疑似重复标题」；标题不相似但正文相近（≥ 0.5）判「疑似重复/冲突内容」
+- **无关内容不误报**（假阳性会迅速让人无视提示）
+- `upsert` 同一标题不把自己当成重复项
+- **核心页变体同样触发**（「新建『近期工作动态记录』而不是更新原页」正是最高发的重复写入）
+- 检测内部异常时静默跳过，写入本身照常成功
+
+### 热度自动升降级 —— `tests/test_heat_apply.py`（29 断言）
+
+`memory_heat_suggest(apply=True)` 会把预览里的建议**真正写盘**。整组测试围绕「预览与执行绝不能漂移」展开：
+
+- 判据纯函数 `_heat_tier_decision` 逐档取值：冷 → `cold`、hot 且未达阈值 → `warm`、过热 → `hot`、其余维持现状、**核心页一律豁免**
+- **预览不改盘**：`apply=False` 前后全库文件的哈希与 mtime 不变
+- **执行写盘且所见即所改**：预览列出的每一条，执行后 tier 与之一致
+- **幂等**：连续两次 `apply=True`，第二次无任何改动
+- **v2 字段不丢**：批量改 tier 不会清掉 `scope` / `status` / `confidence` / `supersedes` 等字段
+- 空库边界不崩
 
 ### 运行时可观测性 —— `tests/test_metrics.py`（45 断言）
 
@@ -720,7 +764,7 @@ for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 
 CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
 
-> 这九层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。
+> 这十二层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。
 
 ---
 

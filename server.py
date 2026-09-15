@@ -75,6 +75,7 @@ from yaml_io import (
     parse_yaml_frontmatter as _parse_yaml_frontmatter,
     read_text as _read_text,
     strip_bom as _strip_bom,
+    strip_leading_frontmatter as _strip_leading_frontmatter,
     yaml_quote_scalar as _yaml_quote_scalar,
 )
 
@@ -1000,6 +1001,10 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
     # verified 为假时不应残留验证时间戳（避免"未验证却有 verified_at"的矛盾态）
     if not verified:
         verified_at = None
+    # 归一化正文：调用方常把「带 frontmatter 的整篇笔记」当作 content 传入，
+    # 若直接拼接会产出双 frontmatter（Obsidian 只认第一块，第二块退化为正文垃圾，
+    # 并污染检索/去重/链接抽取）。此处统一剥掉，顺带自愈历史受损条目。
+    content = _strip_leading_frontmatter(content)
     frontmatter = _build_frontmatter(title, tags, source, created=created, summary=summary,
                                      tier=tier, access_count=access_count, links=links, version=version,
                                      mem_type=mem_type, confidence=confidence, verified=verified,
@@ -1108,6 +1113,12 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     # 第三轮 P0-6：拒绝空壳与空标题
     if not title or not title.strip():
         return "错误：标题为空，已拒绝写入。"
+    # 归一化必须早于空壳校验与摘要派生：调用方（其他 AI 客户端 / 手工整篇粘贴 /
+    # 跨工具导入）常把「带 frontmatter 的完整笔记」直接当 content 传入。若不先剥，
+    # ① 正文会叠加出双 frontmatter（Obsidian 只认第一块，第二块沦为正文垃圾）；
+    # ② 自动摘要会把那段 frontmatter 文本固化进 summary，污染检索结果与索引快照。
+    # 仅含 frontmatter 而无正文的输入会在下一步被空壳校验拦下。
+    content = _strip_leading_frontmatter(content)
     if not content or not content.strip():
         return "错误：内容为空，已拒绝创建空壳记忆（改进#5）。如为更新且需保留正文，请勿传空 content。"
 

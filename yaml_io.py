@@ -26,6 +26,7 @@ __all__ = [
     "parse_scalar",
     "parse_yaml_frontmatter",
     "parse_frontmatter",
+    "strip_leading_frontmatter",
     "yaml_quote_scalar",
     "dump_yaml_frontmatter",
     "build_frontmatter",
@@ -320,6 +321,27 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
         pass
 
     return parse_yaml_frontmatter(raw_meta), body.strip()
+
+
+def strip_leading_frontmatter(text: str) -> str:
+    """剥掉正文开头多余的 frontmatter 块（可能连续多块），返回纯正文。
+
+    背景：调用方（其他 AI 客户端、手工整篇粘贴、跨工具导入）常把「带 frontmatter
+    的完整笔记」直接当作 content 传入；而写入端会自行生成权威 frontmatter 再拼接，
+    两者叠加即产出「双 frontmatter」—— Obsidian 只认第一块，第二块退化为正文里的
+    垃圾文本，并污染检索、去重与链接抽取（2026-09-15 全库排查出 8 篇此型损坏）。
+
+    归一化只在「块内容确实像 frontmatter」（至少存在一行 `key:`）时才执行，
+    以免误伤正文开头恰为 `---` 水平线 + 后续普通文本的合法写法。
+    """
+    text = strip_bom(text)
+    while True:
+        m = re.match(r"^\s*---[ \t]*\r?\n(.*?)\r?\n[ \t]*---[ \t]*(?:\r?\n|\Z)", text, re.S)
+        if not m:
+            return text.lstrip("\r\n")
+        if not re.search(r"^[ \t]*[A-Za-z_][\w\-]*[ \t]*:", m.group(1), re.M):
+            return text.lstrip("\r\n")
+        text = text[m.end():]
 
 
 def yaml_quote_scalar(value: Any) -> str:

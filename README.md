@@ -185,7 +185,7 @@ supersedes: 项目_xxx_旧索引方案
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **373 条断言的十二层测试**：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29
+- **414 条断言的十三层测试**：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 41
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`，可观测层拆为 `metrics.py`
 
@@ -620,7 +620,8 @@ ai-memory-template/
 │   ├── test_trash.py             # 34 断言：回收站闭环（列出 / 取回 / 清空 / 同名拒绝）
 │   ├── test_dup_guard.py         # 15 断言：冲突重复防护（标题 / 正文 / 核心页 / 容错）
 │   ├── test_heat_apply.py        # 29 断言：热度自动升降级（判据 / 预览 / 执行 / 字段不丢）
-│   └── test_metrics.py           # 45 断言：运行时可观测性
+│   ├── test_metrics.py           # 45 断言：运行时可观测性
+│   └── test_frontmatter_norm.py  # 41 断言：frontmatter 归一化（双 frontmatter / 摘要污染 / 自愈）
 ├── scripts/
 │   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
 ├── .github/workflows/
@@ -645,7 +646,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 373 条断言。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 414 条断言。
 
 ### 语义回归 —— `tests/test_roundtrip.py`（28 断言）
 
@@ -746,6 +747,20 @@ ai-memory-template/
 - **v2 字段不丢**：批量改 tier 不会清掉 `scope` / `status` / `confidence` / `supersedes` 等字段
 - 空库边界不崩
 
+### frontmatter 归一化 —— `tests/test_frontmatter_norm.py`（41 断言）
+
+写入端会自行生成权威 frontmatter，而调用方（其他 AI 客户端、手工整篇粘贴、跨工具导入）**常把「带 frontmatter 的完整笔记」直接当作 `content` 传入**。两者直接拼接会产出「双 frontmatter」：Obsidian 只认第一块，第二块退化为正文里的深层垃圾；更隐蔽的是**自动摘要取自未剥离的原始 `content`**，会把那段 frontmatter 文本固化进 `summary` 字段，持续污染检索结果与索引快照。
+
+修复分两道纵深：`yaml_io.strip_leading_frontmatter()` 纯函数负责剥离，`memory_write()` 入口调用它（**早于空壳校验与摘要/标签派生**），`_write_memory()` 收口再剥一次（覆盖其余写盘路径）：
+
+- 传入单块 / 连续多块 frontmatter → 落盘仍只有 1 块，正文干净
+- **摘要污染回归**：`summary` 不得含 `---` / `title:` 等传入块文本
+- **权威性**：服务器生成的 `title` / `tags` 为准，传入块不夺权
+- **更新路径**（历史重灾区）同样只留 1 块，版本号正常自增
+- **自愈**：磁盘上已被写坏的条目，再次写入即恢复
+- **误伤防护**：正文开头恰为 `---` 水平线 + 非 `key:` 文本时**不剥**
+- 幂等（连写两次不堆叠）、纯函数边界（空串 / 无 frontmatter / 空块 / BOM）
+
 ### 运行时可观测性 —— `tests/test_metrics.py`（45 断言）
 
 - 计数 / 耗时累积、跨实例 read-merge-write 合并、达到阈值自动落盘
@@ -764,7 +779,7 @@ for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 
 CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
 
-> 这十二层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。
+> 这十三层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
 
 ---
 

@@ -5,6 +5,8 @@ __pycache__/
 
 # 重构前的本地备份（不入库）
 server.bak.*
+# 跨仓同步（template ⇄ 本地运行版）前的自动备份
+*.syncbak.*
 
 # SQLite metadata index (generated at runtime by memory_index.py)
 # 一条通配覆盖全部派生物：.db 本体、-shm/-wal 旁文件，以及测试用 rename 产生的

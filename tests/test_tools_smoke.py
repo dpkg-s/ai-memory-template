@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""20 个 MCP 工具全量冒烟测试。
+"""22 个 MCP 工具全量冒烟测试。
 
 用途:
     确认 server.py 的**全部** MCP 工具都能被正常调用且不抛异常。与
     test_roundtrip.py 分工互补:
       - test_roundtrip.py 验证「语义正确性」(frontmatter 写读无损、反斜杠
         不雪崩、read 不污染 updated、SQLite 索引自愈等)
-      - 本脚本验证「覆盖面」(20 个工具一个不漏、全部可调用)
+      - 本脚本验证「覆盖面」(22 个工具一个不漏、全部可调用)
     两者结合才能支撑 server.py 的安全重构（P3 模块化即以此护航）。
 
     脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
+
+    ⚠️ memory_restart **不在此调用**：它会真的 execv 掉当前进程。行为测试见
+    tests/test_restart.py（用替身记录 execv，绝不真换进程）。
 
 运行:
     python tests/test_tools_smoke.py        # 退出码 0=全绿, 1=有失败
@@ -118,15 +121,48 @@ import asyncio  # noqa: E402
 EXPECTED_TOOLS = {
     "memory_write", "memory_read", "memory_rebuild_links", "memory_search",
     "memory_list", "memory_delete", "memory_update_metadata", "memory_audit",
-    "memory_index_draft", "memory_archive", "memory_restore", "memory_heat_suggest",
+    "memory_doctor", "memory_index_draft", "memory_archive", "memory_restore",
+    "memory_heat_suggest", "memory_restart",
     "memory_graph", "memory_orphans", "memory_batch_tag", "memory_batch_tier",
     "memory_archive_old", "memory_smart_search", "memory_recent", "memory_stats",
 }
+# A1 (2026-09-17) 行为标注：MCP 规范里 destructiveHint / openWorldHint 默认都是
+# True，漏标会让客户端把普通 upsert 也当成需二次确认的破坏性操作，并误以为工具
+# 会触达外部世界。此处把「只读集」「破坏性集」「非幂等集」三组钉死，防后续新增
+# 工具漏标。
+EXPECTED_READONLY = {
+    "memory_read", "memory_search", "memory_smart_search", "memory_list",
+    "memory_recent", "memory_stats", "memory_graph", "memory_orphans",
+    "memory_audit", "memory_doctor", "memory_index_draft", "memory_rebuild_links",
+}
+EXPECTED_DESTRUCTIVE = {
+    "memory_archive", "memory_archive_old", "memory_delete", "memory_batch_tag",
+}
+# 非幂等（重复调用语义不同或有额外副作用）：
+#   memory_restore —— 从 .archive 移回后再次调用，目标位置可能已被新条目占用；
+#   memory_restart —— 每调用一次就真的再换一次进程，重复调用有真实副作用。
+EXPECTED_NONIDEM = {"memory_restore", "memory_restart"}
 try:
-    registered = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    check("工具总数 = 20", len(registered) == 20, f"实际 {len(registered)}: {sorted(registered)}")
+    tools = asyncio.run(server.mcp.list_tools())
+    registered = {t.name for t in tools}
+    check("工具总数 = 22", len(registered) == 22, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
+
+    ann = {t.name: t.annotations for t in tools}
+    check("全部工具均有 annotations", all(a is not None for a in ann.values()),
+          f"缺失={sorted(n for n, a in ann.items() if a is None)}")
+    check("openWorldHint 全为 False（纯本地 Vault）",
+          all(a.openWorldHint is False for a in ann.values() if a is not None))
+    check("readOnlyHint 集合与预期一致",
+          {n for n, a in ann.items() if a and a.readOnlyHint} == EXPECTED_READONLY,
+          f"实际={sorted(n for n, a in ann.items() if a and a.readOnlyHint)}")
+    check("destructiveHint 集合与预期一致",
+          {n for n, a in ann.items() if a and a.destructiveHint} == EXPECTED_DESTRUCTIVE,
+          f"实际={sorted(n for n, a in ann.items() if a and a.destructiveHint)}")
+    check("idempotentHint=False 集合与预期一致",
+          {n for n, a in ann.items() if a and a.idempotentHint is False} == EXPECTED_NONIDEM,
+          f"实际={sorted(n for n, a in ann.items() if a and a.idempotentHint is False)}")
 except Exception as e:  # noqa: BLE001
     check("列出注册工具", False, f"{type(e).__name__}: {e}")
 

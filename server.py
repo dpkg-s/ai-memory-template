@@ -8,12 +8,14 @@ Storage:
 - Frontmatter written as YAML (Obsidian-native), legacy JSON still readable
 
 Features:
-- 20 MCP tools: read/write/search/list/recent/graph/orphans/stats, batch tag &
-  tier, heat-based tier suggestions, archive/restore, audit, rebuild_links,
+- 22 MCP tools: read/write/search/smart_search/list/recent/graph/orphans/stats,
+  audit/doctor/index_draft/rebuild_links, batch tag & tier, heat-based tier
+  suggestions, archive/restore/delete, in-place hot restart (memory_restart),
   auto-generated MOC index (记忆索引.md)
 - YAML frontmatter, Obsidian wikilinks, automatic link extraction,
   title-based dedup upsert, file locking, cross-process cache invalidation,
   SQLite metadata index for O(1) title lookup
+- 零外部依赖：仅标准库 + mcp SDK
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import atexit
 import json
 import re
 import sqlite3
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +43,7 @@ logger.addHandler(_log_handler)
 logger.setLevel(logging.INFO)
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 import memory_index as midx
 import locks
@@ -426,6 +430,16 @@ def _replace_with_retry(tmp: Path, path: Path, attempts: int = 6,
     raise last_err
 
 
+# ---- 写盘持久化 (2026-09-17, B3) ------------------------------------
+# 原子替换只保证「读者看不到半写文件」，不保证「内容已落盘」——os.replace 返回时
+# 数据可能仍在页缓存里，断电或进程被强杀会留下「文件名对、内容为空」的条目。
+# 在 replace 之前对 tmp 做 flush + fsync，把内容推到存储设备，构成完整的
+# tmp → fsync → rename 三段式（EverOS 架构文档将此列为 Key guarantee）。
+# 代价：每次写入多一次磁盘同步，毫秒级。本库写入频率是会话级而非高并发，
+# 该代价换取崩溃场景的完整性是划算的；批量写入可设 AI_MEMORY_FSYNC=0 临时关闭。
+_FSYNC_ENABLED = os.environ.get("AI_MEMORY_FSYNC", "1") not in ("0", "false", "False")
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write text atomically: temp file in the same dir, then os.replace.
 
@@ -444,7 +458,16 @@ def _atomic_write_text(path: Path, content: str) -> None:
         tmp.unlink(missing_ok=True)
     except OSError:
         pass
-    tmp.write_text(content, encoding="utf-8")
+    if _FSYNC_ENABLED:
+        # 显式 open（而非 path.write_text）只为在 close 前拿到 fileno 做 fsync。
+        # newline 保持默认 None，与 Path.write_text 语义一致（Windows 下 \n → \r\n）。
+        # 切勿改成 newline=""：那会一次性改变全库行尾，属破坏性回归。
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    else:
+        tmp.write_text(content, encoding="utf-8")
     try:
         _replace_with_retry(tmp, path)
     except OSError:
@@ -1056,7 +1079,27 @@ def _refresh_index() -> None:
         logger.warning("_refresh_index failed: %s", e)
 
 
-@mcp.tool()
+# ---- MCP 工具行为标注 (2026-09-17, A1) ------------------------------
+# 客户端依据这些 hint 决定是否向用户二次确认、能否并发或重试调用，并在渐进式
+# 发现工具时据此排序。语义遵循 MCP 规范，两个默认值最容易踩：
+#   * destructiveHint 默认是 **True** —— 非破坏性写工具必须显式设 False，
+#     否则客户端会把普通 upsert 也当成破坏性操作要求确认。只读工具按规范
+#     本可省略该字段（readOnlyHint 为真时它无意义），此处仍显式声明，
+#     以防客户端忽略该前提条件而按默认值误判。
+#   * openWorldHint 默认是 **True** —— 本库只操作本地 Vault，不触达外部世界。
+# idempotentHint 表示「重复调用结果相同」：仅 memory_restore 例外 —— 从
+# .archive 移回后再次调用语义不明确（目标位置可能已被新条目占用）。
+_RO = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                      idempotentHint=True, openWorldHint=False)
+_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                         idempotentHint=True, openWorldHint=False)
+_WRITE_NONIDEM = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                 idempotentHint=False, openWorldHint=False)
+_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                               idempotentHint=True, openWorldHint=False)
+
+
+@mcp.tool(annotations=_WRITE)
 def memory_write(title: str, content: str, tags: list[str] | None = None, source: str | None = None,
                  summary: str | None = None, tier: str | None = None,
                  mem_type: str | None = None, confidence: str | None = None,
@@ -1260,7 +1303,7 @@ CORE_META_KEYS = ["title", "tags", "summary", "created", "updated", "tier", "acc
                   "scope", "project", "status", "supersedes", "conflicts", "source_context"]
 BODY_TRUNCATE_CHARS = 8000  # memory_read 默认正文截断阈值，防超长笔记(如 近期工作动态 21KB)吃 token
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
     """Read a memory entry by exact title, with filename fallback for legacy files.
 
@@ -1314,7 +1357,7 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
     return f"未找到标题为 '{title}' 的记忆"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_rebuild_links() -> str:
     """链接一致性校验（2026-09-06 起不再重写文件/写 links 字段）。
 
@@ -1432,7 +1475,7 @@ def _bigram_fallback(keyword_lower: str, tag: str | None, mem_type: str | None,
     return lines, len(ranked), hidden
 
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                   mem_type: str | None = None,
                   scope: str | None = None, project: str | None = None,
@@ -1556,7 +1599,7 @@ def _list_trash(limit: int = 20) -> str:
             f"清空: memory_delete(empty_trash=True)\n" + "\n".join(lines) + tail)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None,
                 mem_type: str | None = None,
                 scope: str | None = None, project: str | None = None,
@@ -1626,7 +1669,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
         result += f"\n\n... 共 {total} 条，显示前 {limit} 条"
     return result + _filter_hint(hidden)
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 @_locked_write
 def memory_delete(title: str, trash: bool = True, purge: bool = False,
                   empty_trash: bool = False) -> str:
@@ -1698,7 +1741,7 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False,
             return f"已永久删除记忆: {title} ({f.name})"
     return f"未找到标题为 '{title}' 的记忆"
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE)
 @_locked_write
 def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] | None = None,
                            summary: str | None = None, source: str | None = None,
@@ -1795,7 +1838,7 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
             return f"已更新元数据: {title}"
     return f"未找到标题为 '{title}' 的记忆"
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_audit() -> str:
     """Scan the vault and summarize what should be indexed or cleaned up manually.
 
@@ -1930,7 +1973,114 @@ def memory_audit() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
+def memory_doctor(limit: int = 20) -> str:
+    """Check SQLite index <-> disk consistency without repairing anything.
+
+    ``_refresh_index`` rebuilds unconditionally, so drift stays invisible right
+    up until it gets silently repaired. This tool answers "is the index
+    trustworthy right now" by reporting three classes of divergence:
+
+    1. **stale rows** — the index has a row, no file exists on disk
+    2. **unindexed files** — a ``.md`` exists on disk with no index row
+    3. **field drift** — ``title`` / ``(size, mtime)`` disagree between sides
+
+    Deliberately skips the lazy rebuild: repairing first would make every report
+    read "consistent". Scan scope matches ``_rebuild_index``'s loader (vault root
+    + ``.archive``) so archive copies are not misreported as stale.
+    """
+    if not _IDX_FILE.exists():
+        return ("# 索引一致性自检\n\n"
+                f"索引文件尚未建立：{_IDX_FILE.name}\n"
+                "> 首次写入或重启服务后会自动建立。")
+
+    conn = None
+    try:
+        conn = midx.connect(_IDX_FILE)
+        idx = {r["relpath"]: r for r in midx.iter_all(conn)}
+
+        disk: dict[str, Path] = {}
+        search_dirs = [MEMORY_DIR]
+        archive = MEMORY_DIR / ".archive"
+        if archive.exists():
+            search_dirs.append(archive)
+        for d in search_dirs:
+            for f in d.glob("*.md"):
+                try:
+                    disk[f.relative_to(MEMORY_DIR).as_posix()] = f
+                except ValueError:
+                    continue
+        n_root = sum(1 for rel in disk if "/" not in rel)
+
+        stale = sorted(set(idx) - set(disk))
+        unindexed = sorted(set(disk) - set(idx))
+
+        title_drift: list[tuple[str, str, str]] = []
+        stat_drift: list[str] = []
+        unreadable: list[str] = []
+        for rel in sorted(set(idx) & set(disk)):
+            row, path = idx[rel], disk[rel]
+            try:
+                meta, _ = _load_memory(path)
+            except Exception as e:
+                unreadable.append(f"- {rel}：{e}")
+                continue
+            title_now = _entry_title(meta, path)
+            if title_now != row["title"]:
+                title_drift.append((rel, row["title"], title_now))
+            if not midx.fresh(conn, MEMORY_DIR, row):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                stat_drift.append(
+                    f"- {rel}：索引 size={row['size']} mtime={row['mtime']:.3f}"
+                    f" ↔ 磁盘 size={st.st_size} mtime={st.st_mtime:.3f}"
+                )
+    finally:
+        if conn is not None:
+            midx.close(conn)
+
+    clean = not (stale or unindexed or title_drift or stat_drift or unreadable)
+
+    out = ["# 索引一致性自检", "",
+           f"- 索引行数: {len(idx)}",
+           f"- 磁盘文件: {len(disk)}（根目录 {n_root}，.archive {len(disk) - n_root}）",
+           f"- 结论: {'索引与磁盘一致' if clean else '发现差异，索引当前不可完全信任'}",
+           ""]
+
+    def _section(head: str, items: list[str]) -> None:
+        out.append(f"## {head}")
+        out.extend(items[:limit] if items else ["- 无"])
+        if len(items) > limit:
+            out.append(f"- ... 共 {len(items)} 条，显示前 {limit} 条")
+        out.append("")
+
+    _section(f"1. 死索引（索引有行、磁盘无文件）— {len(stale)} 条",
+             [f"- {rel}" for rel in stale])
+    _section(f"2. 未入索引（磁盘有文件、索引无行）— {len(unindexed)} 条",
+             [f"- {rel}" for rel in unindexed])
+
+    out.append("## 3. 字段漂移")
+    out.append(f"- title 不一致: {len(title_drift)} 条")
+    out.extend(f"  - {rel}：索引「{old}」↔ 磁盘「{new}」"
+               for rel, old, new in title_drift[:limit])
+    out.append(f"- size/mtime 不一致: {len(stat_drift)} 条")
+    out.extend(stat_drift[:limit])
+    if len(stat_drift) > limit:
+        out.append(f"- ... 共 {len(stat_drift)} 条，显示前 {limit} 条")
+    out.append("")
+
+    if unreadable:
+        _section(f"4. 读取失败（跳过比对）— {len(unreadable)} 条", unreadable)
+
+    if not clean:
+        out.append("> 本工具只诊断不修复。索引定位为「运行时缓存，删掉可重建」，"
+                   "重启 MCP 服务会在启动时全量重建；磁盘文件始终是唯一事实源。")
+    return "\n".join(out)
+
+
+@mcp.tool(annotations=_RO)
 def memory_index_draft() -> str:
     """Generate a draft of the main index without writing it back automatically."""
     entries = _iter_entries()
@@ -1970,7 +2120,7 @@ def memory_index_draft() -> str:
 
     return "\n".join(lines).rstrip()
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 @_locked_write
 def memory_archive(title: str) -> str:
     """Archive a memory entry: move full content to .archive/, leave a summary stub."""
@@ -2095,7 +2245,7 @@ def _restore_from_trash(title: str) -> str:
     return f"已恢复记忆: {target_title}（从 .trash/{target_path.name}）"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_NONIDEM)
 @_locked_write
 def memory_restore(title: str, source: str = "archive") -> str:
     """Restore an entry back to the vault root (P1-7).
@@ -2276,7 +2426,7 @@ def _heat_report(apply: bool) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE)
 def memory_heat_suggest(apply: bool = False) -> str:
     """Scan entries and suggest tier changes based on access_count and staleness.
 
@@ -2298,7 +2448,7 @@ def memory_heat_suggest(apply: bool = False) -> str:
         if locked:
             _release_lock()
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
     """Show which pages this entry links to and which pages link to it (backlinks).
 
@@ -2360,7 +2510,7 @@ def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
 
     return "\n".join(lines)
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_orphans() -> str:
     """Find entries with zero backlinks (isolated notes)."""
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
@@ -2406,7 +2556,7 @@ def memory_orphans() -> str:
 
     return "\n".join(lines)
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 @_locked_write
 def memory_batch_tag(old_tag: str, new_tag: str) -> str:
     """Rename a tag across all entries."""
@@ -2439,7 +2589,7 @@ def memory_batch_tag(old_tag: str, new_tag: str) -> str:
         return "已更新 {} 条记忆的标签: {} -> {}\n- ".format(len(updated), old_tag, new_tag) + "\n- ".join(updated)
     return '未找到包含标签 "{}" 的记忆'.format(old_tag)
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE)
 @_locked_write
 def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float | None = None) -> str:
     """Batch-set tier based on heat score range."""
@@ -2477,7 +2627,7 @@ def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float
         return "已调整 {} 条记忆为 tier={}:\n- ".format(len(updated), target_tier) + "\n- ".join(updated)
     return "没有符合筛选条件的记忆"
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 @_locked_write
 def memory_archive_old(days: int = 90) -> str:
     """Archive entries not updated in N days."""
@@ -2507,7 +2657,7 @@ def memory_archive_old(days: int = 90) -> str:
         return "已归档以下记忆:\n- " + "\n- ".join(archived)
     return "没有超过 {} 天未更新的条目需要归档".format(days)
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
                         mem_type: str | None = None,
                         scope: str | None = None, project: str | None = None,
@@ -2608,7 +2758,7 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
 
     return "\n".join(lines) + _filter_hint(hidden)
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_recent(days: int = 7, limit: int = 20) -> str:
     """List entries updated within the last N days, most recent first."""
     now = datetime.now(timezone.utc)
@@ -2638,7 +2788,7 @@ def memory_recent(days: int = 7, limit: int = 20) -> str:
         lines.append(f"\n... 共 {len(recent)} 条，显示前 {limit} 条")
     return "\n".join(lines)
 
-@mcp.tool()
+@mcp.tool(annotations=_RO)
 def memory_stats() -> str:
     """Show memory vault health statistics."""
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
@@ -2787,5 +2937,258 @@ def memory_stats() -> str:
             lines.append(f"- [[{title}]]")
 
     return "\n".join(lines)
+
+
+# =====================================================================
+# 热重启 (2026-09-17)
+# =====================================================================
+# 目标：改完本文件（或任一模块）后，**不重连客户端、不重启应用**即加载新代码。
+#
+# 机制：os.execv 用同一解释器重新执行本脚本 —— **原地替换进程映像**，且继承已打开
+# 的 fd 0/1/2 ⇒ MCP 的 stdio 管道不中断，客户端感知不到换过进程。本次调用的响应
+# 必须先经管道发出，故真正的 execv 交给延迟的 daemon 线程执行。
+#
+# 三条经实测确认的硬约束（2026-09-17，本机 Windows + Python 3.13.12）：
+#   ① **只能用 os.execv，绝不能用 os.execve**。execve 约 1/3 概率以 0xC0000005
+#      (ACCESS_VIOLATION) 崩在调用瞬间（15 轮压测崩 5 轮），而 execv 20/20、
+#      execv+预置 env 20/20 全通过。要给新进程传标记，直接 `os.environ[k] = v`
+#      改当前进程环境块即可 —— execv 由 CRT 传入同一环境块，实测新进程读得到。
+#   ② 换进程后**客户端不会重发 initialize**（它以为会话还在），而 ServerSession
+#      默认以 NotInitialized 起步 ⇒ 一切请求都被
+#      「Received request before initialization was complete」拒掉。故接力进程
+#      必须把既有会话视为已初始化（见 _install_session_resume_patch）。
+#   ③ Windows 上 execv 内部是 CreateProcess + ExitProcess，**pid 会变**，与
+#      POSIX「真替换、pid 不变」语义不同。实测 MCP 客户端不因此断开会话。
+
+_RESTART_ENABLED = os.environ.get("AI_MEMORY_RESTART", "1") not in ("0", "false", "False")
+_RESTART_CHAIN_MAX = 5            # 接力链上限，防重启风暴
+_RESTARTING = threading.Event()   # 本进程内已安排重启，拒绝重复排队
+_RESTART_CHAIN = 0
+_RESUME_PATCH_STATUS = "未安装"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+_RESTART_DELAY = _env_float("AI_MEMORY_RESTART_DELAY", 1.5)
+
+
+def _install_session_resume_patch() -> str:
+    """把「接力进程」的会话直接视为已初始化，返回人类可读的状态说明。
+
+    为何不用 SDK 自带的 stateless：`ServerSession.__init__` 确实是
+    ``Initialized if stateless else NotInitialized``，但 FastMCP 的 stdio 路径
+    **不透传**该开关（`run_stdio_async` 调 `_mcp_server.run(read, write,
+    init_options)` 不带 stateless；构造参数 `stateless_http` 只被
+    streamable_http_app 消费）。故按同一语义直接补 `__init__`，仅本进程生效。
+
+    实现上做两件防守：用 `*args/**kwargs` 透传（SDK 改签名时不会 TypeError）；
+    只在校验到 `InitializationState.Initialized` 成员存在时才安装。**不要**用
+    `hasattr(ServerSession, "_initialization_state")` 当判据 —— SDK 里该名字只在
+    `__init__` 中作为**实例属性**赋值，类属性另有其名（`_initialized`），类上取不到，
+    会恒为 False 从而静默跳过安装。真正的「装上了且生效」由 memory_restart 的预检
+    用真实构造来验证，不靠属性名猜测。
+    """
+    try:
+        from mcp.server.session import InitializationState, ServerSession
+    except Exception as exc:  # pragma: no cover - 依赖 SDK 内部路径
+        return f"导入 mcp.server.session 失败：{type(exc).__name__}: {exc}"
+    if not hasattr(InitializationState, "Initialized"):
+        return "SDK 的 InitializationState 缺少 Initialized 成员，补丁不适用"
+    original = ServerSession.__init__
+    if getattr(original, "_ai_memory_resume_patch", False):
+        return "已安装（幂等，跳过重复包装）"
+
+    def patched(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self._initialization_state = InitializationState.Initialized
+
+    patched._ai_memory_resume_patch = True  # type: ignore[attr-defined]
+    ServerSession.__init__ = patched  # type: ignore[method-assign]
+    return "已安装"
+
+
+def _read_restart_chain() -> int:
+    try:
+        return max(0, int(os.environ.get("AI_MEMORY_RESTART_CHAIN", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _restart_argv() -> list[str]:
+    """重放当前命令行（解释器 + 本脚本 + 原有参数）。
+
+    刻意不提供「自定义重启命令」这类配置面：`python server.py` 是本项目的标准
+    启动方式，重放 argv 即精确。异常启动方式（`python -c`、被包装器吞掉 argv）
+    由预检拦下并提示改用 UI 重连，不引入第二套配置。
+    """
+    return [sys.executable] + list(sys.argv)
+
+
+_PREFLIGHT_SNIPPET = (
+    "import sys;"
+    "sys.path.insert(0, {server_dir!r});"
+    "import server;"
+    "from mcp.server.session import ServerSession, InitializationState;"
+    "assert callable(server.memory_restart), 'memory_restart 未注册';"
+    "assert getattr(ServerSession.__init__, '_ai_memory_resume_patch', False), '会话恢复补丁未装上';"
+    "s = ServerSession(None, None, server.mcp._mcp_server.create_initialization_options());"
+    "assert s._initialization_state is InitializationState.Initialized, '会话未处于已初始化状态';"
+    "print('PREFLIGHT-OK')"
+)
+
+
+def _restart_preflight() -> str | None:
+    """返回 None 表示可以重启，否则返回必须放弃重启的原因。
+
+    最关键的一条：**绝不能把起不来的代码换上**。stdio MCP 一旦新进程启动失败，
+    客户端看到的是连接断开 —— 那比「改了没生效」糟糕得多。故先在子进程里试导入
+    新代码，并顺带确认会话恢复补丁装得上；失败则原地不动，把错误原文交回调用方。
+
+    ⚠️ **必须显式 `stdin=subprocess.DEVNULL`**（2026-09-17 实测踩到，本函数最初
+    漏了它，导致预检必然 90s 超时、热重启 100% 被自己的预检拦下）：stdio MCP server
+    的 stdin 是客户端管道，且已被 asyncio Proactor 以**挂起的重叠读**绑定；子进程
+    继承该句柄后，自己启动阶段对 stdin 的探测会与父进程的挂起读互锁 ⇒ 子进程永远
+    到不了第一行代码，`subprocess.run` 只能干等到 timeout。对照实测：继承管道
+    stdin 20s 超时（连子进程的第一条 print 都读不到）/ `DEVNULL` 0.46s 正常返回。
+    **同一陷阱对任何「MCP server 内 spawn 子进程」的代码都成立。**
+    """
+    argv = _restart_argv()
+    script = argv[1] if len(argv) > 1 else ""
+    if not script or not Path(script).is_file():
+        return (f"\n  命令行中没有可重放的脚本文件（argv={argv!r}）。\n"
+                "  若本服务不是以 `python <server.py>` 方式启动，请改用 UI「停用再启用」加载新代码。")
+    env = {k: v for k, v in os.environ.items() if k != "AI_MEMORY_RESTART_CHAIN"}
+    env["AI_MEMORY_RESUME"] = "1"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _PREFLIGHT_SNIPPET.format(server_dir=str(_SERVER_DIR))],
+            cwd=str(_SERVER_DIR), env=env, capture_output=True, text=True, timeout=90,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        return f"\n  预检子进程无法启动：{type(exc).__name__}: {exc}"
+    if proc.returncode != 0 or "PREFLIGHT-OK" not in (proc.stdout or ""):
+        detail = (proc.stderr or proc.stdout or "(无输出)").strip().splitlines()[-6:]
+        return ("\n  新代码预检未通过，已放弃重启（当前进程继续用旧代码服务）：\n"
+                + "\n".join("    " + ln for ln in detail))
+    return None
+
+
+def _restart_prepare() -> str:
+    """换进程前的收尾。execv **不触发 atexit**，故内存里攒着的状态必须手动落盘，
+    否则最后一批指标与访问计数会随旧进程一起消失。"""
+    done: list[str] = []
+    try:
+        if _METRICS_ENABLED:
+            _METRICS.flush()
+            done.append("指标")
+    except Exception as exc:
+        logger.debug("restart: metrics flush failed: %s", exc)
+    try:
+        n = _flush_access_counts()
+        if n:
+            done.append(f"访问计数×{n}")
+    except Exception as exc:
+        logger.debug("restart: access flush failed: %s", exc)
+    return "、".join(done) if done else "无待落盘状态"
+
+
+def _deferred_restart(argv: list[str], delay: float) -> None:
+    """延迟换进程。等的是「本次工具响应已写进 stdio 管道」这件事 —— 它是 execv
+    唯一的时序前提，且无法从应用层观测，故用可调的等待时间覆盖。"""
+    time.sleep(delay)
+    flushed = _restart_prepare()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os.environ["AI_MEMORY_RESUME"] = "1"
+    os.environ["AI_MEMORY_RESTART_CHAIN"] = str(_RESTART_CHAIN + 1)
+    logger.info("热重启：execv %s（已落盘：%s）", argv, flushed)
+    try:
+        os.execv(argv[0], argv)
+    except OSError as exc:
+        _RESTARTING.clear()
+        logger.error("热重启失败（%s）：%s —— 本进程继续运行，请改用 UI 重连该 MCP 服务。",
+                     argv[0], exc)
+
+
+@mcp.tool(annotations=_WRITE_NONIDEM)
+def memory_restart(delay: float | None = None) -> str:
+    """Restart this MCP server in place so edited server.py / module code takes effect at once.
+
+    用途：改完记忆库代码（server.py 或任一模块）后立刻生效，**不必重连客户端、
+    不必重启应用**。实现是 os.execv 原地替换进程映像，并保留 stdin/stdout，因此
+    MCP 的 stdio 会话不中断。
+
+    执行顺序（三件事都做了才敢换进程）：
+      1. **预检**：在子进程里试导入新代码，并确认「会话恢复补丁」装得上。任一失败
+         即放弃重启 —— 绝不让起不来的代码顶掉正在服务的进程。
+      2. 本次响应先经 stdio 管道发出（真正 execv 在延迟线程里执行）。
+      3. 新进程通过环境变量得知自己是「接力进程」，会把客户端既有会话视为已初始化
+         （否则客户端不重发 initialize，新进程会用 "Received request before
+         initialization was complete" 拒掉一切请求）。
+
+    注意：
+      - 换进程后 **pid 会变**（Windows 上 execv 内部是 CreateProcess）。
+      - 接力链上限 5 次，用于防重启风暴；超限后请用 UI 重连本服务复位。
+      - 设 AI_MEMORY_RESTART=0 可整体禁用本工具。
+
+    delay (optional): 换进程前的等待秒数，为「响应写出」留时间。默认取
+        AI_MEMORY_RESTART_DELAY（1.5s），显式传入时被夹在 [0.1, 30]。
+
+    返回值是安排结果（含将执行的命令与接力链计数），**不代表新代码已生效**；
+    新代码从下一次调用起生效。
+    """
+    if not _RESTART_ENABLED:
+        return ("热重启已被 AI_MEMORY_RESTART=0 禁用。"
+                "请改用 UI「停用再启用」该 MCP 服务来加载新代码。")
+    if _RESTARTING.is_set():
+        return "本进程已有一个热重启在排队，忽略本次重复调用。"
+    if _RESTART_CHAIN >= _RESTART_CHAIN_MAX:
+        return (f"接力链已达上限（{_RESTART_CHAIN}/{_RESTART_CHAIN_MAX}），拒绝继续热重启 —— "
+                "这是防重启风暴的保险。请用 UI 重连该 MCP 服务以复位计数。")
+
+    blocked = _restart_preflight()
+    if blocked:
+        return "已取消热重启。" + blocked
+
+    if delay is None:
+        d = _RESTART_DELAY
+    else:
+        try:
+            d = max(0.1, min(float(delay), 30.0))
+        except (TypeError, ValueError):
+            d = _RESTART_DELAY
+
+    argv = _restart_argv()
+    _RESTARTING.set()
+    threading.Thread(target=_deferred_restart, args=(argv, d),
+                     name="ai-memory-restart", daemon=True).start()
+    return (
+        f"热重启已安排：约 {d}s 后原地换进程（pid 会变，stdio 会话不变）。\n"
+        f"  · 命令：{' '.join(argv)}\n"
+        f"  · 接力链：{_RESTART_CHAIN + 1}/{_RESTART_CHAIN_MAX}\n"
+        f"  · 接力会话恢复：{_RESUME_PATCH_STATUS}\n"
+        "本次响应会先发出，之后才换进程，客户端**无需重连**；新代码从下一次调用起生效。\n"
+        "若数秒后所有调用都超时，说明新进程未能起来，请用 UI 重连该 MCP 服务"
+        "（旧代码与记忆库数据均未受影响）。"
+    )
+
+
+# 接力进程：把客户端既有会话视为已初始化，否则它会拒绝一切请求（约束②）。
+if _RESTART_ENABLED and os.environ.get("AI_MEMORY_RESUME") == "1":
+    _RESTART_CHAIN = _read_restart_chain()
+    _RESUME_PATCH_STATUS = _install_session_resume_patch()
+    logger.info("热重启接力：pid=%s 接力链=%s 会话恢复=%s",
+                os.getpid(), _RESTART_CHAIN, _RESUME_PATCH_STATUS)
+
+
 if __name__ == "__main__":
     mcp.run()

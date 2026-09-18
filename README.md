@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-2.2.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-77%20assertions-brightgreen)](#测试与-ci)
+[![Tests](https://img.shields.io/badge/tests-506%20assertions-brightgreen)](#测试与-ci)
 
 ---
 
@@ -19,7 +19,7 @@
 - [特性](#特性)
 - [快速开始](#快速开始)
 - [实际使用效果](#实际使用效果)
-- [20 个工具速查](#20-个工具速查)
+- [23 个工具速查](#23-个工具速查)
 - [自定义配置](#自定义配置)
 - [用 Obsidian 可视化记忆网络](#用-obsidian-可视化记忆网络)
 - [多设备同步与版本控制](#多设备同步与版本控制)
@@ -171,6 +171,12 @@ supersedes: 项目_xxx_旧索引方案
 
 自动补链已停用（避免制造大量冗余链接），`memory_rebuild_links` 改为只读校验：扫描全库双链、报告死链与计数，不改任何文件。配套工具 `memory_graph`（出入链图谱）与 `memory_orphans`（孤立笔记检测）。
 
+### 一次调用拿到上下文
+
+`memory_graph` 只列「出链 + 反链」，跨会话延续仍得把沿途正文一条条读出来 —— 实测要 3~5 次调用。`memory_context` 把这件事压成一次：以某条笔记为起点，沿双链向两个方向 BFS 到指定层数，按 `tier → 读取次数 → 更新时间` 挑出最该看的周边条目，连同各自正文与关系标注**拼成一段可直接喂给模型的 Markdown**。
+
+两个容易踩的点已经在实现里兜住：输出是**整段字符预算**，在起点与周边之间分摊（起点至多占一半），否则一条长笔记会把周边全挤掉；自动生成的 `记忆索引.md` 被排除在周边之外 —— 它的正文就是全库标题清单，否则会冒充「头号邻居」。`timeframe` 支持自然语言（`last week` / `2 days ago` / `3d`），只筛周边、**起点始终保留**。
+
 ### 跨进程并发安全
 
 多个 AI 同时写入时，基于 PID + 时间戳的**文件锁**保证互斥，15 秒超时并自动接管陈旧锁。锁在**线程内可重入**，因此 `memory_write → 自动归档 → memory_archive` 这条嵌套链路不会自死锁。
@@ -181,11 +187,17 @@ supersedes: 项目_xxx_旧索引方案
 
 设计上刻意克制：纯标准库、全链路 `try/except`（观测绝不能成为主流程的新故障点）、**不加跨进程锁**（多进程 read-merge-write 同一 JSON 非原子，允许少量丢失 —— 指标看趋势，不需要精确到个位）。正常退出时自动落盘零头；被强杀则丢最后不足 50 次事件，这正是这层取舍的一部分。设 `AI_MEMORY_METRICS=0` 可完全关闭。
 
+### 改完即生效（原地热重启）
+
+改了 `server.py` 或任一模块后，调用 `memory_restart` 即可让新代码生效，**不必重连客户端、不必重启应用**：进程映像被原地替换，stdin/stdout 保留，stdio 会话因此不断。
+
+换进程前先在子进程里**预检** —— 新代码能否导入、会话恢复补丁能否装上，任一失败就放弃重启，绝不让起不来的代码顶掉正在服务的进程。重启后的新进程凭环境变量把客户端既有会话视为已初始化，否则客户端不重发 `initialize`，新进程会以「初始化未完成」拒掉一切请求。接力链上限 5 次，用于防重启风暴。
+
 ### 工程化保障
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **414 条断言的十三层测试**：语义回归 28 + 全工具冒烟 25 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 41
+- **506 条断言的十五层测试**：语义回归 28 + 全工具冒烟 32 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 18 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 41 + 原地热重启 26 + 上下文组装 59
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py`，可观测层拆为 `metrics.py`
 
@@ -352,7 +364,7 @@ args = ["/path/to/ai-memory/server.py"]
 
 ---
 
-## 20 个工具速查
+## 23 个工具速查
 
 ### 读写
 
@@ -372,6 +384,7 @@ args = ["/path/to/ai-memory/server.py"]
 | `memory_smart_search(query, tag?, limit=10, mem_type?, scope?, project?, status?)` | 多字段加权搜索：标题 ×10、标签 ×4、摘要 ×3、正文 ×1，另加时效性加权。**零词法命中即非候选**，时效性不能单独决定入选 |
 | `memory_list(tag?, limit=20, tier?, mem_type?, scope?, project?, status?, include_trash?)` | 罗列记忆摘要，过滤语义同上；`include_trash=True` 改为列出回收站内容 |
 | `memory_graph(title, limit=10, include_all=False)` | 显示指定笔记的出链与反向链接图谱，默认截断 10 条 |
+| `memory_context(title, depth=2, max_related=10, timeframe?, max_chars?)` | **上下文组装**：沿 `[[wikilink]]` 出链与反链 BFS 到 `depth` 层（`0` = 只要起点），把沿途正文拼成一段可直接喂给模型的 Markdown，每块标注关系 / 深度 / tier / 读取次数 / 更新时间。周边按 `tier → access_count ↓ → updated ↓` 排序取前 `max_related` 条；`timeframe` 支持自然语言（`last week` / `2 days ago` / `3d` / `2026-09-01`）且只过滤周边；`max_chars` 为**整段预算**（在起点与周边间分摊，`0` = 不限） |
 | `memory_orphans()` | 查找没有任何笔记引用的孤立笔记 |
 | `memory_stats()` | 健康度统计：各 tier 数量、记忆类型 / 可信度 / 作用域 / 生命周期 / 写入方上下文 / 结构版本分布、访问 TOP10、近 7/30/90 天更新量、热门标签 TOP10、孤立笔记数，以及**运行时指标**（检索零结果率 / 锁等待 / 索引重建） |
 
@@ -385,12 +398,14 @@ args = ["/path/to/ai-memory/server.py"]
 | `memory_batch_tag(old_tag, new_tag)` | 全库标签重命名 |
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
 | `memory_heat_suggest(apply=False)` | 按访问频次与陈旧度给出 tier 升降建议。默认 `apply=False` **只预览不写盘**；`apply=True` 才真正批量落地（核心页豁免，预览与执行共用同一判据函数，不会漂移） |
+| `memory_restart(delay?)` | **原地热重启**：改完 `server.py` 或任一模块后让新代码立刻生效，不必重连客户端、不必重启应用。`os.execv` 替换进程映像并保留 stdin/stdout，会话不断；重启前先在子进程**预检**新代码可导入、会话恢复补丁装得上，失败即放弃。⚠️ 换进程后 **pid 会变**；接力链上限 5 次防重启风暴 |
 
 ### 审计
 
 | 工具 | 说明 |
 |------|------|
 | `memory_audit()` | 全库扫描：空壳检测 / 死链检测（跳过代码块）/ 命名漂移 / 缺 source·tags 汇总 |
+| `memory_doctor(limit=20)` | **索引一致性自检（只读不修）**：报告索引与磁盘的三类偏差 —— 索引有行但文件已不在（stale rows）、磁盘有 `.md` 却无索引行（unindexed）、`title` 与 `(size, mtime)` 两侧不一致（field drift）。刻意**跳过惰性重建**，否则修完再报永远「一致」；扫描范围与索引加载器一致（库根 + `.archive`），归档副本不会被误报为 stale |
 | `memory_index_draft()` | 自动生成记忆索引草稿（不回写，需人工确认） |
 | `memory_rebuild_links()` | 只读校验：扫描正文双链，报告死链与计数，不修改文件 |
 
@@ -593,7 +608,7 @@ ai-memory-template/
 ├── CHANGELOG.md             # 版本变更记录
 ├── LICENSE                  # MIT
 │
-├── server.py                # MCP 服务端：20 个工具注册 + 存储层 + 业务逻辑
+├── server.py                # MCP 服务端：23 个工具注册 + 存储层 + 业务逻辑
 ├── memory_index.py          # SQLite 元数据索引（标题 O(1) 定位）
 ├── metrics.py               # 运行时指标（检索/读写/锁/索引；仅标准库）
 ├── yaml_io.py               # YAML frontmatter 解析 / 序列化（无状态）
@@ -609,7 +624,7 @@ ai-memory-template/
 │
 ├── tests/
 │   ├── test_roundtrip.py         # 28 断言：语义回归
-│   ├── test_tools_smoke.py       # 25 断言：全工具冒烟 + 注册完整性
+│   ├── test_tools_smoke.py       # 32 断言：全工具冒烟 + 注册完整性
 │   ├── test_p0_credentials.py    # 24 断言：记忆可信度字段
 │   ├── test_scope_lifecycle.py   # 70 断言：作用域 / 生命周期 / 冲突字段
 │   ├── test_concurrency.py       # 38 断言：跨进程并发（乐观锁 / 混合操作 / 读写并发）
@@ -621,7 +636,9 @@ ai-memory-template/
 │   ├── test_dup_guard.py         # 15 断言：冲突重复防护（标题 / 正文 / 核心页 / 容错）
 │   ├── test_heat_apply.py        # 29 断言：热度自动升降级（判据 / 预览 / 执行 / 字段不丢）
 │   ├── test_metrics.py           # 45 断言：运行时可观测性
-│   └── test_frontmatter_norm.py  # 41 断言：frontmatter 归一化（双 frontmatter / 摘要污染 / 自愈）
+│   ├── test_frontmatter_norm.py  # 41 断言：frontmatter 归一化（双 frontmatter / 摘要污染 / 自愈）
+│   ├── test_restart.py           # 26 断言：原地热重启（预检失败即放弃 / 接力标记 / 上限 5 次 / pid 变化）
+│   └── test_context.py           # 59 断言：上下文组装（深度边界 / 出链反链 / 预算分摊 / timeframe / 生成页排除）
 ├── scripts/
 │   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
 ├── .github/workflows/
@@ -646,7 +663,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 414 条断言。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 506 条断言。
 
 ### 语义回归 —— `tests/test_roundtrip.py`（28 断言）
 
@@ -770,6 +787,27 @@ ai-memory-template/
 - `AI_MEMORY_METRICS=0` 可关闭（子进程验证）
 - **容错**：指标设施自身崩塌时，检索与统计仍然正常返回
 
+### 原地热重启 —— `tests/test_restart.py`（26 断言）
+
+- **预检失败即放弃**：新代码导入不通过、或会话恢复补丁装不上时**不换进程**，原进程继续服务
+- **接力标记**：新进程能识别自己由重启而来，不因客户端未重发 `initialize` 而拒掉请求
+- 接力链上限 5 次防重启风暴，到顶后给出可操作的复位指引
+- 换进程后 **pid 变化**（Windows 上 `execv` 内部即 `CreateProcess`），旧 pid 不再响应
+- 响应先经管道发出、`execv` 在延迟线程执行 ⇒ 调用方拿到返回值，而非连接被掐断
+- 环境变量传递走 `os.environ` 赋值而非 `os.execve`（本机实测 1/3 概率崩溃的回归护栏）
+
+### 上下文组装 —— `tests/test_context.py`（59 断言）
+
+- 深度边界：`depth=0` 只要起点 / `1` 只取直接邻居 / `2` 展开两层 / 超过图深度不报错
+- **出链与反链都纳入**（只取出链会漏掉「谁引用了我」）
+- 排序权重：`tier(hot > warm > cold)` 优先，其次 `access_count`，最后按 `updated`
+- `max_related` 截断，且**起点不占用周边配额**
+- `timeframe` 只过滤周边、起点恒在；无法识别的表达式按不限处理并在输出里提示；`_parse_timeframe` 有单元级覆盖
+- **预算分摊回归**：起点很长时周边仍须分到配额（缺陷形态是长起点独吞整段预算，周边一篇都展不开）
+- **生成页排除**：`记忆索引.md` 正文即全库标题列表，必须排除出周边，否则会冒充「头号邻居」
+- 截断回退到行边界，不把 `_关系 · 深度 · …_` 标注行切成半截
+- 标题解析：不存在时报错清晰、按文件名 stem 命中、反斜杠路径归一化
+
 所有脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
 
 ```bash
@@ -779,7 +817,7 @@ for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 
 CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
 
-> 这十三层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
+> 这十五层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
 
 ---
 

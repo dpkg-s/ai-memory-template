@@ -5,9 +5,17 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [2.3.0] - 2026-09-18
+
+本版两条主线：**把「记忆怎么被取回来用」补成一个工具**（`memory_context` 上下文组装，跨会话延续从 3~5 次调用降到 1 次），以及**让改动立刻生效**（`memory_restart` 原地热重启，不必重连客户端）。同时把 Phase 3 的三项机制收成闭环 —— 回收站可进可出、重复写入主动提示、热度可预览可落地 —— 并修掉 4 个隐蔽的正确性问题（双 frontmatter 与摘要污染、重复防护漏掉核心页、索引自动生成死链、Windows 下跨进程缓存永不失效）。
 
 ### Added
+
+- **`memory_context` —— 上下文组装（第 23 个工具）**：`memory_graph` 只列「出链 + 反链」，跨会话延续仍得把沿途正文一条条读出来（实测 3~5 次调用）。本工具**把沿途内容直接组装成一段可喂给模型的 Markdown**，一次调用拿到起点 + 周边。沿 `[[wikilink]]` 出链与反链 BFS 至 `depth`（`0` = 只要起点），周边按 `tier(hot > warm > cold) → access_count ↓ → updated ↓` 排序取前 `max_related` 条，每块标注来源与关系（`关系 · 深度 · tier · reads · updated`）；`timeframe` 支持自然语言（`last week` / `2 days ago` / `3d` / `2026-09-01`），**只过滤周边、起点恒在**，无法识别时按不限处理并在输出里提示。
+  三个设计要点都是实测踩出来的：① `max_chars` 是**整段预算**而非单篇上限，必须分摊（起点至多一半，其余按篇数均分），否则长起点会独吞预算、周边一篇都展不开；② 自动生成的 `记忆索引.md` **必须排除出周边** —— 它的正文就是全库标题列表，会把每个条目都变成「强相关」；③ 截断要回退到行边界（`rsplit("\n", 1)[0]`），否则会把 `_关系 · 深度 · …_` 标注行切成半截。专项测试 `tests/test_context.py`（59 断言）。
+- **`memory_restart` —— 原地热重启（第 22 个工具）**：改完 `server.py` 或任一模块后让新代码**立刻生效，不必重连客户端、不必重启应用**。实现为 `os.execv` 原地替换进程映像并保留 stdin/stdout，故 stdio 会话不断。
+  稳妥性靠三道闸：① **预检** —— 先在子进程里试导入新代码、并确认「会话恢复补丁」装得上，任一失败即放弃重启，**绝不让起不来的代码顶掉正在服务的进程**；② 本次响应先经管道发出，真正的 `execv` 在延迟线程里执行；③ 新进程凭环境变量知道自己是「接力进程」，把客户端既有会话视为已初始化 —— 否则客户端不重发 `initialize`，新进程会以 "Received request before initialization was complete" 拒掉一切请求。
+  细节：Windows 上 `execv` 内部是 `CreateProcess`，**pid 会变**；接力链上限 5 次防重启风暴；本机 Windows + Python 3.13 实测 `os.execve` 给新进程传 env 有约 1/3 概率崩在调用瞬间（压测 15 轮崩 5 轮），`os.execv` + `os.environ` 赋值 20/20 通过 ⇒ 统一走后者。文档另写明**宿主差异**：有客户端给 stdio MCP 套 Job Object 包装器，换进程时包装器随旧映像一起退出，客户端会报 `Not connected` —— 此时宿主会按需重新 spawn，**依旧不用重启应用**。专项测试 `tests/test_restart.py`。
 
 - **热度驱动的 tier 自动升降级**（`memory_heat_suggest(apply=False)`）：此前它只**输出建议字符串**，改完还得手抄一遍 tool call，等于把闭环留给使用者，实际没人会做。现在支持 `apply=True` 真正写盘，同时保持**默认只预览**——不传参数绝不会动你的库。
   关键设计是**预览与执行共用同一个判据函数 `_heat_tier_decision`**：两套代码各写一份阈值判断，迟早漂移成「预览说升、执行说降」，这是这类工具最隐蔽的坑。判据三档：`score < 0.1` 且非 cold → `cold`；`score < 0.5` 且为 hot → `warm`（先降一档，避免从 hot 直接摔到 cold）；`score > 3.0` 且非 hot → `hot`；其余维持现状。`CORE_PAGES` 一律豁免。
@@ -216,7 +224,9 @@
 - 跨平台安装脚本：Windows PowerShell + Linux/macOS bash
 - 零外部依赖：仅需 Python 3.10+ 与 `mcp` 包
 
-[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.2.0
 [2.1.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.1.0
 [2.0.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.0.0
 [1.1.0]: https://github.com/dpkg-s/ai-memory-template/compare/v1.0.0...v1.1.0

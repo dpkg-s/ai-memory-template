@@ -32,13 +32,28 @@
   - 与既有 `.archive/` 恢复路径互不干扰：`memory_restore` 的 `source` 默认 `"archive"`，行为完全向后兼容
   - 专项测试 `tests/test_trash.py`（34 断言）：软删除退出检索、恢复后索引与字段正确、同名冲突拒绝、同名两条并存、`purge` 与清空、既有归档路径无回归
 
+### Changed
+
+- **`memory_search` 长句检索策略**：此前是**纯子串匹配**，长句作为整体子串必然零命中（「查不到」与「不存在」被混为一谈）。现改为「精确路径零命中时才降级到 bigram 兜底」，命中门槛为共享中文 bigram ≥ 2 且 query 覆盖率 ≥ 0.15 —— 常态查询零额外开销，弱相关条目不会被硬凑进来；兜底结果首行显式标注「以下为 bigram 模糊匹配结果」，不伪装成精确命中。长句召回实测 0.00 → 1.00。
+- **`memory_heat_suggest` 由「只预览」变为「可预览可执行」**：新增 `apply=True` 真正写盘，同时保持默认 `apply=False` 只预览 —— 不传参数绝不会动库。预览与执行共用同一个判据函数 `_heat_tier_decision`，避免两套阈值漂移成「预览说升、执行说降」。
+- **回收站从「只进不出」变为闭环**：`memory_delete` 软删进的条目，现在可通过 `memory_list(include_trash=True)` 列出、`memory_restore(title, source="trash")` 取回、`memory_delete(title, empty_trash=True)` 清空。
+- **`memory_rebuild_links` 改为只读校验**：不再改写文件，只扫描全库双链、报告死链与计数。
+- **跨进程缓存失效键升级**：由「目录 `st_mtime`」改为「目录 mtime + 逐文件 `(name, size, mtime_ns)` 指纹」（`_vault_fingerprint()`），任何内容变更（含 Obsidian 保存、其它客户端写入、`git` 改文件）都会令缓存失效。147 篇规模下额外开销约 1~3 ms。
+
 ### Fixed
 
-- **双 frontmatter 与摘要污染**（`memory_write` / `_write_memory`）：写入端会自行生成权威 frontmatter，而调用方**常把「带 frontmatter 的完整笔记」直接当作 `content` 传入**（其他 AI 客户端、手工整篇粘贴、跨工具导入），两者直接拼接即产出「**双 frontmatter**」—— 文件开头连着两个 `---` 块，解析端 `content.split("---", 2)` 只认第一块，第二块连同其 YAML 一并退化为**正文里的深层垃圾**，反过来污染检索、去重与链接抽取。更隐蔽的是**自动摘要取自未剥离的原始 `content`**（`clean = content.replace("\n", " ")`），把那段 frontmatter 文本固化进 `summary` 字段常驻于检索结果与索引快照。全库体检实测命中 **8 篇**（含核心业务笔记）。
-  修复分两道纵深：新增纯函数 `yaml_io.strip_leading_frontmatter()` 负责剥离；`memory_write()` 入口调用它，位置**早于空壳校验与摘要 / 标签派生**（否则摘要仍会吃进垃圾）；`_write_memory()` 收口再剥一次，覆盖其余写盘路径（热度批量调整、回收站恢复等）。剥离只对「确实像 frontmatter（至少一行 `key:`）」的块生效，**正文开头恰为 `---` 水平线的合法写法不被误伤**；顺带获得**自愈**能力 —— 磁盘上已被写坏的条目，下次写入即恢复正常。新增专项测试 `tests/test_frontmatter_norm.py`（41 断言，含摘要污染回归组与误伤防护组）。
-- **冲突防护漏掉核心页**（`_find_duplicate_hints`）：防护上线时无条件跳过 `CORE_PAGES`（`近期工作动态` / `用户画像` / `记忆库总规范` 等），结果「新建『近期工作动态记录』而不是更新原页」这类**最典型的重复写入恰恰静默通过**——与防护目标正好背离。现已让核心页同样参与比对；真正需要豁免的只有「完全同名」（同名写入属于更新而非重复），而该情形本已由 `other == title` 分支处理，无需二次排除。`tests/test_dup_guard.py` 新增 F 组 3 断言覆盖。
-- **索引自动生成死链**（`_refresh_index` / `memory_index_draft`）：两处生成 `记忆索引.md` 与索引草稿时直接输出 `- [[{title}]]`，而 Obsidian 解析双链以**文件名 stem** 为准 —— `safe_filename()` 会把标题里的空格等字符归一化成下划线，于是凡标题含空格的笔记（如「2026-07-06 记忆库半自动审计」对应 `2026-07-06_记忆库半自动审计.md`）在索引中全是**渲染死链**；更糟的是 `_refresh_index` 在每次 `memory_write` 后都会重建索引，会把人工修复**覆盖回去**（实测 148 篇的库中稳定复现 36 条）。新增 `_wiki_link(path, title)`：target 恒用 `path.stem`，人类可读标题只放别名位（`[[stem|title]]`），两处生成器统一改走它；`memory_index_draft` 中形如 `f"{title}|{path.stem}"` 的错误别名计算（方向反了且从未被使用）一并删除。新增回归测试 `tests/test_index_links.py`（18 断言）：判定口径为「索引与草稿里的每一条链接，其 target 都必须能解析到库中真实存在的文件」，并覆盖幂等重建与含非法字符标题。
-- **跨进程缓存失效在 Windows 上不生效**（`_iter_entries`）：缓存失效键原先只比对记忆库**目录**的 `st_mtime`，而 Windows/NTFS 下改写已存在文件的**内容**不会更新父目录 mtime（只有新建 / 重命名 / 删除才会）——于是 Obsidian 保存、其它 MCP 客户端写入、`git` 改文件内容这类外部编辑**永远触发不了缓存重建**，服务端持续返回陈旧条目（`memory_search` / `memory_list` / `memory_audit` 均受影响），恰好命中「多 AI 工具共享同一记忆库」这一核心场景。现改为 `_vault_fingerprint()`：**目录 mtime + 逐文件 `(name, size, mtime_ns)` 指纹**，任何内容变更都会令缓存失效。147 篇规模下额外开销约 1~3 ms。
+- **双 frontmatter 与摘要污染**（`memory_write` / `_write_memory`）：调用方把「带 frontmatter 的完整笔记」当 `content` 传入时，与写入端自行生成的权威 frontmatter 直接拼接，产出「双 frontmatter」—— 第二块连同 YAML 退化成正文深层垃圾，并固化进 `summary` 字段。全库体检实测命中 8 篇。新增 `yaml_io.strip_leading_frontmatter()` 在写入入口与收口各剥一次，只对「确实像 frontmatter」的块生效，正文开头合法的 `---` 水平线不被误伤；顺带获得自愈能力（已写坏的条目下次写入即恢复）。
+- **冲突防护漏掉核心页**（`_find_duplicate_hints`）：上线时无条件跳过 `CORE_PAGES`，导致「新建『近期工作动态记录』而非更新原页」这类最典型的重复写入静默通过。现已让核心页同样参与比对，真正豁免的只有完全同名（属更新）。
+- **索引自动生成死链**（`_refresh_index` / `memory_index_draft`）：直接输出 `- [[{title}]]`，而 Obsidian 以文件名 stem 解析双链，标题含空格即全成渲染死链，且每次 `memory_write` 后重建会把人工修复覆盖回去（148 篇库稳定复现 36 条）。新增 `_wiki_link(path, title)`：target 恒用 `path.stem`，可读标题放别名位（`[[stem|title]]`）。
+- **跨进程缓存失效在 Windows 上不生效**（`_iter_entries`）：Windows/NTFS 改写已存在文件内容不更新父目录 mtime，外部编辑永远触发不了缓存重建，服务端持续返回陈旧条目。改用文件级指纹后已修复。
+
+### Removed
+
+- **`memory_index_draft` 里从未被使用的错误别名计算**：形如 `f"{title}|{path.stem}"` 的别名方向反了且从未被使用，随索引死链修复一并删除。
+
+### Dependencies
+
+- 无变化（`requirements.txt` 仍为 `mcp>=1.27,<2`，`requirements-dev.txt` 仍为 `pytest>=8.0` + `ruff>=0.5`）。
 
 ## [2.2.0] - 2026-09-10
 

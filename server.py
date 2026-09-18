@@ -8,10 +8,10 @@ Storage:
 - Frontmatter written as YAML (Obsidian-native), legacy JSON still readable
 
 Features:
-- 22 MCP tools: read/write/search/smart_search/list/recent/graph/orphans/stats,
-  audit/doctor/index_draft/rebuild_links, batch tag & tier, heat-based tier
-  suggestions, archive/restore/delete, in-place hot restart (memory_restart),
-  auto-generated MOC index (记忆索引.md)
+- 23 MCP tools: read/write/search/smart_search/list/recent/graph/context/
+  orphans/stats, audit/doctor/index_draft/rebuild_links, batch tag & tier,
+  heat-based tier suggestions, archive/restore/delete, in-place hot restart
+  (memory_restart), auto-generated MOC index (记忆索引.md)
 - YAML frontmatter, Obsidian wikilinks, automatic link extraction,
   title-based dedup upsert, file locking, cross-process cache invalidation,
   SQLite metadata index for O(1) title lookup
@@ -2509,6 +2509,248 @@ def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
         lines.append("- (无)")
 
     return "\n".join(lines)
+
+# ---- B1 memory_context：上下文遍历与组装 (2026-09-18) --------------------
+# 与 memory_graph 的分工：graph 只「列链接」，本工具「组装内容」——
+# 一次调用即可拿到「某主题 + 其周边」的可读上下文，替代 3~5 次手工拼装。
+_CONTEXT_TIER_RANK = {"hot": 0, "warm": 1, "cold": 2}
+# 生成页：「记忆索引」由 _refresh_index 在每次写入后重建，正文就是**全库标题列表**。
+# 若参与遍历，则任何查询的头号「邻居」都是它（warm + 刚更新 ⇒ 排位极高），
+# 它的 [[链接]] 是「罗列全库」的产物、不是语义关联 ⇒ 只将它排除出**周边**；
+# 显式把它当起点传入时仍可正常使用。
+_CONTEXT_SKIP_TITLES = {"记忆索引"}
+_CONTEXT_MIN_BLOCK_ROOM = 200   # 剩余预算低于此值就不再展开新条目
+_CONTEXT_TF_UNITS = {"h": 1 / 24, "d": 1, "w": 7, "m": 30, "y": 365,
+                     "hour": 1 / 24, "day": 1, "week": 7, "month": 30, "year": 365}
+_CONTEXT_TF_WORDS = (("last week", 7), ("last month", 30), ("last year", 365),
+                     ("this week", 7), ("this month", 30))
+
+
+def _parse_timeframe(timeframe: str | None) -> int | None:
+    """把 timeframe 解析成「最多多少天」；无法识别返回 None（= 不限）。
+
+    支持 "today" / "yesterday" / "last week" / "2 days ago" / "3d" / "24h" /
+    "2w" / "2026-09-01"。刻意保持宽松：解析不出就按不限处理、由调用方在输出里
+    提示，不抛异常 —— 防的是一个拼错的参数让整段上下文都取不到。
+    """
+    s = (timeframe or "").strip().lower()
+    if not s or s in ("all", "any", "全部", "不限"):
+        return None
+    if s in ("today", "今天"):
+        return 0
+    if s in ("yesterday", "昨天"):
+        return 1
+    for word, days in _CONTEXT_TF_WORDS:
+        if s.startswith(word):
+            return days
+    s = re.sub(r"\s*ago$", "", s)
+    m = re.fullmatch(r"(\d+)\s*([a-z]+)", s)
+    if m:
+        factor = _CONTEXT_TF_UNITS.get(m.group(2).rstrip("s"))
+        if factor is not None:
+            return max(0, int(round(int(m.group(1)) * factor)))
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return max(0, (datetime.now(timezone.utc) - dt).days)
+    return None
+
+
+@mcp.tool(annotations=_RO)
+def memory_context(title: str, depth: int = 2, max_related: int = 10,
+                   timeframe: str | None = None, max_chars: int | None = None) -> str:
+    """Assemble a ready-to-read context block around one entry (B1).
+
+    与 memory_graph 的区别：graph 只列「出链 + 反链」，本工具**把沿途正文组装成
+    一段可直接喂给模型的内容**并标注来源与关系 —— 跨会话延续从「3~5 次调用」降到 1 次。
+
+    Args:
+        title: 起点条目的标题（或文件名 stem）。
+        depth: 沿 [[wikilink]] 出链 / 反链扩展的层数。0 = 只要起点本身。
+        max_related: 周边条目数上限（起点不计入），按 tier → access_count →
+            updated 排序取前 N。
+        timeframe: 只保留 updated 在范围内的**周边**条目（起点始终包含）。支持
+            "today" / "yesterday" / "last week" / "2 days ago" / "3d" / "24h" /
+            "2w" / "2026-09-01"；不传或 "all" = 不限。无法识别时按不限处理并在
+            输出里提示。
+        max_chars: 整段输出字符上限；0 = 不限。省略时用 BODY_TRUNCATE_CHARS。
+            预算在起点与周边间分摊（起点至多一半，其余按篇数均分），
+            故周边不会因起点过长而被挤到一篇不剩；想要全文传 0。
+
+    Returns:
+        Markdown：起点块 + 周边块；每块以 `_关系 · 深度 · tier · reads · updated_`
+        标注来源。受 max_chars 约束时会显式提示截断与未展开数量。
+
+        自动生成的「记忆索引」不参与周边遍历（它的 [[链接]] 只是罗列全库，
+        会挤掉真实关联）；但显式传它作为起点时仍可用。
+    """
+    all_entries = _iter_entries()
+
+    by_name: dict[str, tuple[Path, dict[str, Any], str]] = {}
+    for _f, _meta, _body in all_entries:
+        for key in (_entry_title(_meta, _f), _f.stem):
+            by_name.setdefault(key, (_f, _meta, _body))
+
+    start = by_name.get(title) or by_name.get(_clean_link_name(title))
+    if start is None:
+        return '未找到标题为 "{}" 的记忆'.format(title)
+    start_title = _entry_title(start[1], start[0])
+
+    def _resolve(name: str) -> str | None:
+        """把正文里的链接名解析为库内真实标题；解析不到返回 None（视为未建页）。"""
+        ent = by_name.get(name) or by_name.get(_clean_link_name(name))
+        return _entry_title(ent[1], ent[0]) if ent else None
+
+    # 出链 / 反链都以「正文扫描」为唯一事实源，与 memory_graph 保持同一口径。
+    outlinks: dict[str, list[str]] = {}
+    backlinks: dict[str, list[str]] = {}
+    for _f, _meta, _body in all_entries:
+        _t = _entry_title(_meta, _f)
+        if _t in _CONTEXT_SKIP_TITLES:
+            continue
+        _resolved: list[str] = []
+        for _link in _extract_wiki_links(_body):
+            _nxt = _resolve(_link)
+            if _nxt and _nxt != _t and _nxt not in _resolved:
+                _resolved.append(_nxt)
+        outlinks[_t] = _resolved
+        for _nxt in _resolved:
+            backlinks.setdefault(_nxt, []).append(_t)
+
+    # BFS：记下每个可达条目的最小深度，以及「从谁、以何种关系」抵达。
+    found: dict[str, tuple[int, str, str]] = {}
+    seen = {start_title}
+    queue: list[tuple[str, int, str, str]] = [(start_title, 0, "起点", "")]
+    limit_depth = max(int(depth), 0)
+    while queue:
+        cur, d, rel, via = queue.pop(0)
+        if cur != start_title:
+            found.setdefault(cur, (d, rel, via))
+        if d >= limit_depth:
+            continue
+        for _nxt, _kind in ([(n, "出链") for n in outlinks.get(cur, [])] +
+                            [(n, "反链") for n in backlinks.get(cur, [])]):
+            if _nxt not in seen and _nxt != start_title:
+                seen.add(_nxt)
+                queue.append((_nxt, d + 1, _kind, cur))
+
+    tf_days = _parse_timeframe(timeframe)
+    tf_note = ""
+    if timeframe and tf_days is None:
+        tf_note = "（timeframe={!r} 无法识别，已按不限处理）".format(timeframe)
+
+    selected: list[tuple[str, int, str, str, tuple[Path, dict[str, Any], str]]] = []
+    skipped_tf = 0
+    skipped_gen = 0
+    for _name, (_d, _rel, _via) in found.items():
+        if _name in _CONTEXT_SKIP_TITLES:
+            skipped_gen += 1
+            continue
+        _ent = by_name.get(_name)
+        if _ent is None:
+            continue
+        _upd = _ent[1].get("updated") or _ent[1].get("created") or ""
+        if tf_days is not None and _days_since_utc(_upd) > tf_days:
+            skipped_tf += 1
+            continue
+        selected.append((_name, _d, _rel, _via, _ent))
+
+    def _rank(item) -> tuple:
+        _meta = item[4][1]
+        _tier = str(_meta.get("tier", "warm")).lower()
+        try:
+            _reads = int(_meta.get("access_count", 0) or 0)
+        except (TypeError, ValueError):
+            _reads = 0
+        _dt = _parse_dt_utc(_meta.get("updated")) or datetime.min.replace(tzinfo=timezone.utc)
+        return (_CONTEXT_TIER_RANK.get(_tier, 1), -_reads, -_dt.timestamp())
+
+    selected.sort(key=_rank)
+    total_related = len(selected)
+    shown = selected[:max(int(max_related), 0)]
+
+    budget = BODY_TRUNCATE_CHARS if max_chars is None else int(max_chars)
+    unlimited = budget == 0
+
+    def _meta_line(meta: dict[str, Any], extra: str) -> str:
+        bits = [extra, "tier=" + str(meta.get("tier", "warm")),
+                "reads=" + str(meta.get("access_count", 0) or 0)]
+        _updated = str(meta.get("updated") or "")[:10]
+        if _updated:
+            bits.append("updated=" + _updated)
+        return " · ".join(b for b in bits if b)
+
+    def _render(name: str, ent, extra: str) -> str:
+        return "## {}\n\n_{}_\n\n{}".format(name, _meta_line(ent[1], extra), ent[2].strip())
+
+    def _cut_at_line(text: str, cap: int) -> str:
+        """按字符上限截断并回退到最后一个换行 —— 避免把 `_关系 · 深度 · tier_` 标注行切断。"""
+        cut = text[:max(cap, 0)]
+        return cut.rsplit("\n", 1)[0] if "\n" in cut else cut
+
+    head = ["# 上下文：{}".format(start_title),
+            "起点 1 篇 + 周边 {} 篇（展开 {} 篇）".format(total_related, len(shown))
+            + ("；{} 篇超出 timeframe 已略过".format(skipped_tf) if skipped_tf else "")
+            + ("；生成页 {} 篇未计入".format(skipped_gen) if skipped_gen else "")
+            + ("；{} 篇超出 max_related 未展开".format(total_related - len(shown))
+               if total_related > len(shown) else "")
+            + ((" " + tf_note) if tf_note else ""),
+            "起点出链 {} 条 / 反链 {} 条".format(len(outlinks.get(start_title, [])),
+                                                 len(backlinks.get(start_title, [])))]
+
+    buf = ["\n".join(head)]
+    used = len(buf[0])
+
+    # 预算分摊：max_chars 约束的是**整段输出**，而单篇正文最长可达 20KB+（如「近期工作动态」）
+    # —— 若让起点独占预算，周边一篇都展不开，那这工具就白搭。
+    # 规则：起点至多占一半（无周边时可用满）；其余按「剩余 ÷ 未展开篇数」均分，
+    # 且每篇至少预留 _CONTEXT_MIN_BLOCK_ROOM ⇒ 前篇截得短时后篇自动多分。
+    truncated_any = False
+    if unlimited:
+        start_cap = 10 ** 9
+    elif not shown:
+        start_cap = max(budget - used, 0)
+    else:
+        start_cap = min(max(budget // 2, _CONTEXT_MIN_BLOCK_ROOM), max(budget - used, 0))
+
+    start_block = _render(start_title, start, "起点 · 深度 0")
+    if len(start_block) > start_cap:
+        start_block = _cut_at_line(start_block, start_cap) + "\n\n…（起点正文已按 max_chars 截断）"
+        truncated_any = True
+    buf.append(start_block)
+    used += len(start_block)
+
+    merged = 0
+    for _idx, (_name, _d, _rel, _via, _ent) in enumerate(shown):
+        remaining = (budget - used) if not unlimited else 10 ** 9
+        if remaining < _CONTEXT_MIN_BLOCK_ROOM:
+            break
+        left = len(shown) - _idx                      # 含本篇仍未展开的篇数
+        reserve = _CONTEXT_MIN_BLOCK_ROOM * (left - 1)  # 为后面的篇保留最低额度
+        share = min(remaining // left, max(remaining - reserve, _CONTEXT_MIN_BLOCK_ROOM))
+        block = _render(_name, _ent, "{} ←「{}」· 深度 {}".format(_rel, _via, _d))
+        if len(block) > share:
+            block = _cut_at_line(block, share) + "\n\n…（本块已按 max_chars 截断）"
+            truncated_any = True
+        buf.append(block)
+        used += len(block)
+        merged += 1
+
+    if merged < len(shown):
+        buf.append("…共 {} 篇周边，因 max_chars 只展开了 {} 篇（可传 max_chars=0 取全部）"
+                   .format(total_related, merged))
+    elif total_related > len(shown):
+        buf.append("…另有 {} 篇未展开（提高 max_related 可见）".format(total_related - len(shown)))
+    if truncated_any:
+        buf.append("…上方有块被截断（max_chars={}）；传 max_chars=0 可取全文"
+                   .format(budget))
+
+    return "\n\n".join(buf)
+
 
 @mcp.tool(annotations=_RO)
 def memory_orphans() -> str:

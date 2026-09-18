@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""22 个 MCP 工具全量冒烟测试。
+"""23 个 MCP 工具全量冒烟测试。
 
 用途:
     确认 server.py 的**全部** MCP 工具都能被正常调用且不抛异常。与
     test_roundtrip.py 分工互补:
       - test_roundtrip.py 验证「语义正确性」(frontmatter 写读无损、反斜杠
         不雪崩、read 不污染 updated、SQLite 索引自愈等)
-      - 本脚本验证「覆盖面」(22 个工具一个不漏、全部可调用)
+      - 本脚本验证「覆盖面」(23 个工具一个不漏、全部可调用)
     两者结合才能支撑 server.py 的安全重构（P3 模块化即以此护航）。
 
     脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
@@ -95,6 +95,8 @@ call("memory_orphans", server.memory_orphans, expect="")
 # =====================================================================
 section("关系图与链接工具")
 call("memory_graph", server.memory_graph, "冒烟_主笔记", expect="冒烟_")
+call("memory_context", server.memory_context, "冒烟_主笔记", expect="冒烟_关联笔记")
+call("memory_context(depth=0)", server.memory_context, "冒烟_主笔记", depth=0, expect="上下文")
 call("memory_rebuild_links", server.memory_rebuild_links, expect="")
 
 # =====================================================================
@@ -123,7 +125,8 @@ EXPECTED_TOOLS = {
     "memory_list", "memory_delete", "memory_update_metadata", "memory_audit",
     "memory_doctor", "memory_index_draft", "memory_archive", "memory_restore",
     "memory_heat_suggest", "memory_restart",
-    "memory_graph", "memory_orphans", "memory_batch_tag", "memory_batch_tier",
+    "memory_graph", "memory_context", "memory_orphans", "memory_batch_tag",
+    "memory_batch_tier",
     "memory_archive_old", "memory_smart_search", "memory_recent", "memory_stats",
 }
 # A1 (2026-09-17) 行为标注：MCP 规范里 destructiveHint / openWorldHint 默认都是
@@ -132,7 +135,8 @@ EXPECTED_TOOLS = {
 # 工具漏标。
 EXPECTED_READONLY = {
     "memory_read", "memory_search", "memory_smart_search", "memory_list",
-    "memory_recent", "memory_stats", "memory_graph", "memory_orphans",
+    "memory_recent", "memory_stats", "memory_graph", "memory_context",
+    "memory_orphans",
     "memory_audit", "memory_doctor", "memory_index_draft", "memory_rebuild_links",
 }
 EXPECTED_DESTRUCTIVE = {
@@ -145,7 +149,7 @@ EXPECTED_NONIDEM = {"memory_restore", "memory_restart"}
 try:
     tools = asyncio.run(server.mcp.list_tools())
     registered = {t.name for t in tools}
-    check("工具总数 = 22", len(registered) == 22, f"实际 {len(registered)}: {sorted(registered)}")
+    check("工具总数 = 23", len(registered) == 23, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
 

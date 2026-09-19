@@ -123,10 +123,13 @@ def index_relpaths() -> set[str]:
 
 
 def disk_relpaths() -> set[str]:
-    s = {p.name for p in server.MEMORY_DIR.glob("*.md")}
+    # 键取「相对 MEMORY_DIR 的 posix 路径」而非 p.name —— 目录分层（2026-09-19）
+    # 后不同子目录可能存在同名文件，用 name 作键会互相覆盖、比对假通过。
+    s = {p.relative_to(server.MEMORY_DIR).as_posix() for p in server._iter_md_files()}
     arc = server.MEMORY_DIR / ".archive"
     if arc.exists():
-        s |= {".archive/" + p.name for p in arc.glob("*.md")}
+        s |= {p.relative_to(server.MEMORY_DIR).as_posix()
+              for p in server._iter_md_files(arc)}
     return s
 
 

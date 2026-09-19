@@ -234,7 +234,7 @@ def _rebuild_index() -> None:
 
         def _loader():
             for d in dirs:
-                for f in d.glob("*.md"):
+                for f in _iter_md_files(d):
                     try:
                         meta, _ = _load_memory(f)
                         yield f, meta
@@ -518,13 +518,59 @@ CORE_PAGES = {"记忆索引", "近期工作动态", "用户画像", "AI身份档
 
 # ---- 回收站 (.trash) -------------------------------------------------
 # memory_delete 默认软删除：文件移入 .trash/ 而非 unlink，误删可恢复。
-# .trash/ 不参与任何检索（读取端只 glob MEMORY_DIR/*.md），取回走
+# .trash/ 不参与任何检索（读取端统一走 _iter_md_files，它剪掉本目录），取回走
 # memory_restore(source="trash")，查看走 memory_list(include_trash=True)。
 TRASH_DIR_NAME = ".trash"
 
 
 def _trash_dir() -> Path:
     return MEMORY_DIR / TRASH_DIR_NAME
+
+
+# ---- 目录分层支持 (2026-09-19) ---------------------------------------
+# 记忆库不再只平铺在 vault 根目录：分类子目录（如 项目/、运维/、技能/）
+# 里的条目与根目录条目完全等同 —— 所有「读取端枚举」统一收敛到下面这个
+# 函数。此前散落的 21 处手写 `MEMORY_DIR.glob("*.md")` 全是非递归的，
+# 一旦有子目录就会集体漏读，故一律改走这里。
+#
+# RESERVED_DIRS 内的目录，其整棵子树都不进检索范围：
+#   * .archive / .trash —— 独立功能区，各有专用工具（memory_restore 等）
+#   * .git / .obsidian  —— 版本库与 Obsidian 配置
+#   * ai-memory         —— vault 根下那份代码副本，自带 README 等 .md，
+#                          不排除的话会被当成记忆条目混进检索
+RESERVED_DIRS = frozenset({
+    ".archive", ".trash", ".git", ".obsidian",
+    "ai-memory", "__pycache__", ".ruff_cache", ".pytest_cache",
+})
+
+
+def _iter_md_files(base: Path | None = None) -> list[Path]:
+    """递归枚举 base（默认 MEMORY_DIR）下全部 .md，跳过 RESERVED_DIRS。
+
+    返回**已排序**结果，排序键为「层级深度 + posix 相对路径」⇒ 根目录条目
+    先于子目录条目、同级按字典序。之所以强调确定性：调用方普遍依赖稳定次序
+    （`_iter_entries` 的缓存填充序、`memory_search` 的同分 tie-break），
+    而 `os.walk` 的目录序遍历顺序在不同文件系统上并无保证。
+
+    ⚠️ 起点本身不受 RESERVED_DIRS 限制（只有它的**子目录**会被剪枝）——
+    这正是 `_iter_md_files(MEMORY_DIR / ".archive")` 能取到归档条目的原因。
+    """
+    root = MEMORY_DIR if base is None else base
+    if not root.exists():
+        return []
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # 就地改写 dirnames 才能真正剪枝（os.walk 依据它决定是否下探）
+        dirnames[:] = [d for d in dirnames if d not in RESERVED_DIRS]
+        for fname in filenames:
+            if fname.endswith(".md"):
+                found.append(Path(dirpath) / fname)
+    try:
+        found.sort(key=lambda p: (p.relative_to(root).as_posix().count("/"),
+                                  p.relative_to(root).as_posix()))
+    except ValueError:
+        found.sort()
+    return found
 
 
 def _free_path_in(directory: Path, name: str) -> Path:
@@ -663,7 +709,7 @@ def _flush_access_counts() -> int:
 def _flush_access_counts_locked() -> int:
     """写回 access_count（调用方必须已持有跨进程锁）。"""
     flushed = 0
-    for f in MEMORY_DIR.glob("*.md"):
+    for f in _iter_md_files():
         try:
             meta, body = _load_memory(f)
             title = _entry_title(meta, f)
@@ -942,12 +988,12 @@ def _vault_fingerprint() -> tuple:
         dir_mtime = 0
     parts: list[tuple] = []
     try:
-        for f in sorted(MEMORY_DIR.glob("*.md")):
+        for f in _iter_md_files():
             try:
                 st = f.stat()
             except OSError:
                 continue
-            parts.append((f.name, st.st_size, st.st_mtime_ns))
+            parts.append((f.relative_to(MEMORY_DIR).as_posix(), st.st_size, st.st_mtime_ns))
     except OSError:
         pass
     return (dir_mtime, tuple(parts))
@@ -963,7 +1009,7 @@ def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
     _DIR_FINGERPRINT = fp
     _ENTRY_CACHE.clear()
     entries: list[tuple[Path, dict[str, Any], str]] = []
-    for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
+    for f in sorted(_iter_md_files(), reverse=True):
         try:
             meta, body = _load_memory(f)
         except Exception as e:
@@ -1197,10 +1243,10 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     existing_meta: dict[str, Any] = {}
     existing_body: str = ""
 
-    # 写入只匹配根目录条目；.archive 是只读归档（不参与写入匹配）。
+    # 写入匹配全库条目（含分类子目录）；.archive 是只读归档（不参与写入匹配）。
     # 若根目录无此标题而归档中有，视为"归档后重建"——在根目录新建条目，
     # 归档保持原样。要修改归档内容请先 memory_restore。
-    for f in list(MEMORY_DIR.glob("*.md")):
+    for f in _iter_md_files():
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -1331,8 +1377,8 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
                     + f"\n\n... [正文共 {len(body)} 字符，已截断至前 {max_chars}。需要完整内容请以 max_chars=0 重读]")
         return f"[{meta_str}]\n\n{body}"
 
-    # 回退: 全库 glob 扫描 (索引 miss / 文件被外部改动导致 stale)
-    for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
+    # 回退: 全库递归扫描 (索引 miss / 文件被外部改动导致 stale)
+    for f in _iter_md_files() + _iter_md_files(MEMORY_DIR / ".archive"):
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -1504,7 +1550,7 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
         search_dirs.append(archive_dir)
 
     for search_dir in search_dirs:
-        for f in sorted(search_dir.glob("*.md"), reverse=True):
+        for f in sorted(_iter_md_files(search_dir), reverse=True):
             try:
                 meta, body = _load_memory(f)
             except Exception:
@@ -1577,7 +1623,7 @@ def _list_trash(limit: int = 20) -> str:
     tdir = _trash_dir()
     if not tdir.exists():
         return "回收站为空"
-    rows = sorted(tdir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    rows = sorted(_iter_md_files(tdir), key=lambda p: p.stat().st_mtime, reverse=True)
     if not rows:
         return "回收站为空"
     lines: list[str] = []
@@ -1621,7 +1667,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     entries: list[str] = []
     hidden = 0
 
-    for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
+    for f in sorted(_iter_md_files(), reverse=True):
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -1688,7 +1734,7 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False,
         tdir = _trash_dir()
         if not tdir.exists():
             return "回收站为空，无需清理"
-        files = sorted(tdir.glob("*.md"))
+        files = _iter_md_files(tdir)
         if not files:
             return "回收站为空，无需清理"
         removed = 0
@@ -1710,7 +1756,7 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False,
         trash_dir = _trash_dir()
         if trash_dir.exists():
             search_dirs.append(trash_dir)
-    for f in [p for d in search_dirs for p in d.glob("*.md")]:
+    for f in [p for d in search_dirs for p in _iter_md_files(d)]:
         try:
             meta, _ = _load_memory(f)
         except Exception:
@@ -1779,7 +1825,7 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
     if status is not None and status not in LIFECYCLE_STATUSES:
         return (f"错误：status 取值非法（'{status}'）。"
                 f"合法取值：{', '.join(LIFECYCLE_STATUSES)}。")
-    for f in list(MEMORY_DIR.glob("*.md")) + list((MEMORY_DIR / ".archive").glob("*.md")):
+    for f in _iter_md_files() + _iter_md_files(MEMORY_DIR / ".archive"):
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -1853,7 +1899,7 @@ def memory_audit() -> str:
     all_titles: set[str] = set()
     archive_dir = MEMORY_DIR / ".archive"
     for d in ([MEMORY_DIR, archive_dir] if archive_dir.exists() else [MEMORY_DIR]):
-        for f in d.glob("*.md"):
+        for f in _iter_md_files(d):
             try:
                 m, _ = _load_memory(f)
                 all_titles.add(_entry_title(m, f))
@@ -1987,7 +2033,7 @@ def memory_doctor(limit: int = 20) -> str:
 
     Deliberately skips the lazy rebuild: repairing first would make every report
     read "consistent". Scan scope matches ``_rebuild_index``'s loader (vault root
-    + ``.archive``) so archive copies are not misreported as stale.
+    + 分类子目录 + ``.archive``) so archive copies are not misreported as stale.
     """
     if not _IDX_FILE.exists():
         return ("# 索引一致性自检\n\n"
@@ -2005,12 +2051,14 @@ def memory_doctor(limit: int = 20) -> str:
         if archive.exists():
             search_dirs.append(archive)
         for d in search_dirs:
-            for f in d.glob("*.md"):
+            for f in _iter_md_files(d):
                 try:
                     disk[f.relative_to(MEMORY_DIR).as_posix()] = f
                 except ValueError:
                     continue
         n_root = sum(1 for rel in disk if "/" not in rel)
+        n_arch = sum(1 for rel in disk if rel.startswith(".archive/"))
+        n_cat = len(disk) - n_root - n_arch
 
         stale = sorted(set(idx) - set(disk))
         unindexed = sorted(set(disk) - set(idx))
@@ -2045,7 +2093,7 @@ def memory_doctor(limit: int = 20) -> str:
 
     out = ["# 索引一致性自检", "",
            f"- 索引行数: {len(idx)}",
-           f"- 磁盘文件: {len(disk)}（根目录 {n_root}，.archive {len(disk) - n_root}）",
+           f"- 磁盘文件: {len(disk)}（根目录 {n_root}，分类目录 {n_cat}，.archive {n_arch}）",
            f"- 结论: {'索引与磁盘一致' if clean else '发现差异，索引当前不可完全信任'}",
            ""]
 
@@ -2131,7 +2179,7 @@ def memory_archive(title: str) -> str:
     target_meta: dict[str, Any] = {}
     target_body = ""
 
-    for f in MEMORY_DIR.glob("*.md"):
+    for f in _iter_md_files():
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -2203,7 +2251,7 @@ def _restore_from_trash(title: str) -> str:
     target_path: Path | None = None
     target_meta: dict[str, Any] = {}
     target_body = ""
-    for f in sorted(trash_dir.glob("*.md")):
+    for f in _iter_md_files(trash_dir):
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -2220,7 +2268,7 @@ def _restore_from_trash(title: str) -> str:
         return f"错误：'{target_title}' 是核心页面，不允许恢复覆盖。"
 
     # 根目录已有同标题条目 => 拒绝，避免静默覆盖现存内容（回收站里的可能是旧版）
-    for f in MEMORY_DIR.glob("*.md"):
+    for f in _iter_md_files():
         try:
             m, _ = _load_memory(f)
         except Exception:
@@ -2269,7 +2317,7 @@ def memory_restore(title: str, source: str = "archive") -> str:
     target_path: Path | None = None
     target_meta: dict[str, Any] = {}
     target_body = ""
-    for f in archive_dir.glob("*.md"):
+    for f in _iter_md_files(archive_dir):
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -2288,7 +2336,7 @@ def memory_restore(title: str, source: str = "archive") -> str:
 
     # 定位根目录中的 stub（若有），否则用安全文件名新建
     stub = MEMORY_DIR / _safe_filename(target_title)
-    for f in MEMORY_DIR.glob("*.md"):
+    for f in _iter_md_files():
         try:
             m, _ = _load_memory(f)
         except Exception:
@@ -2348,7 +2396,7 @@ def _heat_report(apply: bool) -> str:
     stats: list[tuple[str, str, str, int, str, str]] = []
     core_skipped = 0
 
-    for f in sorted(MEMORY_DIR.glob("*.md"), reverse=True):
+    for f in sorted(_iter_md_files(), reverse=True):
         try:
             meta, _body = _load_memory(f)
         except Exception:
@@ -3005,7 +3053,7 @@ def memory_recent(days: int = 7, limit: int = 20) -> str:
     """List entries updated within the last N days, most recent first."""
     now = datetime.now(timezone.utc)
     recent: list[tuple[str, str, str]] = []
-    for f in MEMORY_DIR.glob("*.md"):
+    for f in _iter_md_files():
         try:
             meta, _ = _load_memory(f)
         except Exception:

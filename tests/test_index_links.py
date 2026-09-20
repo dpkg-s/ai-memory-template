@@ -61,7 +61,12 @@ def index_targets() -> list[str]:
 
 
 def resolves(target: str) -> bool:
-    return (Path(_TMP) / f"{target}.md").exists()
+    """Obsidian 按**文件名（stem）**解析 [[双链]]，与条目所在目录无关 ⇒ 必须递归查找。
+
+    阶段二（2026-09-20）之前条目全在 vault 根，只查根目录恰好也对；放行标题里的
+    `/` 之后新建条目可能落在分类子目录里，只查根目录会把合法链接误判成死链。
+    """
+    return any(p.stem == target for p in Path(_TMP).rglob("*.md"))
 
 
 def unreachable(targets: list[str]) -> list[str]:
@@ -93,6 +98,8 @@ check("IL2d 索引全部链接可解析", not bad, f"死链={bad}")
 
 # =====================================================================
 # IL3: 其它非法字符 + 别名保真
+# 阶段二后 `/` 不再是「非法字符」，而是**子目录分隔符**（见 tests/test_title_path.py），
+# 所以本组仍保留 `/` 是为了守「其余非法字符照旧归一化」+「跨目录仍可解析」。
 print("\n[IL3] 其它归一化字符")
 t_junk = '测试/非法:字符*案例?x'
 stem_junk = Path(safe_filename(t_junk)).stem
@@ -102,8 +109,11 @@ check("IL3a 含非法字符的标题可解析", stem_junk in targets and resolve
 idx_text = (Path(_TMP) / "记忆索引.md").read_text(encoding="utf-8")
 check("IL3b 原始标题保留在别名位", f"[[{stem_junk}|{t_junk}]]" in idx_text,
       f"期望 [[{stem_junk}|{t_junk}]]")
-bad = unreachable(targets)
-check("IL3c 索引全部链接可解析", not bad, f"死链={bad}")
+check("IL3c 索引全部链接可解析", not unreachable(targets), f"死链={unreachable(targets)}")
+check("IL3d '/' 解释为子目录（条目落在 测试/ 下）",
+      (Path(_TMP) / "测试" / f"{stem_junk}.md").exists(),
+      f"实际存在: {[str(p.relative_to(_TMP)) for p in Path(_TMP).rglob('*.md')]}")
+check("IL3e ':' '*' '?' 仍被归一化成 '_'", "非法_字符_案例_x" in stem_junk, stem_junk)
 
 # =====================================================================
 # IL4: 幂等 —— 反复重建索引不得退化

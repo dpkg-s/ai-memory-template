@@ -59,6 +59,7 @@ from text_utils import (
     days_since_utc as _days_since_utc,
     extract_wiki_links as _extract_wiki_links,
     heat_score as _heat_score,
+    legacy_flat_filename as _legacy_flat_filename,
     parse_dt_utc as _parse_dt_utc,
     safe_filename as _safe_filename,
 )
@@ -376,6 +377,19 @@ def _release_lock() -> None:
 mcp = FastMCP("ai-memory", instructions="本地共享 Markdown 记忆库，支持多个 AI 工具读写")
 
 
+def _rel_display(path: Path) -> str:
+    """写入回显用：优先给「相对 vault 根的 posix 路径」。
+
+    阶段二后条目可能落在分类子目录里，只回 `path.name` 会让「到底写哪儿了」
+    变得不可见 —— 而落点正是本阶段最容易出错的环节。不在 vault 内（理论上
+    不可能，但回显路径绝不能成为抛异常的地方）时退回文件名。
+    """
+    try:
+        return path.relative_to(MEMORY_DIR).as_posix()
+    except ValueError:
+        return path.name
+
+
 def _resolve_unique_path(directory: Path, title: str) -> Path:
     """Pick a filename for a new entry, avoiding collisions with files that
     belong to a different title (P0-4).
@@ -384,6 +398,10 @@ def _resolve_unique_path(directory: Path, title: str) -> Path:
     the same filename and silently overwrite each other. If the target already
     exists on disk AND its frontmatter title differs from ours, append _2/_3/...
     until free. If it exists and the title matches (e.g. a stale stub), reuse it.
+
+    阶段二（2026-09-20）：``_safe_filename`` 的返回值现在可以是含 ``/`` 的
+    **相对路径**（标题里写了存放目录）。路径拼接天然支持，但重名后缀必须落在
+    相对路径的**父目录**里（见下方注释）。
     """
     base = _safe_filename(title)
     candidate = directory / base
@@ -397,7 +415,10 @@ def _resolve_unique_path(directory: Path, title: str) -> Path:
         pass
     n = 2
     while True:
-        alt = directory / f"{candidate.stem}_{n}{candidate.suffix}"
+        # ⚠️ 追加后缀必须留在**同一个目录**：base 现在可能含 '/'（阶段二），
+        # 若写成 directory / f"{candidate.stem}_{n}" 会把重名条目错落到 vault 根，
+        # 反而制造出「子目录一份 + 根目录一份」的重复。
+        alt = candidate.parent / f"{candidate.stem}_{n}{candidate.suffix}"
         if not alt.exists():
             return alt
         n += 1
@@ -452,7 +473,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
     时会互相 unlink/replace 而抛 FileNotFoundError。pid 后缀使各进程的 temp 名
     天然隔离，作为纵深防御，即使将来新增未持锁的写路径也不会互踩。
     替换动作走 _replace_with_retry，抵御 Windows 上「目标文件正被读取」的瞬时占用。
+
+    阶段二（2026-09-20）：目标路径可以位于**尚不存在的分类子目录**里（标题写了
+    ``目录/条目``），故先 ``mkdir(parents=True)`` 补齐父目录 —— 这是全库写盘的
+    唯一收口，放在这里可让 memory_write / archive / restore / 索引重建一并受益。
+    幂等，已存在时零成本。
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         tmp.unlink(missing_ok=True)
@@ -571,6 +598,45 @@ def _iter_md_files(base: Path | None = None) -> list[Path]:
     except ValueError:
         found.sort()
     return found
+
+
+# ---- 阶段二：memory_write 支持子目录 (2026-09-20) ---------------------
+# 标题允许写成 `目录/条目`（如 `项目/记忆库MCP/条目`），落盘位置由
+# `text_utils.safe_filename()` 逐段消毒后决定。这里补的是 **政策**校验：
+# text_utils 只负责「什么字符非法」，而「哪些目录不允许写」是 vault 的约定。
+#
+# 为什么要单独校验而不是靠消毒兜住：
+#   * 消毒会把 `.archive/x` 变成 `archive/x`（`strip("._")` 吃掉前导点），
+#     于是「写进保留目录」会**静默变成写进同名普通目录**，用户看不出问题；
+#   * `..` 段被消毒消解后同样无声 —— 显式报错才符合「宁可拒绝、不要惊喜」。
+TITLE_PATH_MAX_DEPTH = 3   # 目录层数上限（`项目/记忆库MCP/条目` = 2 层目录，合规）
+
+
+def _title_path_error(title: str) -> str | None:
+    """标题含 ``/``（即指定了存放子目录）时的政策校验。
+
+    返回错误文案；``None`` 表示放行。仅当标题含 ``/`` 时才检查，因此**不影响**
+    存量扁平条目的读写 —— 含 ``/`` 的历史标题（如 ``轻装时代(QZSD)灯架/三脚架产品谱系``）
+    首段不是保留目录、层级也浅，同样放行。
+    """
+    if "/" not in title:
+        return None
+    if title.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", title):
+        return "错误：标题不能以分隔符开头，也不能包含盘符（会写到 vault 之外）。"
+    raw_segs = [s.strip() for s in title.split("/")]
+    if any(s in (".", "..") for s in raw_segs):
+        return "错误：标题不能包含 '.' 或 '..' 路径段。"
+    # 同时按**消毒后**的形态再看一遍（防「原始段不保留、消毒后恰好撞上保留目录」）
+    raw_dirs = [s for s in raw_segs if s][:-1]
+    safe_dirs = [s for s in os.path.dirname(_safe_filename(title)).split("/") if s]
+    for dirs, tag in ((raw_dirs, "原始"), (safe_dirs, "归一化后")):
+        if len(dirs) > TITLE_PATH_MAX_DEPTH:
+            return (f"错误：目录层级过深（{tag} {len(dirs)} 层，最多 {TITLE_PATH_MAX_DEPTH} 层）。")
+        hit = [d for d in dirs if d in RESERVED_DIRS]
+        if hit:
+            return (f"错误：'{hit[0]}' 是保留目录（{tag}名称命中），不能作为记忆条目的存放目录。"
+                    f"保留目录：{', '.join(sorted(RESERVED_DIRS))}。")
+    return None
 
 
 def _free_path_in(directory: Path, name: str) -> Path:
@@ -1157,6 +1223,14 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                  expected_version: int | None = None) -> str:
     """Write a memory entry, updating an existing one with the same title if found.
 
+    title 支持 ``目录/条目`` 写法（阶段二，2026-09-20）：标题含 ``/`` 时会落到 vault
+    内的分类子目录，目录不存在则自动创建。例如
+    ``memory_write("项目/记忆库MCP/新条目", ...)`` → ``项目/记忆库MCP/新条目.md``。
+    保留目录（``.archive`` / ``.trash`` / ``.git`` / ``.obsidian`` / ``ai-memory`` 等）、
+    ``.``/``..`` 路径段、盘符与超过 3 层的目录会被**拒绝并给出原因**。
+    按标题更新时仍走全库匹配（含子目录），因此**不会**因为标题里出现路径而重复建档；
+    阶段二之前 ``/`` 被拍成 ``_`` 的历史条目也会被正确命中。
+
     mem_type (optional): 记忆类型，写入 frontmatter 的 type 字段。
         合法取值：fact（明确事实）/ preference（用户偏好）/ decision（决策）/
         experience（经验）/ episodic（事件记录）/ project（项目上下文）/
@@ -1202,6 +1276,11 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     # 第三轮 P0-6：拒绝空壳与空标题
     if not title or not title.strip():
         return "错误：标题为空，已拒绝写入。"
+    # 阶段二：标题里的 '/' 表示存放子目录 —— 位置政策先行校验，避免
+    # 「消毒顺手改道」（`.archive/x` → `archive/x`）这类无声的落点偏移。
+    path_err = _title_path_error(title)
+    if path_err:
+        return path_err
     # 归一化必须早于空壳校验与摘要派生：调用方（其他 AI 客户端 / 手工整篇粘贴 /
     # 跨工具导入）常把「带 frontmatter 的完整笔记」直接当 content 传入。若不先剥，
     # ① 正文会叠加出双 frontmatter（Obsidian 只认第一块，第二块沦为正文垃圾）；
@@ -1246,12 +1325,19 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     # 写入匹配全库条目（含分类子目录）；.archive 是只读归档（不参与写入匹配）。
     # 若根目录无此标题而归档中有，视为"归档后重建"——在根目录新建条目，
     # 归档保持原样。要修改归档内容请先 memory_restore。
+    #
+    # 阶段二兼容：放行 '/' 之前，标题里的 '/' 会被拍成 '_' 才落盘，历史条目
+    # （如 `轻装时代(QZSD)灯架/三脚架产品谱系` → `…灯架_三脚架产品谱系.md`）的文件名
+    # 仍是旧口径。这里额外按旧口径的 stem 再匹配一次，否则该标题会被当成新路径，
+    # 进而造出「同一标题两条记录」。
+    legacy_stem = Path(_legacy_flat_filename(title)).stem if "/" in title else None
     for f in _iter_md_files():
         try:
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if (_entry_title(meta, f) == title or f.stem == title
+                or (legacy_stem is not None and f.stem == legacy_stem)):
             existing_path = f
             existing_meta = meta
             existing_body = body
@@ -1307,7 +1393,7 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
             # Auto-archive: if tier is cold or very-low-heat, move to archive
             _maybe_auto_archive(title, existing_path)
             logger.info("UPDATE  title=%s tags=%s source=%s", title, tags, source)
-            result_msg = f"已更新记忆: {title} ({existing_path.name})"
+            result_msg = f"已更新记忆: {title} ({_rel_display(existing_path)})"
         else:
             filepath = _resolve_unique_path(MEMORY_DIR, title)
             _write_memory(filepath, title=title, tags=tags, source=effective_source, content=content,
@@ -1318,7 +1404,7 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                           conflicts=conflicts, source_context=source_context)
             _maybe_auto_archive(title, filepath)
             logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
-            result_msg = f"已创建记忆: {title} ({filepath.name})"
+            result_msg = f"已创建记忆: {title} ({_rel_display(filepath)})"
         # 改进#7：写入后自动维护索引（跳过索引自身，直接写文件防递归）
         if title != "记忆索引":
             _refresh_index()

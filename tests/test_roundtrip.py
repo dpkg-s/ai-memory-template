@@ -165,7 +165,13 @@ server.memory_write(title_h, "文件名安全正文")
 check("H1 含非法字符标题可写可读", server.memory_read(title_h, max_chars=0).startswith("["),
       "memory_read 未命中")
 safe_name = server._safe_filename(title_h)
-check("H2 安全文件名不含非法字符", not re.search(r'[\\/:*?"<>|]', safe_name), safe_name)
+# 阶段二（2026-09-20）后 '/' 是**子目录分隔符**（专项覆盖见 tests/test_title_path.py），
+# 故判据由「整串不含非法字符」改为「① 末段（真正的文件名）不含非法字符
+# ② 其余各段非空、且不是 '.' / '..'」。文件名安全这条约束本身没有被放松。
+check("H2 安全文件名末段不含非法字符",
+      not re.search(r'[\\:*?"<>|]', Path(safe_name).name), safe_name)
+check("H2b 路径各段非空且无 '.'/'..'",
+      all(seg not in ("", ".", "..") for seg in safe_name[:-3].split("/")), safe_name)
 
 # =====================================================================
 section("I. wiki 链接提取(单元)")

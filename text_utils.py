@@ -5,7 +5,8 @@
 不依赖 MEMORY_DIR、缓存、索引或任何全局状态，可独立测试。
 
 包含三类：
-    - 文件名：safe_filename（标题 -> 安全文件名）
+    - 文件名：safe_filename（标题 -> 安全文件名，标题中的 `/` 表示子目录）
+              legacy_flat_filename（阶段二之前的扁平规则，仅供向后兼容查找）
     - wiki 链接：WIKI_LINK_RE / extract_wiki_links / clean_link_name
     - 时间与热度：parse_dt_utc / days_since_utc / heat_score
 """
@@ -19,6 +20,7 @@ __all__ = [
     "WIKI_LINK_RE",
     "HEAT_DECAY_LAMBDA",
     "safe_filename",
+    "legacy_flat_filename",
     "extract_wiki_links",
     "clean_link_name",
     "parse_dt_utc",
@@ -32,11 +34,59 @@ WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]|]+)?\]\]")
 # 热度随时间衰减的系数：heat = reads / (1 + λ * days)
 HEAT_DECAY_LAMBDA = 0.2
 
+# 单个路径段的最大字符数（阶段二：整条标题的 80 字上限改为**逐段**施加）
+MAX_SEGMENT_CHARS = 80
+# 文件名中必须替换掉的字符（Windows 保留字符 + 空白；`/` 不在其列 ⇒ 用作分隔符）
+_ILLEGAL_CHARS_RE = re.compile(r'[\\:*?"<>|\s]+')
+# 阶段二之前的口径：`/` 与其它非法字符**同属一个字符类**，因此「`a/ b`」这类
+# 连续非法字符会被折叠成单个 `_`。兼容查找必须沿用这个折叠语义，不能拆成两步替换。
+_LEGACY_FLAT_RE = re.compile(r'[\\/:*?"<>|\s]+')
+# 控制字符直接丢弃（比替换成 `_` 更贴近原意，且不制造无意义下划线）
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def safe_filename(title: str) -> str:
-    """把标题转换为安全文件名：替换非法字符、截断至 80 字符、补 .md 后缀。"""
-    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("._")
-    safe = safe[:80] or "memory"
+    """把标题转换为安全文件名；标题中的 ``/`` 表示**子目录**（阶段二，2026-09-20）。
+
+    例：``safe_filename("项目/记忆库MCP/条目")`` → ``"项目/记忆库MCP/条目.md"``。
+    返回的是**相对路径**（不含盘符、不以分隔符开头），调用方自行与基准目录拼接，
+    即 ``MEMORY_DIR / safe_filename(title)``。
+
+    逐段消毒（对 ``/`` 切分出的每一段**独立**施加，规则彼此不串味）：
+
+    * ``\\ : * ? " < > |`` 与空白 → ``_``；控制字符丢弃
+    * 丢弃空段（顺带折叠重复的 ``/``）以及 ``.`` / ``..``（它们在 ``strip("._")``
+      后必为空 ⇒ 天然消解，杜绝目录穿越）
+    * 每段去掉首尾的 ``.`` 与 ``_``（Windows 不允许尾随点/空格）
+    * 每段截断至 ``MAX_SEGMENT_CHARS``
+
+    **无 ``/`` 的标题行为与阶段二之前逐字节一致**（单段即全串，便于回归比对）；
+    所有段都被丢弃时退化为 ``memory.md``。
+
+    ⚠️ 本函数只做**语法**消毒，不判断「哪些目录不允许写入」—— 那是 vault 的
+    **政策**，见 ``server._title_path_error()``（保留目录 / 盘符 / 层级上限）。
+    """
+    parts: list[str] = []
+    for raw in str(title).split("/"):
+        seg = _CONTROL_CHARS_RE.sub("", raw)
+        seg = _ILLEGAL_CHARS_RE.sub("_", seg).strip("._")
+        if not seg:
+            continue
+        parts.append(seg[:MAX_SEGMENT_CHARS])
+    return ("/".join(parts) + ".md") if parts else "memory.md"
+
+
+def legacy_flat_filename(title: str) -> str:
+    """阶段二（2026-09-20）之前的文件名规则：``/`` 与其它非法字符一样拍成 ``_``。
+
+    **仅供向后兼容查找，不用于新建。** 历史确有标题含 ``/`` 的笔记
+    （``轻装时代(QZSD)灯架/三脚架产品谱系`` 实存为 ``轻装时代(QZSD)灯架_三脚架产品谱系.md``）。
+    放行 ``/`` 之后，若不按旧规则再找一遍，这类标题会被当成新路径，
+    从而造出「同一标题两条记录」的重复 —— ``memory_write`` 的匹配循环会同时
+    比对 ``f.stem == Path(legacy_flat_filename(title)).stem`` 来兜住它。
+    """
+    safe = _LEGACY_FLAT_RE.sub("_", str(title)).strip("._")
+    safe = safe[:MAX_SEGMENT_CHARS] or "memory"
     return f"{safe}.md"
 
 

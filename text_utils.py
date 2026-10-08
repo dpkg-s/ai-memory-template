@@ -3,6 +3,8 @@
 
 从 server.py 拆分而来（P3 模块化，2026-09-10）。本模块是**无状态纯函数层**：
 不依赖 MEMORY_DIR、缓存、索引或任何全局状态，可独立测试。
+（B5, 2026-10-08：`heat_score` 的衰减系数改从 `memory_config` 取；后者是最底层、
+自身不反向依赖任何模块，故本层仍是「无 vault 全局状态」的。）
 
 包含三类：
     - 文件名：safe_filename（标题 -> 安全文件名，标题中的 `/` 表示子目录）
@@ -15,6 +17,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+import memory_config
 
 __all__ = [
     "WIKI_LINK_RE",
@@ -32,7 +36,9 @@ __all__ = [
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]|]+)?\]\]")
 
 # 热度随时间衰减的系数：heat = reads / (1 + λ * days)
-HEAT_DECAY_LAMBDA = 0.2
+# B5（2026-10-08）：真值已外置到 memory.toml 的 `heat_decay_lambda`；本常量
+# 保留为向后兼容别名，运行时的真值由 heat_score 内的 memory_config.get() 取。
+HEAT_DECAY_LAMBDA = memory_config.DEFAULTS["heat_decay_lambda"]
 
 # 单个路径段的最大字符数（阶段二：整条标题的 80 字上限改为**逐段**施加）
 MAX_SEGMENT_CHARS = 80
@@ -136,8 +142,13 @@ def days_since_utc(value: Any) -> int:
 
 
 def heat_score(reads: int, updated_str: str) -> float:
-    """Heat score with time decay. Higher = more actively used."""
+    """Heat score with time decay. Higher = more actively used.
+
+    衰减系数 λ 取自 ``memory.toml`` 的 ``heat_decay_lambda``（B5，内置默认 0.2）。
+    每次调用都现取 —— ``memory_config`` 内部有 2 秒 TTL 缓存，读取开销可忽略，
+    而这样改配置无需重启 MCP 进程。
+    """
     if not updated_str:
         return float(reads)
     days_since = days_since_utc(updated_str)
-    return reads / (1 + HEAT_DECAY_LAMBDA * max(days_since, 0))
+    return reads / (1 + memory_config.get("heat_decay_lambda") * max(days_since, 0))

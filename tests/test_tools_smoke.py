@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""23 个 MCP 工具全量冒烟测试。
+"""24 个 MCP 工具全量冒烟测试。
 
 用途:
     确认 server.py 的**全部** MCP 工具都能被正常调用且不抛异常。与
     test_roundtrip.py 分工互补:
       - test_roundtrip.py 验证「语义正确性」(frontmatter 写读无损、反斜杠
         不雪崩、read 不污染 updated、SQLite 索引自愈等)
-      - 本脚本验证「覆盖面」(23 个工具一个不漏、全部可调用)
+      - 本脚本验证「覆盖面」(24 个工具一个不漏、全部可调用)
     两者结合才能支撑 server.py 的安全重构（P3 模块化即以此护航）。
 
     脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
@@ -124,7 +124,7 @@ EXPECTED_TOOLS = {
     "memory_write", "memory_read", "memory_rebuild_links", "memory_search",
     "memory_list", "memory_delete", "memory_update_metadata", "memory_audit",
     "memory_doctor", "memory_index_draft", "memory_archive", "memory_restore",
-    "memory_heat_suggest", "memory_restart",
+    "memory_heat_suggest", "memory_restart", "memory_schema_diff",
     "memory_graph", "memory_context", "memory_orphans", "memory_batch_tag",
     "memory_batch_tier",
     "memory_archive_old", "memory_smart_search", "memory_recent", "memory_stats",
@@ -138,6 +138,7 @@ EXPECTED_READONLY = {
     "memory_recent", "memory_stats", "memory_graph", "memory_context",
     "memory_orphans",
     "memory_audit", "memory_doctor", "memory_index_draft", "memory_rebuild_links",
+    "memory_schema_diff",
 }
 EXPECTED_DESTRUCTIVE = {
     "memory_archive", "memory_archive_old", "memory_delete", "memory_batch_tag",
@@ -149,7 +150,7 @@ EXPECTED_NONIDEM = {"memory_restore", "memory_restart"}
 try:
     tools = asyncio.run(server.mcp.list_tools())
     registered = {t.name for t in tools}
-    check("工具总数 = 23", len(registered) == 23, f"实际 {len(registered)}: {sorted(registered)}")
+    check("工具总数 = 24", len(registered) == 24, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
 

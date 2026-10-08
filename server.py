@@ -8,13 +8,14 @@ Storage:
 - Frontmatter written as YAML (Obsidian-native), legacy JSON still readable
 
 Features:
-- 23 MCP tools: read/write/search/smart_search/list/recent/graph/context/
-  orphans/stats, audit/doctor/index_draft/rebuild_links, batch tag & tier,
-  heat-based tier suggestions, archive/restore/delete, in-place hot restart
-  (memory_restart), auto-generated MOC index (记忆索引.md)
+- 24 MCP tools: read/write/search/smart_search/list/recent/graph/context/
+  orphans/stats, audit/doctor/schema_diff/index_draft/rebuild_links, batch tag &
+  tier, heat-based tier suggestions, archive/restore/delete, in-place hot restart
+  (memory_restart), auto-generated MOC index (.记忆索引.md, hidden by B6)
 - YAML frontmatter, Obsidian wikilinks, automatic link extraction,
   title-based dedup upsert, file locking, cross-process cache invalidation,
   SQLite metadata index for O(1) title lookup
+- 运行时阈值可外置到 vault 根的 memory.toml（B5，热重载，见 memory_config）
 - 零外部依赖：仅标准库 + mcp SDK
 """
 
@@ -47,6 +48,7 @@ from mcp.types import ToolAnnotations
 
 import memory_index as midx
 import locks
+import memory_config
 import metrics
 import text_utils
 import yaml_io
@@ -86,6 +88,9 @@ from yaml_io import (
 
 MEMORY_DIR = Path(os.environ.get("AI_MEMORY_DIR", "~/ai-memory")).expanduser().resolve()
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+# B5（2026-10-08）：把 vault 位置注入配置模块 —— 它是最底层，**不反向 import server**，
+# 因此配置文件的位置只能由这里喂给它。必须在任何阈值读取之前调用。
+memory_config.set_vault(MEMORY_DIR)
 _SERVER_DIR = Path(__file__).resolve().parent
 _IDX_FILE = midx.db_path(_SERVER_DIR, MEMORY_DIR)
 _IDX_NEEDS_REBUILD = True
@@ -336,10 +341,12 @@ def _resolve_title_via_index(title: str) -> Path | None:
     try:
         _ensure_index()
         with midx.connect(_IDX_FILE) as conn:
+            # A3：permalink 也参与定位 —— 必须与 memory_index.find / _entry_matches
+            # 同口径，否则「索引快路径」与「全库回退」对同一入参的判定会不一致。
             rows = conn.execute(
-                """SELECT * FROM entries WHERE title=? OR stem=?
+                """SELECT * FROM entries WHERE permalink=? OR title=? OR stem=?
                    ORDER BY (relpath LIKE '.archive/%') ASC, updated DESC""",
-                (title, title),
+                (title, title, title),
             ).fetchall()
             for row in rows:
                 p = MEMORY_DIR / row["relpath"]
@@ -409,7 +416,7 @@ def _resolve_unique_path(directory: Path, title: str) -> Path:
         return candidate
     try:
         meta, _ = _load_memory(candidate)
-        if _entry_title(meta, candidate) == title or candidate.stem == title:
+        if _entry_matches(meta, candidate, title):
             return candidate
     except Exception:
         pass
@@ -511,9 +518,41 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 _ACCESS_CACHE: dict[str, int] = {}  # title -> pending access_count increments
 _ACCESS_FLUSH_THRESHOLD = 10
-_ENTRY_CACHE: dict[str, tuple] = {}  # title -> (path, meta, body)
+# ---- B2 索引增量化（2026-10-08）--------------------------------------
+# 旧实现只有「整库指纹」一层缓存：任何一个文件变动都会让 _iter_entries 重新
+# 解析**全库** frontmatter。而 frontmatter 解析正是写入延迟的主要构成（201 篇
+# 规模已可测量）—— 写一条笔记就要付一次全库解析，延迟随库增长线性上升。
+#
+# 现拆成两层，键一律用 **relpath**（相对 MEMORY_DIR 的 posix 路径）：
+#   ① 整库指纹 _DIR_FINGERPRINT：未变 ⇒ 连 os.walk/stat 都省掉，直接回放快照；
+#   ② 文件级 _ENTRY_STAT：指纹变了也只重解析 (size, mtime_ns) 真变化的那些文件。
+# Windows/NTFS 改写已有文件内容不会 bump 父目录 mtime，故新鲜度判据必须落到
+# 文件级 —— 与 _vault_fingerprint 存在的理由完全相同。
+# ⚠️ 键由 title 改为 relpath 顺带修掉一处历史遗留：旧实现下不同目录的同名条目
+# 会在缓存里互相覆盖元数据。（_ENTRY_CACHE 仅供 _iter_entries 使用，无外部读取方。）
+_ENTRY_CACHE: dict[str, tuple] = {}   # relpath -> (path, meta, body)
+_ENTRY_STAT: dict[str, tuple] = {}    # relpath -> (size, mtime_ns)：条目级新鲜度
+_ENTRY_SNAPSHOT: list[tuple] = []     # 上次返回的条目序列（整库指纹未变时直接回放）
 _CACHE_VALID = False
 _DIR_FINGERPRINT: tuple = ()  # last seen vault fingerprint, for cross-process cache invalidation
+_PARSE_COUNT = 0              # 累计 frontmatter 解析次数（B2 可观测性：增量是否真省了活）
+_INDEX_SIG: tuple | None = None  # 上次渲染索引的内容签名（见 _refresh_index）
+
+# ---- B6：生成物隐藏化（2026-10-08）-----------------------------------
+# `记忆索引` 是库里**唯一**的纯生成物：每次写入后由 `_refresh_index` 整体重建，
+# 正文不含任何人工内容。给它加 `.` 前缀后：
+#   ① Obsidian 默认不显示点号开头的文件 ⇒ vault 根的人读区立刻干净；
+#   ② 与 EverOS 那套「人看的 / 框架派生的」分层对齐（`.atomic_facts/` 等）。
+#
+# ⚠️ 三条必须同时成立，否则会造出「同名两条目」或「索引全变死链」：
+#   ① **文件名硬编码只允许出现在这一行**，其余一律走 `_index_path()`；
+#   ② 生成物**必须仍在 `_iter_entries()` 扫描范围内**（os.walk 不跳点文件）——
+#      改名时若顺手把它排除，`memory_read("记忆索引")`、graph、doctor 会一起失联；
+#   ③ `memory_rebuild_links` 的 `known` 必须同时收 `path.stem` —— MOC 用的是
+#      `_wiki_link`（**渲染 stem**），改名后 stem 变成 `.记忆索引`，只认 title 的
+#      判定会当场把新索引判成死链。
+_INDEX_FILENAME = ".记忆索引.md"
+_INDEX_LEGACY_FILENAME = "记忆索引.md"   # B6 之前的名字，仅供一次性迁移识别
 _TAG_AUTO_MAP: dict[str, str] = {
     "python": "python", "py": "python", "flask": "python", "django": "python", "fastapi": "python",
     "javascript": "javascript", "js": "javascript", "typescript": "typescript", "ts": "typescript",
@@ -639,6 +678,84 @@ def _title_path_error(title: str) -> str | None:
     return None
 
 
+# ---- 阶段三：写入端自动归类 (2026-09-20) ------------------------------
+# 多级目录落地后，新条目仍靠写入方在 title 里手写 ``目录/条目``；一旦漏写，
+# 笔记就静静躺在 vault 根 —— 扁平格局重新长回来。阶段二闭合的是「能不能写」，
+# 本段闭合的是「会不会忘」。
+#
+# 做法：复用既有的语义分桶 ``_entry_bucket()``（原本只服务索引草稿），把它的
+# 结果接到写入路径上。因此「索引里的分组」与「磁盘上的目录」同源，不会出现
+# 索引归 A 桶、文件却躺在 B 目录这种自相矛盾。
+#
+# 四档策略，读环境变量 ``AI_MEMORY_DIR_POLICY``：
+#   off    —— 不介入，落 vault 根（阶段二及之前的行为）
+#   warn   —— 落点不变，但在返回消息里给出建议目录   ← **默认**
+#   auto   —— 自动落 ``规范目录/条目.md``
+#   strict —— 无规范目录可归时**拒绝写入**，要求写入方显式指定
+#
+# 默认取 warn 而非 auto，是**刻意保守**，依据是阶段三首轮的实测回归：把 auto
+# 设为默认后，**11 个既有测试套件失败**（18 套里），失败主体是辅助函数按
+# `<根>/<标题>.md` 读文件 —— 它们编码的正是「新条目落在根」这一心智模型，
+# 而非实现细节。既然既有代码、既有习惯、多个客户端都依赖它，默认值就不该动。
+# 而自动归类的判据（``_entry_bucket``）本身是**关键词启发式**：它读的是
+# ``_auto_suggest_tags()`` 自动补出来的 tags，两个启发式叠加会让落点对写入方
+# 不可预测（实测「测试_索引命中」因正文含 mcp 字样被自动补 tag，进而落到 工具/）。
+# ⇒ 先用 warn 观察一段时间，确认误判率可接受，再按需切 auto。
+# 要立刻启用自动归类：设 ``AI_MEMORY_DIR_POLICY=auto``。
+DIR_POLICY_ENV = "AI_MEMORY_DIR_POLICY"
+DIR_POLICIES = ("off", "warn", "auto", "strict")
+DEFAULT_DIR_POLICY = "warn"
+
+# ⚠️ 三条边界（均来自 2026-09-20 的实测教训）：
+#   1. 只作用于**新建**。已存在标题的更新一律就地更新、绝不搬运 —— 否则存量
+#      16 篇根目录核心页与 20 余个历史目录会被无谓搅动。
+#   2. 落盘目录**不写进 frontmatter 的 title**。title 始终是裸条目名：早前有
+#      4 篇 title 被写成 ``目录/条目`` 形式，导致其入链全部失效。
+#   3. 标题已显式含 ``/`` 时**完全尊重写入方**，不做二次推断。
+
+# 语义桶 -> 规范目录。只映射**语义无歧义**的目录：vault 里另有十余个历史遗留
+# 目录（故障 / 排坑 / 排查 / 核验 / 经验 / 环境 / 技术 / 图片 / 调研 / 需求 /
+# 偏好 / 素材 / 移动端 / Codex），彼此语义重叠（仅故障·排坑·排查 就有三个近义）。
+# 本表刻意**不再向它们写新条目** ⇒ 旧目录只承接存量、自然冻结，新笔记一律进
+# 规范目录，碎片随存量归档而收敛。要收编旧目录请走一次性搬迁，不要在这里做。
+BUCKET_DIRS: dict[str, str | None] = {
+    "时间线": "时间线",
+    "项目": "项目",
+    "工具": "工具",
+    "运维": "运维",
+    "修复": "修复",
+    "规则": "规则",
+    "身份与配置": "身份",
+    "模板": "模板",
+    "AI相关": "技术",
+    "其他": "其他",
+    "索引": None,          # 核心页（记忆索引），留在 vault 根
+}
+
+
+def _dir_policy() -> str:
+    """当前目录策略；未设置或取值非法时回落 ``DEFAULT_DIR_POLICY``。
+
+    非法值**不报错**（策略是运维开关，不该让写入失败），但也不做近似匹配：
+    一律按默认档处理，且返回值上看不出差别 —— 故把这条明确写进文档。
+    """
+    raw = (os.environ.get(DIR_POLICY_ENV) or "").strip().lower()
+    return raw if raw in DIR_POLICIES else DEFAULT_DIR_POLICY
+
+
+def _suggest_dir(title: str, tags: list[str]) -> str | None:
+    """推断条目的规范存放目录；``None`` 表示应留在 vault 根。
+
+    核心页（``CORE_PAGES``）一律留根 —— 它们是全库导航入口，散进子目录会让
+    「根目录 = 书架第一层」这个约定失效，而历史双链多以根路径书写。
+    """
+    if title in CORE_PAGES:
+        return None
+    bucket, _reason = _entry_bucket({"title": title, "tags": tags},
+                                    Path(_safe_filename(title)))
+    return BUCKET_DIRS.get(bucket)
+
+
 def _free_path_in(directory: Path, name: str) -> Path:
     """在 directory 内取一个**严格空闲**的路径（重名则追加 _2 / _3 ...）。
 
@@ -672,9 +789,12 @@ def _maybe_auto_archive(title: str, path: Path) -> None:
 # memory_write 写入后据此做「疑似重复/冲突」提示（不阻断写入）。
 # 相似度用字符 bigram 集合的 Jaccard 系数 —— 零依赖、对中文天然友好
 # （FTS5 分词坑未解，但 bigram 不需要分词，直接滑窗取相邻字符对）。
-_DUP_TITLE_JACCARD = 0.6    # 标题相似度阈值：>= 判「疑似重复标题」
-_DUP_BODY_JACCARD = 0.5     # 正文相似度阈值：>= 判「疑似重复/冲突内容」
-_DUP_MAX_HINTS = 3          # 最多返回几条提示，避免刷屏
+# B5（2026-10-08）：两个相似度阈值已外置到 memory.toml（`dup_title_jaccard` /
+# `dup_body_jaccard`）。下列常量只作**向后兼容别名与文档性默认值**，运行时真值
+# 一律现取（见 `_find_duplicate_hints`），否则改配置不生效。
+_DUP_TITLE_JACCARD = memory_config.DEFAULTS["dup_title_jaccard"]
+_DUP_BODY_JACCARD = memory_config.DEFAULTS["dup_body_jaccard"]
+_DUP_MAX_HINTS = 3          # 最多返回几条提示，避免刷屏（条数不属阈值类，仍内联）
 
 
 def _bigrams(text: str) -> set[str]:
@@ -699,9 +819,9 @@ def _find_duplicate_hints(title: str, content: str,
                           existing: list[tuple[Path, dict[str, Any], str]]) -> list[str]:
     """在现有条目里找疑似重复/冲突，返回最多 _DUP_MAX_HINTS 条提示。
 
-    匹配逻辑：
-      1. 标题 bigram Jaccard >= _DUP_TITLE_JACCARD → 「疑似重复标题」
-      2. 否则正文 bigram Jaccard >= _DUP_BODY_JACCARD → 「疑似重复/冲突内容」
+    匹配逻辑（阈值取自 memory.toml，B5）：
+      1. 标题 bigram Jaccard >= `dup_title_jaccard`（默认 0.6）→ 「疑似重复标题」
+      2. 否则正文 bigram Jaccard >= `dup_body_jaccard`（默认 0.5）→ 「疑似重复/冲突内容」
     排除：标题完全相同（那就是 upsert 自己，同名写入属于更新而非重复）。
     纯提示，不改任何数据 —— 是否合并/标注 supersedes 由调用方（AI/主人）决定。
     """
@@ -711,6 +831,10 @@ def _find_duplicate_hints(title: str, content: str,
     c_bi = _bigrams(content)
     if not t_bi and not c_bi:
         return []
+
+    # 阈值在循环外取一次：memory_config 自带 TTL 缓存，但逐候选现取仍是白费开销。
+    title_thr = memory_config.get("dup_title_jaccard")
+    body_thr = memory_config.get("dup_body_jaccard")
 
     hints: list[tuple[float, str]] = []
     seen_titles: set[str] = set()
@@ -730,10 +854,10 @@ def _find_duplicate_hints(title: str, content: str,
         title_sim = _jaccard(t_bi, o_t_bi)
         body_sim = _jaccard(c_bi, _bigrams(body))
 
-        if title_sim >= _DUP_TITLE_JACCARD:
+        if title_sim >= title_thr:
             kind = "疑似重复标题"
             score = title_sim
-        elif body_sim >= _DUP_BODY_JACCARD:
+        elif body_sim >= body_thr:
             kind = "疑似重复/冲突内容"
             score = body_sim
         else:
@@ -836,6 +960,29 @@ def _entry_title(meta: dict[str, Any], path: Path) -> str:
     if isinstance(title, str) and title.strip():
         return title.strip()
     return path.stem
+
+
+def _entry_matches(meta: dict[str, Any], path: Path, key: str) -> bool:
+    """条目是否匹配 key：**permalink → title → stem** 三级（A3, 2026-10-08）。
+
+    抽成单一入口的理由：全库原先有 9 处各自手写
+    `_entry_title(meta, f) == key or f.stem == key`，任何一处漏改都会让「旧标识
+    可定位」在不同工具上表现不一致 —— 那是最难排查的一类不一致（同一入参有时命中、
+    有时落到全库回退）。
+
+    permalink 是「首次写入时冻结的标识」，所以**文件被改名后**（stem 变）仍能用旧
+    标识命中。此前条目的唯一身份是 title/stem，改名即失联；这是 A3 要解决的核心问题。
+
+    ⚠️ 有意**不**用于「同名判定」场景（如 `_find_duplicate_hints` 里「同名即
+    upsert 自己」）：那里判断的是「标题是否一样」，掺入 permalink 会让重复检测
+    的语义变味。
+    """
+    if not key:
+        return False
+    pl = meta.get("permalink")
+    if isinstance(pl, str) and pl and pl == key:
+        return True
+    return _entry_title(meta, path) == key or path.stem == key
 
 
 def _wiki_link(path: Path, title: str | None = None) -> str:
@@ -970,6 +1117,51 @@ def _schema_version(meta: dict[str, Any]) -> int:
     return v if isinstance(v, int) else 1
 
 
+# ---- B4（2026-10-08）：frontmatter 键分层 ---------------------------------
+# 「写入端会产出什么」即本库的 schema 契约（`yaml_io.build_frontmatter` 是唯一
+# 写出源）。据此把磁盘上出现的键分成三层，**不再另立一份 schema 文件** ——
+# 两份真相必然分叉，而代码本身就是最准的那份。
+#
+#   core   任何版本都必须有（v1 时代就已存在）。缺 = 真实缺陷。
+#   v2     仅 schema_version>=2 承诺写出。v1 条目缺它们属**预期**，是迁移清单。
+#   opt    按需写出（有值才写）。缺失不是缺陷。
+_SCHEMA_CORE_KEYS = ("title", "tags", "created", "updated", "tier", "access_count")
+_SCHEMA_V2_KEYS = ("type", "confidence", "verified", "scope", "status", "schema_version")
+_SCHEMA_OPTIONAL_KEYS = ("permalink", "verified_at", "project", "supersedes",
+                         "conflicts", "source_context", "source", "summary",
+                         "links", "version")
+# `archived_to` 由 memory_archive 写入，不属 frontmatter 契约但属已知键 ——
+# 漏掉它会把全部归档 stub 误报成「未知键」，把真信号淹没在噪声里。
+_SCHEMA_KNOWN_EXTRA = ("archived_to",)
+_SCHEMA_ALL_KNOWN = frozenset(
+    _SCHEMA_CORE_KEYS + _SCHEMA_V2_KEYS + _SCHEMA_OPTIONAL_KEYS + _SCHEMA_KNOWN_EXTRA
+)
+
+
+def _frontmatter_key_lines(path: Path) -> dict[str, int]:
+    """返回该文件 frontmatter 内的 `键 -> 行号(1-based)`，用于把差异定位到行。
+
+    只扫首块 ``--- … ---``，正文里形如 ``key:`` 的行不会被误收。解析失败或文件
+    没有 frontmatter 时返回空 dict（调用方据此退化为「不附行号」）。
+    """
+    marks: dict[str, int] = {}
+    try:
+        text = _read_text(path)
+    except Exception:
+        return marks
+    if not text.startswith("---"):
+        return marks
+    for i, ln in enumerate(text.splitlines(), 1):
+        if i == 1:
+            continue
+        if ln.strip() == "---":
+            break
+        m = re.match(r"^([A-Za-z_][\w-]*)\s*:", ln)
+        if m:
+            marks.setdefault(m.group(1), i)
+    return marks
+
+
 def _credential_badge(meta: dict[str, Any]) -> str:
     """把可信度 / 生命周期字段压成紧凑标记，供搜索/列表行内展示。
 
@@ -1030,6 +1222,80 @@ def _filter_hint(hidden: int) -> str:
             f"可用 status=\"any\"、status=\"archived\" 或对应 scope 显式查看）")
 
 
+# ---- C1：工具输出可选 JSON（2026-10-08）-------------------------------
+# 只对**本质是「同构记录列表」的只读工具**开放 `output_format`（默认 "text"）：
+#   memory_read / memory_search / memory_list / memory_recent / memory_orphans
+#
+# 为什么不给全部 24 个工具都加：
+#   ① 报告型工具（stats / doctor / audit / schema_diff / context / graph …）的产出
+#      是**叙事**：分节标题 + 计数说明 + 提示语。把它整体转 JSON 等于另立一套真相，
+#      两份结构必然分叉 —— 这正是本仓反复踩过的坑（schema 文件 / 双链口径）。
+#   ② 写工具（write / update / archive / delete …）返回的是**操作回执**（一句话
+#      结果），结构化没有意义。
+#   ③ 于是范围**刻意**只覆盖「文本本身就是记录的渲染」的那几个：JSON 是文本的
+#      **同源投影**，而不是第二份实现。
+#
+# 口径：JSON 与文本由**同一批局部变量**组装（不是各写一遍）；非法取值**报错**而不
+# 静默回落 text —— 脚本化调用最怕「以为拿到 JSON、实际拿到一句中文」，那样
+# json.loads 会在很远的地方才炸，排查成本极高。
+_OUTPUT_FORMATS = ("text", "json")
+
+
+def _norm_output_format(value: str | None) -> str:
+    """校验 output_format 取值；非法值抛 ValueError（调用方转成错误文本）。"""
+    v = (value or "text").strip().lower()
+    if v not in _OUTPUT_FORMATS:
+        raise ValueError(f"output_format 只能是 {' / '.join(_OUTPUT_FORMATS)}，收到 {value!r}")
+    return v
+
+
+def _json_out(payload: dict[str, Any]) -> str:
+    """统一 JSON 输出：中文不转义、缩进 2（便于人眼与脚本共用）。"""
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _truncate_body(body: str, max_chars: int) -> tuple[str, bool, int]:
+    """按预算截断正文。返回 `(截断后的正文, 是否截断, 原长)`。
+
+    **文本与 JSON 共用**这一步，但截断说明只在文本侧拼（JSON 侧用 `truncated` /
+    `total_chars` 两个字段表达）—— 否则脚本拿到正文后还得正则剥掉那句中文提示。
+    """
+    total = len(body)
+    if max_chars and max_chars > 0 and total > max_chars:
+        return body[:max_chars], True, total
+    return body, False, total
+
+
+def _body_notice(total: int, max_chars: int) -> str:
+    """文本形态的截断说明尾巴（字节级与原实现一致）。"""
+    return f"\n\n... [正文共 {total} 字符，已截断至前 {max_chars}。需要完整内容请以 max_chars=0 重读]"
+
+
+def _meta_facets(meta: dict[str, Any]) -> dict[str, Any]:
+    """JSON 输出用的元数据切面 —— 与 `_credential_badge` 展示的是**同一组字段**。
+
+    只收「非默认值」的字段（scope=global / status=active 等默认值不出现），这样
+    JSON 里不会塞满噪声，也不必让调用方区分「没设置」与「设成了默认值」。
+    """
+    facets: dict[str, Any] = {
+        "type": meta.get("type", DEFAULT_MEMORY_TYPE),
+        "confidence": meta.get("confidence", DEFAULT_CONFIDENCE),
+        "verified": bool(meta.get("verified")),
+    }
+    for key, default in (("scope", DEFAULT_SCOPE), ("status", DEFAULT_STATUS)):
+        val = meta.get(key, default)
+        if val != default:
+            facets[key] = val
+    for key in ("project", "supersedes"):
+        val = meta.get(key)
+        if val:
+            facets[key] = val
+    conflicts = meta.get("conflicts")
+    if isinstance(conflicts, list) and conflicts:
+        facets["conflicts"] = conflicts
+    return facets
+
+
 def _load_memory(path: Path) -> tuple[dict[str, Any], str]:
     meta, body = _parse_frontmatter(_read_text(path))
     return _apply_meta_defaults(meta), body
@@ -1038,8 +1304,11 @@ def _invalidate_cache() -> None:
     global _CACHE_VALID
     _CACHE_VALID = False
 
-def _vault_fingerprint() -> tuple:
-    """Vault fingerprint: dir mtime + per-file (name, size, mtime_ns).
+def _vault_fingerprint(files: list[Path] | None = None) -> tuple:
+    """Vault fingerprint: dir mtime + per-file (relpath, size, mtime_ns).
+
+    ``files`` 允许调用方复用自己刚枚举好的文件列表（`_iter_entries` 会把
+    `_iter_md_files()` 的结果直接传进来），省掉一次重复的 os.walk + stat。
 
     On Windows/NTFS, rewriting the *content* of an existing file does NOT bump
     the parent directory mtime — only create/rename/delete does. A dir-mtime-only
@@ -1054,7 +1323,7 @@ def _vault_fingerprint() -> tuple:
         dir_mtime = 0
     parts: list[tuple] = []
     try:
-        for f in _iter_md_files():
+        for f in (_iter_md_files() if files is None else files):
             try:
                 st = f.stat()
             except OSError:
@@ -1066,26 +1335,70 @@ def _vault_fingerprint() -> tuple:
 
 
 def _iter_entries() -> list[tuple[Path, dict[str, Any], str]]:
-    global _CACHE_VALID, _ENTRY_CACHE, _DIR_FINGERPRINT
+    """全库条目枚举（唯一入口，14 处调用）。
+
+    B2 两层缓存（2026-10-08）：
+
+      ① 整库指纹未变 ⇒ 直接回放 `_ENTRY_SNAPSHOT`，连枚举与 stat 都省掉；
+      ② 指纹变了 ⇒ 逐文件按 (size, mtime_ns) 判新鲜，**只重解析真变化的文件**。
+         这是本改动的核心收益：改一条笔记不再触发全库 frontmatter 解析。
+
+    返回的 meta 一律是浅拷贝 —— 调用方就地改 meta 不会污染缓存（旧实现直接
+    回传缓存内的同一 dict，属共享可变对象隐患）。
+    """
+    global _CACHE_VALID, _DIR_FINGERPRINT, _ENTRY_SNAPSHOT, _PARSE_COUNT
     # Cross-process invalidation: rebuild when the vault fingerprint changed
     # (Obsidian edit, other MCP client, git operation). See _vault_fingerprint.
-    fp = _vault_fingerprint()
-    if _CACHE_VALID and _ENTRY_CACHE and fp == _DIR_FINGERPRINT:
-        return list(_ENTRY_CACHE.values())
+    files = _iter_md_files()
+    fp = _vault_fingerprint(files)
+    if _CACHE_VALID and _ENTRY_CACHE and _ENTRY_SNAPSHOT and fp == _DIR_FINGERPRINT:
+        # 与慢路径一致地返回浅拷贝：否则调用方改 meta 会写进快照，污染后续调用。
+        # 单个 dict 浅拷贝约 1µs 级，201 篇合计 <1ms，相对省下的解析开销可忽略。
+        return [(p, dict(m), b) for p, m, b in _ENTRY_SNAPSHOT]
     _DIR_FINGERPRINT = fp
-    _ENTRY_CACHE.clear()
-    entries: list[tuple[Path, dict[str, Any], str]] = []
-    for f in sorted(_iter_md_files(), reverse=True):
+
+    order: list[str] = []
+    seen: set[str] = set()
+    for f in reversed(files):           # 原实现为 sorted(_iter_md_files(), reverse=True)
+        try:
+            rel = f.relative_to(MEMORY_DIR).as_posix()
+        except ValueError:
+            continue
+        order.append(rel)
+        seen.add(rel)
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        sig = (st.st_size, st.st_mtime_ns)
+        if _ENTRY_CACHE.get(rel) is not None and _ENTRY_STAT.get(rel) == sig:
+            continue                    # ★ 增量：文件未变 ⇒ 复用，零 frontmatter 解析
         try:
             meta, body = _load_memory(f)
         except Exception as e:
-            logger.debug("_iter_entries: skipped %s: %s", f.name, e)
+            logger.debug("_iter_entries: skipped %s: %s", rel, e)
+            _ENTRY_CACHE.pop(rel, None)
+            _ENTRY_STAT.pop(rel, None)
             continue
-        t = _entry_title(meta, f)
-        entries.append((f, meta, body))
-        _ENTRY_CACHE[t] = (f, meta, body)
+        _ENTRY_CACHE[rel] = (f, meta, body)
+        _ENTRY_STAT[rel] = sig
+        _PARSE_COUNT += 1
+
+    # 剪枝：磁盘上已消失的条目（删除 / 改名 / 移入保留目录），防缓存无界增长
+    for gone in [r for r in _ENTRY_CACHE if r not in seen]:
+        _ENTRY_CACHE.pop(gone, None)
+        _ENTRY_STAT.pop(gone, None)
+
+    snapshot: list[tuple[Path, dict[str, Any], str]] = []
+    for rel in order:
+        item = _ENTRY_CACHE.get(rel)
+        if item is None:
+            continue
+        path, meta, body = item
+        snapshot.append((path, dict(meta), body))
+    _ENTRY_SNAPSHOT = snapshot
     _CACHE_VALID = True
-    return entries
+    return list(snapshot)
 
 
 def _write_memory(path: Path, title: str, tags: list[str], source: str | None, content: str,
@@ -1095,9 +1408,10 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
                   mem_type: str | None = None, confidence: str | None = None,
                   verified: bool | None = None, verified_at: str | None = None,
                   scope: str | None = None, project: str | None = None,
-                  status: str | None = None, supersedes: str | None = None,
+                  status: str | None = None,                   supersedes: str | None = None,
                   conflicts: list[str] | None = None,
-                  source_context: str | None = None) -> None:
+                  source_context: str | None = None,
+                  permalink: str | None = None) -> None:
     # Merge cached access_count increments into the written count
     cached = _ACCESS_CACHE.pop(title, 0)
     if cached:
@@ -1106,7 +1420,7 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
     # P0/P1 语义字段同理：更新正文不应把 type/confidence/verified/scope/status
     # 重置为默认值——否则「只改正文」会静默丢掉项目的隔离标记与生命周期状态）。
     if any(v is None for v in (version, mem_type, confidence, verified, scope, status,
-                               project, supersedes, conflicts, source_context)):
+                               project, supersedes, conflicts, source_context, permalink)):
         try:
             em, _ = _load_memory(path)
             if version is None:
@@ -1131,6 +1445,10 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
                 conflicts = em.get("conflicts")
             if source_context is None:
                 source_context = em.get("source_context")
+            # A3：permalink 一旦写过就永不重置 —— 若这里写成 `or path.stem`，
+            # 文件改名时会把冻结值悄悄改掉，稳定标识就失去意义了。
+            if permalink is None:
+                permalink = em.get("permalink")
         except Exception:
             pass
     # verified 为假时不应残留验证时间戳（避免"未验证却有 verified_at"的矛盾态）
@@ -1140,30 +1458,87 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
     # 若直接拼接会产出双 frontmatter（Obsidian 只认第一块，第二块退化为正文垃圾，
     # 并污染检索/去重/链接抽取）。此处统一剥掉，顺带自愈历史受损条目。
     content = _strip_leading_frontmatter(content)
+    # A3：permalink 的生成规则 —— 首次写入时冻结为**当时的文件名 stem**，此后永不覆盖
+    # （上面的继承块已负责「有则沿用」）。取 stem 而非 title 的理由：全库双链按 stem
+    # 解析（见 _wiki_link），stem 本就是链接体系的锚点，用它作 permalink 可保证
+    # 「冻结值」与「实际链接目标」天然一致。
+    if not permalink:
+        permalink = path.stem
     frontmatter = _build_frontmatter(title, tags, source, created=created, summary=summary,
                                      tier=tier, access_count=access_count, links=links, version=version,
                                      mem_type=mem_type, confidence=confidence, verified=verified,
                                      verified_at=verified_at, scope=scope, project=project,
                                      status=status, supersedes=supersedes, conflicts=conflicts,
-                                     source_context=source_context)
+                                     source_context=source_context, permalink=permalink)
     _atomic_write_text(path, f"---\n{frontmatter}\n---\n\n{content}")
 
 
+def _index_path() -> Path:
+    """自动生成索引的落盘路径（B6 起带 `.` 前缀，见 `_INDEX_FILENAME`）。"""
+    return MEMORY_DIR / _INDEX_FILENAME
+
+
+def _drop_legacy_index() -> None:
+    """一次性迁移（B6）：删掉旧名 `记忆索引.md`。
+
+    只删「确认是生成物」的那份 —— frontmatter 的 title 必须是 `记忆索引`，且 tags
+    命中 `moc`/`index`/`navigation`。若用户手工放了一份同名笔记（title 不同、
+    或没有 moc 标签），**保留**：那是数据，不是生成物，删了就不可逆。
+    """
+    legacy = MEMORY_DIR / _INDEX_LEGACY_FILENAME
+    if not legacy.exists():
+        return
+    try:
+        meta, _ = _load_memory(legacy)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("B6 迁移跳过 %s（无法解析 frontmatter：%s）", legacy.name, e)
+        return
+    tags = {str(t).lower() for t in _entry_tags(meta)}
+    if _entry_title(meta, legacy) != "记忆索引" or not (tags & {"moc", "index", "navigation"}):
+        logger.warning("B6 迁移跳过 %s（疑似人工文件，不是生成物）", legacy.name)
+        return
+    try:
+        legacy.unlink()
+        _idx_remove_path(legacy)
+        logger.info("B6 迁移：已删除旧名生成物 %s（生成物现为 %s）",
+                    legacy.name, _INDEX_FILENAME)
+    except OSError as e:
+        logger.warning("B6 迁移失败 %s：%s", legacy.name, e)
+
+
 def _refresh_index() -> None:
-    """Rebuild 记忆索引.md body from current entries (direct write, no recursion).
+    """Rebuild 索引 body from current entries (direct write, no recursion).
 
     Called after every successful memory_write so the index stays in sync
     without manual maintenance (improvement #7).
+
+    B2（2026-10-08）：加内容签名短路。索引正文只由 (bucket, stem, title) 三元组
+    决定，三者全未变时重建只会产出逐字节相同的结果 ⇒ 跳过渲染与写盘。
+
+    B6（2026-10-08）：落盘名改 `.记忆索引.md`（见 `_INDEX_FILENAME`）；写完顺带
+    清掉旧名 —— 迁移机会只有这里，因为只有这里会（重）建生成物。
     """
+    global _INDEX_SIG
     try:
         entries = _iter_entries()
         order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复",
                  "时间线", "模板", "AI相关", "其他"]
         groups: dict[str, list[tuple[Path, str]]] = {b: [] for b in order}
+        sig_parts: list[tuple[str, str, str]] = []
         for path, meta, _body in entries:
             title = _entry_title(meta, path)
             bucket, _reason = _entry_bucket(meta, path)
             groups.setdefault(bucket, []).append((path, title))
+            sig_parts.append((bucket, path.stem, title))
+        # tier / updated / 正文篇幅等变化都不改变索引正文，故一律不纳入签名。
+        # ⚠️ 短路必须同时要求文件存在 —— 索引被外部删除时签名同样「未变」，
+        #    而那时恰恰需要重建。
+        idx_path = _index_path()
+        index_sig = tuple(sorted(sig_parts))
+        if index_sig == _INDEX_SIG and idx_path.exists():
+            _m_inc("index_refresh_skipped")
+            return
+        _INDEX_SIG = index_sig
         lines = ["# 记忆索引（自动维护）", "",
                  "> 本索引由 ai-memory MCP 在每次写入后自动更新。如确需手工调整，请改各笔记自身而非此处。", ""]
         for bucket in order:
@@ -1179,7 +1554,6 @@ def _refresh_index() -> None:
                 lines.append("- " + _wiki_link(path, title))
             lines.append("")
         body = "\n".join(lines).rstrip()
-        idx_path = MEMORY_DIR / "记忆索引.md"
         if idx_path.exists():
             meta, _ = _load_memory(idx_path)
         else:
@@ -1187,6 +1561,7 @@ def _refresh_index() -> None:
                     "tier": "warm", "source": "ai-memory-server"}
         meta["updated"] = datetime.now(timezone.utc).isoformat()
         _atomic_write_text(idx_path, f"---\n{_dump_yaml_frontmatter(meta)}\n---\n\n{body}")
+        _drop_legacy_index()
     except Exception as e:
         logger.warning("_refresh_index failed: %s", e)
 
@@ -1230,6 +1605,17 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     ``.``/``..`` 路径段、盘符与超过 3 层的目录会被**拒绝并给出原因**。
     按标题更新时仍走全库匹配（含子目录），因此**不会**因为标题里出现路径而重复建档；
     阶段二之前 ``/`` 被拍成 ``_`` 的历史条目也会被正确命中。
+
+    目录归属（阶段三，2026-09-20）：**新建**条目若标题未含 ``/``，会按标题与
+    tags 推断规范目录，并在返回值末尾给出建议或落点。策略由环境变量
+    ``AI_MEMORY_DIR_POLICY`` 控制：``warn``（默认，落点不变、只给建议）/
+    ``auto``（自动归类落盘）/ ``strict``（无目录可归时拒绝写入）/ ``off``（关闭）。
+    **已存在标题的更新一律就地更新、绝不搬运**（存量根目录条目不受影响）；
+    核心页始终留在 vault 根，不参与自动归类。
+
+    ``title`` 与落点分离：**frontmatter 里只存叶子名**（``项目/记忆库MCP/条目`` →
+    ``条目``），目录仅由文件路径表达。早前把整串路径写进 title，会让该条目在所有
+    「按 title 比对」的判定中失配（入链失效、MOC 渲染成死链）。
 
     mem_type (optional): 记忆类型，写入 frontmatter 的 type 字段。
         合法取值：fact（明确事实）/ preference（用户偏好）/ decision（决策）/
@@ -1322,26 +1708,48 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     existing_meta: dict[str, Any] = {}
     existing_body: str = ""
 
+    # 阶段三（2026-09-20）：frontmatter 的 title 只存**叶子名**（目录由路径表达）。
+    # 早前把整串 `目录/条目` 写进 title，导致该条目在所有「按 title 比对」的判定里
+    # 全部失配（入链失效、MOC 渲染成死链）。存量 4 篇 + 1 篇属历史数据，需另行修正。
+    leaf_title = title.rsplit("/", 1)[-1].strip() if "/" in title else title
+
     # 写入匹配全库条目（含分类子目录）；.archive 是只读归档（不参与写入匹配）。
     # 若根目录无此标题而归档中有，视为"归档后重建"——在根目录新建条目，
     # 归档保持原样。要修改归档内容请先 memory_restore。
+    #
+    # 阶段三：标题含 '/' 时**先按路径精确命中**。因为 frontmatter 现在只存叶子名，
+    # 「按 title 全库比对」对显式路径标题必然失配 —— 不先按路径找，同一标题每次
+    # 写入都会另建一份。
+    explicit_path = MEMORY_DIR / _safe_filename(title) if "/" in title else None
+    if explicit_path is not None and explicit_path.exists():
+        # ⚠️ 必须核对 frontmatter 的 title：该路径上完全可能是「同名的别人的条目」
+        # （重名场景）。不核对就会把它覆盖掉 —— 那是不可逆的数据丢失。核对不上
+        # 就交给下面的 _resolve_unique_path 追加 _2 后缀，另建一份。
+        try:
+            _em, _eb = _load_memory(explicit_path)
+            if _entry_title(_em, explicit_path) == leaf_title:
+                existing_path = explicit_path
+                existing_meta, existing_body = _em, _eb
+        except Exception:
+            pass
     #
     # 阶段二兼容：放行 '/' 之前，标题里的 '/' 会被拍成 '_' 才落盘，历史条目
     # （如 `轻装时代(QZSD)灯架/三脚架产品谱系` → `…灯架_三脚架产品谱系.md`）的文件名
     # 仍是旧口径。这里额外按旧口径的 stem 再匹配一次，否则该标题会被当成新路径，
     # 进而造出「同一标题两条记录」。
     legacy_stem = Path(_legacy_flat_filename(title)).stem if "/" in title else None
-    for f in _iter_md_files():
-        try:
-            meta, body = _load_memory(f)
-        except Exception:
-            continue
-        if (_entry_title(meta, f) == title or f.stem == title
-                or (legacy_stem is not None and f.stem == legacy_stem)):
-            existing_path = f
-            existing_meta = meta
-            existing_body = body
-            break
+    if existing_path is None:
+        for f in _iter_md_files():
+            try:
+                meta, body = _load_memory(f)
+            except Exception:
+                continue
+            if (_entry_matches(meta, f, title)
+                    or (legacy_stem is not None and f.stem == legacy_stem)):
+                existing_path = f
+                existing_meta = meta
+                existing_body = body
+                break
 
     _invalidate_cache()
     locked = _acquire_lock()
@@ -1370,7 +1778,7 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
             old_tier = tier or existing_meta.get("tier", "warm")
             _write_memory(
                 existing_path,
-                title=title,
+                title=leaf_title,
                 tags=tags,
                 source=effective_source,
                 content=content,
@@ -1395,16 +1803,37 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
             logger.info("UPDATE  title=%s tags=%s source=%s", title, tags, source)
             result_msg = f"已更新记忆: {title} ({_rel_display(existing_path)})"
         else:
-            filepath = _resolve_unique_path(MEMORY_DIR, title)
-            _write_memory(filepath, title=title, tags=tags, source=effective_source, content=content,
+            # ---- 阶段三：新建条目的目录归属 ----
+            # 标题含 '/' = 写入方已显式指定目录（阶段二政策已在入口放行），
+            # 此时不介入；否则按语义桶推断规范目录，再按策略决定落点。
+            policy = _dir_policy()
+            write_title = title          # 仅用于算落盘路径，可带目录前缀
+            dir_notice = ""
+            if "/" not in title and policy != "off":
+                suggest = _suggest_dir(title, tags)
+                if suggest:
+                    if policy == "auto":
+                        write_title = f"{suggest}/{title}"
+                        dir_notice = f"（已自动归类到 {suggest}/）"
+                    elif policy == "warn":
+                        dir_notice = (f"\n\n💡 建议归类：标题写作 '{suggest}/{title}' "
+                                      f"即可落入 {suggest}/ 目录（本次仍落在 vault 根）。")
+                    elif policy == "strict":
+                        return (f"错误：标题未指定分类目录（策略 strict，"
+                                f"{DIR_POLICY_ENV}=strict）。请改写为 "
+                                f"'{suggest}/{title}'。规范目录："
+                                f"{', '.join(sorted(d for d in set(BUCKET_DIRS.values()) if d))}。")
+            filepath = _resolve_unique_path(MEMORY_DIR, write_title)
+            _write_memory(filepath, title=leaf_title, tags=tags, source=effective_source, content=content,
                           summary=summary, tier=tier or "warm", version=new_version,
                           mem_type=mem_type, confidence=confidence, verified=verified,
                           verified_at=_today_utc() if verified else None,
                           scope=scope, project=project, status=status, supersedes=supersedes,
                           conflicts=conflicts, source_context=source_context)
             _maybe_auto_archive(title, filepath)
-            logger.info("CREATE  title=%s tags=%s source=%s (new)", title, tags, source)
-            result_msg = f"已创建记忆: {title} ({_rel_display(filepath)})"
+            logger.info("CREATE  title=%s tags=%s source=%s (new) path=%s",
+                        title, tags, source, _rel_display(filepath))
+            result_msg = f"已创建记忆: {title} ({_rel_display(filepath)}){dir_notice}"
         # 改进#7：写入后自动维护索引（跳过索引自身，直接写文件防递归）
         if title != "记忆索引":
             _refresh_index()
@@ -1433,18 +1862,42 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
 CORE_META_KEYS = ["title", "tags", "summary", "created", "updated", "tier", "access_count", "source",
                   "type", "confidence", "verified", "verified_at",
                   "scope", "project", "status", "supersedes", "conflicts", "source_context"]
-BODY_TRUNCATE_CHARS = 8000  # memory_read 默认正文截断阈值，防超长笔记(如 近期工作动态 21KB)吃 token
+# B5（2026-10-08）：默认预算已外置到 memory.toml 的 `body_truncate_chars`。
+# 本常量保留为**向后兼容别名**（tests/test_context.py 直接读它），运行时真值现取。
+BODY_TRUNCATE_CHARS = memory_config.DEFAULTS["body_truncate_chars"]
 
 @mcp.tool(annotations=_RO)
-def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
+def memory_read(title: str, max_chars: int | None = None,
+                output_format: str | None = None) -> str:
     """Read a memory entry by exact title, with filename fallback for legacy files.
 
-    Body is truncated to max_chars (default 8000) to bound token usage;
-    pass max_chars=0 to get the full body.
+    Body is truncated to max_chars to bound token usage; pass max_chars=0 to get
+    the full body. ``None``/omitted = use ``memory.toml``'s ``body_truncate_chars``
+    (built-in default 8000).
+
+    output_format（C1）：`"text"`（默认）或 `"json"`。JSON 形态
+    `{"found", "title", "path", "meta", "body", "truncated", "total_chars"}` ——
+    `body` 是**已按预算截断**的正文（截断说明只在文本形态里拼），是否被截断由
+    `truncated` / `total_chars` 表达。未命中时返回 `{"found": false, "title": …}`。
+
+    ⚠️ 刻意**不把默认值写成字面量**：Python 的默认参数在 `def` 期求值一次，写死
+    就等于把阈值钉在「进程启动那一刻」，之后改 memory.toml 永不生效（B5 热重载）。
     """
+    try:
+        fmt = _norm_output_format(output_format)
+    except ValueError as e:
+        return f"错误：{e}"
+    if max_chars is None:
+        max_chars = memory_config.get("body_truncate_chars")
     _m_inc("read_calls")
     # 索引快速路径: title/stem 命中 + 文件新鲜 -> 直接读该文件, 免全库 glob+parse
-    idx_hit = _resolve_title_via_index(title)
+    #
+    # 阶段三（2026-09-20）：入参可写成 `目录/条目`，与 memory_write 的写法对称。
+    # frontmatter 的 title 只存叶子名，故按 title 比对命不中路径形式入参；
+    # 含 '/' 时**先按路径直查**（最精确、也最省）。
+    explicit_read = MEMORY_DIR / _safe_filename(title) if "/" in title else None
+    idx_hit = explicit_read if (explicit_read is not None and explicit_read.exists()) \
+        else _resolve_title_via_index(title)
     if idx_hit is not None:
         try:
             meta, body = _load_memory(idx_hit)
@@ -1458,10 +1911,15 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
             for k in CORE_META_KEYS
             if k in meta
         )
-        if max_chars and max_chars > 0 and len(body) > max_chars:
-            body = (body[:max_chars]
-                    + f"\n\n... [正文共 {len(body)} 字符，已截断至前 {max_chars}。需要完整内容请以 max_chars=0 重读]")
-        return f"[{meta_str}]\n\n{body}"
+        shown, truncated, total = _truncate_body(body, max_chars)
+        if fmt == "json":
+            return _json_out({"found": True, "title": _entry_title(meta, idx_hit),
+                              "path": _rel_display(idx_hit),
+                              "meta": {k: meta[k] for k in CORE_META_KEYS if k in meta},
+                              "body": shown, "truncated": truncated, "total_chars": total})
+        if truncated:
+            shown += _body_notice(total, max_chars)
+        return f"[{meta_str}]\n\n{shown}"
 
     # 回退: 全库递归扫描 (索引 miss / 文件被外部改动导致 stale)
     for f in _iter_md_files() + _iter_md_files(MEMORY_DIR / ".archive"):
@@ -1469,7 +1927,7 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             # increment access_count in memory cache (lazy write-back)
             _ACCESS_CACHE[title] = _ACCESS_CACHE.get(title, 0) + 1
             if len(_ACCESS_CACHE) >= _ACCESS_FLUSH_THRESHOLD:
@@ -1481,11 +1939,18 @@ def memory_read(title: str, max_chars: int = BODY_TRUNCATE_CHARS) -> str:
                 for k in CORE_META_KEYS
                 if k in meta
             )
-            if max_chars and max_chars > 0 and len(body) > max_chars:
-                body = (body[:max_chars]
-                        + f"\n\n... [正文共 {len(body)} 字符，已截断至前 {max_chars}。需要完整内容请以 max_chars=0 重读]")
-            return f"[{meta_str}]\n\n{body}"
+            shown, truncated, total = _truncate_body(body, max_chars)
+            if fmt == "json":
+                return _json_out({"found": True, "title": _entry_title(meta, f),
+                                  "path": _rel_display(f),
+                                  "meta": {k: meta[k] for k in CORE_META_KEYS if k in meta},
+                                  "body": shown, "truncated": truncated, "total_chars": total})
+            if truncated:
+                shown += _body_notice(total, max_chars)
+            return f"[{meta_str}]\n\n{shown}"
     _m_inc("read_misses")
+    if fmt == "json":
+        return _json_out({"found": False, "title": title})
     return f"未找到标题为 '{title}' 的记忆"
 
 
@@ -1498,7 +1963,20 @@ def memory_rebuild_links() -> str:
     不修改任何文件、不刷新 mtime。
     """
     all_entries = _iter_entries()
-    known = {_entry_title(meta, f) for f, meta, _ in all_entries}
+    # A3：入库标识集合同时收 title 与 permalink —— 指向「改名前的旧标识」的双链
+    # 因此不再被误报为死链（permalink 的稳定意义正在于此）。
+    # B6（2026-10-08）：**必须**再收 path.stem —— 生成器渲染双链走 `_wiki_link`，
+    # 而它按 Obsidian 口径**用 stem 当 target**（`[[stem|title]]`）。此前判定只认
+    # title，于是「title ≠ stem」的条目在索引里一律被误报死链（36 篇），改名后的
+    # `.记忆索引` 更会当场新增一条。此处的 `known` 因此与 `_entry_matches` 的
+    # 「permalink → title → stem」查找链**保持同一口径**。
+    known: set[str] = set()
+    for f, meta, _b in all_entries:
+        known.add(_entry_title(meta, f))
+        known.add(f.stem)
+        pl = meta.get("permalink")
+        if isinstance(pl, str) and pl:
+            known.add(pl)
     dead_links: list[str] = []
     total_links = 0
     notes_with_links = 0
@@ -1704,15 +2182,15 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     header = f"找到 {total} 条记忆" + (f"，显示前 {limit} 条" if total > limit else "") + ":\n\n"
     return header + "\n\n".join(shown) + _filter_hint(hidden)
 
-def _list_trash(limit: int = 20) -> str:
-    """列出回收站内容（memory_list(include_trash=True) 的实现）。"""
+def _trash_records(limit: int = 20) -> tuple[int, list[dict[str, Any]]]:
+    """回收站记录（C1：文本与 JSON 共用同一批记录，避免两套实现分叉）。"""
     tdir = _trash_dir()
     if not tdir.exists():
-        return "回收站为空"
+        return 0, []
     rows = sorted(_iter_md_files(tdir), key=lambda p: p.stat().st_mtime, reverse=True)
     if not rows:
-        return "回收站为空"
-    lines: list[str] = []
+        return 0, []
+    records: list[dict[str, Any]] = []
     for f in rows[:limit]:
         try:
             meta, _ = _load_memory(f)
@@ -1725,9 +2203,18 @@ def _list_trash(limit: int = 20) -> str:
             size = st.st_size
         except OSError:
             when, size = "?", 0
-        lines.append(f"- {t}（{when} 移入, {size} B）")
-    tail = f"\n\n... 共 {len(rows)} 条，显示前 {limit} 条" if len(rows) > limit else ""
-    return (f"回收站共 {len(rows)} 条 —— 取回: memory_restore(source=\"trash\")；"
+        records.append({"title": t, "moved_at": when, "size_bytes": size})
+    return len(rows), records
+
+
+def _list_trash(limit: int = 20) -> str:
+    """列出回收站内容（memory_list(include_trash=True) 的文本渲染）。"""
+    total, records = _trash_records(limit)
+    if not total:
+        return "回收站为空"
+    lines = [f"- {r['title']}（{r['moved_at']} 移入, {r['size_bytes']} B）" for r in records]
+    tail = f"\n\n... 共 {total} 条，显示前 {limit} 条" if total > limit else ""
+    return (f"回收站共 {total} 条 —— 取回: memory_restore(source=\"trash\")；"
             f"清空: memory_delete(empty_trash=True)\n" + "\n".join(lines) + tail)
 
 
@@ -1736,7 +2223,8 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
                 mem_type: str | None = None,
                 scope: str | None = None, project: str | None = None,
                 status: str | None = None,
-                include_trash: bool = False) -> str:
+                include_trash: bool = False,
+                output_format: str | None = None) -> str:
     """List memory entries with a small preview.
 
     mem_type (optional): 仅列出该 type 的条目（fact/preference/decision/...）。
@@ -1745,12 +2233,23 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     在日常列表中）；传 "any" 查看全部，传具体值精确过滤。被隐藏的条目数会在末尾提示。
     include_trash (optional): 改为列出**回收站**（.trash/）内容，此时其余过滤参数
     不生效。配合 memory_restore(source="trash") 取回、memory_delete(empty_trash=True) 清空。
+    output_format（C1）: `"text"`（默认）或 `"json"`。回收站形态下 JSON 为
+    `{"trash": true, "count", "limit", "shown", "entries": [{"title","moved_at","size_bytes"}]}`。
     """
+    try:
+        fmt = _norm_output_format(output_format)
+    except ValueError as e:
+        return f"错误：{e}"
     if include_trash:
+        if fmt == "json":
+            total, trash_records = _trash_records(limit)
+            return _json_out({"trash": True, "count": total, "limit": limit,
+                              "shown": len(trash_records), "entries": trash_records})
         return _list_trash(limit)
 
     _t0 = time.perf_counter()
     entries: list[str] = []
+    records: list[dict[str, Any]] = []
     hidden = 0
 
     for f in sorted(_iter_md_files(), reverse=True):
@@ -1788,13 +2287,25 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
         preview += "..." if len(preview) >= (40 if not summary else 80) else ""
 
         entries.append(f"- [{created}] {title} [{tier_val}|{reads}]{source_info}{cred_info} | {tags_display}\n  {preview}")
+        records.append({"title": title, "created": created or None, "tier": tier_val,
+                        "reads": reads if isinstance(reads, int) else 0,
+                        "source": source or None, "tags": entry_tags,
+                        "preview": preview,
+                        "path": _rel_display(f), "facets": _meta_facets(meta)})
 
     if not entries:
         _m_search("list", 0, _t0)
+        if fmt == "json":
+            return _json_out({"trash": False, "count": 0, "limit": limit,
+                              "shown": 0, "hidden": hidden, "entries": []})
         return "记忆库为空" + _filter_hint(hidden)
 
     total = len(entries)
     _m_search("list", total, _t0)
+    if fmt == "json":
+        return _json_out({"trash": False, "count": total, "limit": limit,
+                          "shown": min(limit, total), "hidden": hidden,
+                          "entries": records[:limit]})
     entries = entries[:limit]
     result = "\n".join(entries)
     if total > limit:
@@ -1847,7 +2358,7 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False,
             meta, _ = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             if trash and not purge:
                 trash_dir = _trash_dir()
                 trash_dir.mkdir(parents=True, exist_ok=True)
@@ -1916,7 +2427,7 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             if tier is not None:
                 meta["tier"] = tier
             if tags is not None:
@@ -2215,6 +2726,192 @@ def memory_doctor(limit: int = 20) -> str:
 
 
 @mcp.tool(annotations=_RO)
+def memory_schema_diff(limit: int = 15) -> str:
+    """Diff the frontmatter *structure* across the vault — infer, never repair.
+
+    对标 basic-memory 的 `schema_infer` / `schema_validate` / `schema_diff` 三件套，
+    本库只做其中的 **diff**：把「写入端承诺写出什么」与「磁盘上实际有什么」对账。
+
+    契约来源是代码本身（`yaml_io.build_frontmatter` 是唯一写出源），键分三层：core
+    任何版本都该有 / v2 仅 `schema_version>=2` 承诺 / opt 按需写出。据此输出：
+
+    1. **核心键缺失** —— **有 frontmatter** 却缺任何版本都该有的键。属真实缺陷。
+    2. **v2 条目缺 v2 键** —— 声明了 v2 却没写全，属**不一致**（写入端有 bug）。
+    3. **v1 存量迁移清单** —— v1 条目缺 v2 键是**预期**，此处把它变成「按 diff 批量
+       回填」的输入，而不是一条条盲改。
+    4. **未知键** —— 既非本库写入端产出、也非归档标记的键（如第三方工具写的
+       `aliases`）。可能是历史残留，也可能是外部工具在改你的 frontmatter。
+    5. **可选键使用率** —— 仅作了解，缺失不是缺陷。
+    6. **无 frontmatter 的文件** —— 混在 Vault 里的普通 Markdown（`README.md` /
+       身份档案 / 日志导出）。它们不受结构契约约束，故单列且**不计入缺陷数** ——
+       否则真实缺陷会淹没在这类噪声里（实测 11 条「核心键缺失」里 2 条属此类）。
+
+    扫描范围与 `memory_doctor` 一致（根 + 分类子目录 + `.archive`），故归档 stub 也
+    在账内。样例条目附**键在 frontmatter 中的行号**，便于直接跳到现场；`limit`
+    控制每类显示的样例条数（计数始终是全量）。
+
+    本工具**只读**：不写盘、不改索引、不修复任何条目。
+    """
+    scan: dict[str, Path] = {}
+    for f in _iter_md_files(MEMORY_DIR):
+        try:
+            scan[f.relative_to(MEMORY_DIR).as_posix()] = f
+        except ValueError:
+            continue
+    archive = MEMORY_DIR / ".archive"
+    if archive.exists():
+        for f in _iter_md_files(archive):
+            try:
+                scan[f.relative_to(MEMORY_DIR).as_posix()] = f
+            except ValueError:
+                continue
+
+    versions: Counter = Counter()
+    zones = Counter()
+    core_missing: list[tuple[str, list[str]]] = []
+    v2_missing: list[tuple[str, list[str]]] = []
+    v1_entries: list[str] = []
+    v1_gap_keys: Counter = Counter()
+    unknown: list[tuple[str, list[str]]] = []
+    unknown_keys: Counter = Counter()
+    opt_used: Counter = Counter()
+    no_frontmatter: list[str] = []
+    unreadable: list[str] = []
+
+    for rel in sorted(scan):
+        path = scan[rel]
+        zones["归档" if rel.startswith(".archive/") else
+              ("分类" if "/" in rel else "根")] += 1
+        try:
+            raw = _read_text(path)
+        except Exception as e:                      # 编码异常 / 读取失败
+            unreadable.append(f"- {rel}：{e}")
+            continue
+        # 「没有 frontmatter」与「有 frontmatter 但缺键」是两回事：前者是混在 Vault
+        # 里的普通 Markdown（README / 身份档案 / 日志导出），本就不受结构契约约束
+        # —— 把它们算成「核心键缺失」会让真实缺陷淹没在噪声里（实测 11 条里 2 条
+        # 属此类）。故单列一类，且**不计入缺陷数**。
+        if not raw.startswith("---"):
+            no_frontmatter.append(rel)
+            continue
+        try:
+            meta, _ = _parse_frontmatter(raw)
+        except Exception as e:
+            unreadable.append(f"- {rel}：{e}")
+            continue
+        if not isinstance(meta, dict):
+            unreadable.append(f"- {rel}：frontmatter 解析结果不是映射")
+            continue
+
+        keys = set(meta)
+        ver = _schema_version(meta)
+        versions[ver] += 1
+
+        miss_core = [k for k in _SCHEMA_CORE_KEYS if k not in keys]
+        if miss_core:
+            core_missing.append((rel, miss_core))
+
+        if ver >= SCHEMA_VERSION:
+            miss_v2 = [k for k in _SCHEMA_V2_KEYS if k not in keys]
+            if miss_v2:
+                v2_missing.append((rel, miss_v2))
+        else:
+            v1_entries.append(rel)
+            for k in _SCHEMA_V2_KEYS:
+                if k not in keys:
+                    v1_gap_keys[k] += 1
+
+        extra = sorted(keys - _SCHEMA_ALL_KNOWN)
+        if extra:
+            unknown.append((rel, extra))
+            unknown_keys.update(extra)
+
+        for k in _SCHEMA_OPTIONAL_KEYS:
+            if k in keys:
+                opt_used[k] += 1
+
+    def _with_lines(items: list[tuple[str, list[str]]]) -> list[str]:
+        """把 `(rel, [键])` 渲染成带行号的样例行（只对本类样例读盘取行号）。"""
+        rows = []
+        for rel, ks in items:
+            marks = _frontmatter_key_lines(scan[rel])
+            label = "、".join(f"{k}（第 {marks[k]} 行）" if k in marks else k for k in ks)
+            rows.append(f"- {rel}：{label}")
+        return rows
+
+    def _add_section(head: str, rows: list[str], total: int) -> None:
+        out.append(f"## {head} — {total} 条")
+        out.extend(rows[:limit] if rows else ["- 无"])
+        if total > limit:
+            out.append(f"- ... 共 {total} 条，显示前 {limit} 条")
+        out.append("")
+
+    total = sum(zones.values())
+    n_fm = total - len(no_frontmatter)
+    out = ["# frontmatter 结构差异（schema_diff）", "",
+           f"- 扫描文件: {len(scan)}（根 {zones['根']} · 分类 {zones['分类']} · 归档 {zones['归档']}）",
+           f"- 其中带 frontmatter 的条目: {n_fm}；无 frontmatter: {len(no_frontmatter)}"
+           "（普通 Markdown，不参与结构判定）",
+           "- 结构版本: " + " · ".join(
+               f"v{v} = {versions[v]}" for v in sorted(versions, reverse=True)),
+           f"- 判定基准: 当前写入端结构版本 v{SCHEMA_VERSION}",
+           ""]
+
+    _add_section("1. 核心键缺失（有 frontmatter 却缺任何版本都该有的键 —— 真实缺陷）",
+                 [f"- {rel}：缺 " + "、".join(ks) for rel, ks in core_missing],
+                 len(core_missing))
+    _add_section(f"2. v2 条目缺 v2 必需键（声明了 v{SCHEMA_VERSION} 却没写全）",
+                 _with_lines(v2_missing), len(v2_missing))
+
+    out.append(f"## 3. v1 存量迁移清单 — {len(v1_entries)} 条")
+    if v1_entries:
+        out.append("以下条目缺 v2 键属**预期**（写入端会渐进补齐），此处汇总成回填输入：")
+        for k in _SCHEMA_V2_KEYS:
+            if v1_gap_keys[k]:
+                out.append(f"- 缺 `{k}`：{v1_gap_keys[k]} 条")
+        out.extend(f"- 样例：{rel}" for rel in v1_entries[:limit])
+        if len(v1_entries) > limit:
+            out.append(f"- ... 共 {len(v1_entries)} 条，显示前 {limit} 条")
+    else:
+        out.append("- 无")
+    out.append("")
+
+    _add_section("4. 未知键（非写入端产出、非归档标记）",
+                 _with_lines(unknown), len(unknown))
+    if unknown_keys:
+        out.append("键频次：" + " · ".join(
+            f"`{k}` {n}" for k, n in unknown_keys.most_common()))
+        out.append("")
+
+    out.append("## 5. 可选键使用率（按需写出，缺失不是缺陷）")
+    for k in _SCHEMA_OPTIONAL_KEYS:
+        out.append(f"- `{k}`: {opt_used[k]} / {n_fm}")
+    out.append("")
+
+    if no_frontmatter:
+        _add_section("6. 无 frontmatter 的文件（非记忆条目，不在缺陷数内）",
+                     [f"- {rel}" for rel in no_frontmatter], len(no_frontmatter))
+
+    if unreadable:
+        _add_section("7. 读取失败（未纳入统计）", unreadable, len(unreadable))
+
+    defects = len(core_missing) + len(v2_missing) + len(unreadable)
+    out.append("## 结论")
+    if defects:
+        out.append(f"- **发现 {defects} 条结构缺陷**"
+                   f"（核心键缺失 {len(core_missing)} · v2 缺失 {len(v2_missing)}"
+                   f" · 读取失败 {len(unreadable)}），建议逐条核对。")
+    else:
+        out.append("- 未发现结构缺陷：所有条目的核心键齐全，声明 v2 的条目亦写全 v2 键。")
+    if v1_entries:
+        out.append(f"- v1 存量 {len(v1_entries)} 条待渐进迁移 —— 可据第 3 节按缺失键"
+                   "批量回填，或等其被再次写入时自动补齐。")
+    out.append("> 本工具只诊断不修复；磁盘文件是唯一事实源，改结构走 `memory_write` / "
+               "`memory_update_metadata`。")
+    return "\n".join(out)
+
+
+@mcp.tool(annotations=_RO)
 def memory_index_draft() -> str:
     """Generate a draft of the main index without writing it back automatically."""
     entries = _iter_entries()
@@ -2241,7 +2938,7 @@ def memory_index_draft() -> str:
         groups.setdefault(bucket, []).append((path, title))
 
     order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复", "时间线", "模板", "AI相关", "其他"]
-    lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `记忆索引.md`。", ""]
+    lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `.记忆索引.md`。", ""]
 
     for bucket in order:
         items = groups.get(bucket, [])
@@ -2270,7 +2967,7 @@ def memory_archive(title: str) -> str:
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             target_path = f
             target_meta = meta
             target_body = body
@@ -2342,7 +3039,7 @@ def _restore_from_trash(title: str) -> str:
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             target_path, target_meta, target_body = f, meta, body
             break
     if not target_path:
@@ -2408,7 +3105,7 @@ def memory_restore(title: str, source: str = "archive") -> str:
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             target_path = f
             target_meta = meta
             target_body = body
@@ -2451,26 +3148,32 @@ def memory_restore(title: str, source: str = "archive") -> str:
 # 「预览」与「执行」必须共用同一判据：若两处各写一套阈值，dry-run 说的和
 # 实际改的就会漂移，而这种漂移是静默的（预览说改 3 条、实改 5 条）——比
 # 没有预览更危险。故判据抽成单一函数 _heat_tier_decision，两处都调它。
-_HEAT_COLD_MAX = 0.1         # 低于此分且非 cold → 降为 cold
-_HEAT_DEMOTE_HOT_MAX = 0.5   # 低于此分且是 hot  → 降为 warm
-_HEAT_HOT_MIN = 3.0          # 高于此分且非 hot  → 升为 hot
+# B5（2026-10-08）：三个阈值已外置到 memory.toml（heat_cold_max /
+# heat_demote_hot_max / heat_hot_min）。下列常量仅作向后兼容别名。
+_HEAT_COLD_MAX = memory_config.DEFAULTS["heat_cold_max"]              # 低于此分且非 cold → 降为 cold
+_HEAT_DEMOTE_HOT_MAX = memory_config.DEFAULTS["heat_demote_hot_max"]  # 低于此分且是 hot  → 降为 warm
+_HEAT_HOT_MIN = memory_config.DEFAULTS["heat_hot_min"]                # 高于此分且非 hot  → 升为 hot
 
 
 def _heat_tier_decision(title: str, current_tier: str, score: float) -> str | None:
     """按热度分数给出该条应有的 tier；返回 None 表示维持现状。
 
-    核心页（CORE_PAGES）一律豁免：它们由人工或生成器维护（如 `记忆索引.md`
+    核心页（CORE_PAGES）一律豁免：它们由人工或生成器维护（如 `.记忆索引.md`
     每次写入都会重建），自动改 tier 没有意义。这与 `_maybe_auto_archive`
     的核心页保护同源，也避免出现「预览清单里有核心页、执行时却被跳过」的
     不一致 —— 豁免发生在判据内部，两处行为天然一致。
     """
     if title in CORE_PAGES:
         return None
-    if score < _HEAT_COLD_MAX and current_tier != "cold":
+    # 阈值现取（B5）：预览与执行都走这一个函数，故两处天然用同一套阈值。
+    cold_max = memory_config.get("heat_cold_max")
+    demote_hot_max = memory_config.get("heat_demote_hot_max")
+    hot_min = memory_config.get("heat_hot_min")
+    if score < cold_max and current_tier != "cold":
         return "cold"
-    if score < _HEAT_DEMOTE_HOT_MAX and current_tier == "hot":
+    if score < demote_hot_max and current_tier == "hot":
         return "warm"
-    if score > _HEAT_HOT_MIN and current_tier != "hot":
+    if score > hot_min and current_tier != "hot":
         return "hot"
     return None
 
@@ -2595,7 +3298,7 @@ def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
     target_meta: dict[str, Any] = {}
     target_body = ""
     for f, meta, body in all_entries:
-        if _entry_title(meta, f) == title or f.stem == title:
+        if _entry_matches(meta, f, title):
             target_meta = meta
             target_path = f
             target_body = body
@@ -2711,7 +3414,8 @@ def memory_context(title: str, depth: int = 2, max_related: int = 10,
             "today" / "yesterday" / "last week" / "2 days ago" / "3d" / "24h" /
             "2w" / "2026-09-01"；不传或 "all" = 不限。无法识别时按不限处理并在
             输出里提示。
-        max_chars: 整段输出字符上限；0 = 不限。省略时用 BODY_TRUNCATE_CHARS。
+        max_chars: 整段输出字符上限；0 = 不限。省略时用 ``memory.toml`` 的
+            ``body_truncate_chars``（内置默认 8000）。
             预算在起点与周边间分摊（起点至多一半，其余按篇数均分），
             故周边不会因起点过长而被挤到一篇不剩；想要全文传 0。
 
@@ -2807,7 +3511,7 @@ def memory_context(title: str, depth: int = 2, max_related: int = 10,
     total_related = len(selected)
     shown = selected[:max(int(max_related), 0)]
 
-    budget = BODY_TRUNCATE_CHARS if max_chars is None else int(max_chars)
+    budget = memory_config.get("body_truncate_chars") if max_chars is None else int(max_chars)
     unlimited = budget == 0
 
     def _meta_line(meta: dict[str, Any], extra: str) -> str:
@@ -2887,31 +3591,55 @@ def memory_context(title: str, depth: int = 2, max_related: int = 10,
 
 
 @mcp.tool(annotations=_RO)
-def memory_orphans() -> str:
-    """Find entries with zero backlinks (isolated notes)."""
+def memory_orphans(output_format: str | None = None) -> str:
+    """Find entries with zero backlinks (isolated notes).
+
+    output_format（C1）：`"text"`（默认）或 `"json"`
+    （`{"count", "orphans": [{"title", "path"}]}`）。
+    """
+    try:
+        fmt = _norm_output_format(output_format)
+    except ValueError as e:
+        return f"错误：{e}"
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
 
     backlink_index: dict[str, list[str]] = {}
     title_map: dict[str, tuple[Path, dict[str, Any], str]] = {}
+
+    # ⚠️ 链接 target 必须**先解析回条目**再计入反链。正文里的 `[[X]]` 有三种合法写法：
+    # title、文件名 stem（`_wiki_link` 生成器渲染的就是 stem）、以及 A3 的 permalink
+    # （改名前的旧标识）。直接拿 target 当 key 会造成两类误报：
+    #   ① 生成索引 `.记忆索引` 里的 `[[stem|title]]` 对「title≠stem」的条目**压根连不上**，
+    #      于是那些条目全被算成孤立（与 B6 修掉的死链误报同型）；
+    #   ② {title} / {stem} 之类的模板占位文本会被当成真实链接目标，凭空造出反链。
+    id2title: dict[str, str] = {}
+    for f, meta, _b in all_entries:
+        t = _entry_title(meta, f)
+        id2title.setdefault(t, t)
+        id2title.setdefault(f.stem, t)
+        _pl = meta.get("permalink")
+        if isinstance(_pl, str) and _pl:
+            id2title.setdefault(_pl, t)
 
     for f, meta, body in all_entries:
         t = _entry_title(meta, f)
         title_map[t] = (f, meta, body)
         if t not in backlink_index:
             backlink_index[t] = []
+        if t in _CONTEXT_SKIP_TITLES:
+            # 生成页（`.记忆索引`）的链接只是**全库罗列**，不是真实引用。把它算作
+            # 引用方的话，所有条目都"被引用过" ⇒ 孤立数恒为 0，工具直接失去意义。
+            # 这与 memory_context（周边遍历排除生成页）、memory_stats 的豁免同源。
+            continue
+        candidates: list[str] = []
         links = meta.get("links", [])
         if isinstance(links, list):
-            for link in links:
-                if link != t:
-                    backlink_index.setdefault(link, [])
-                    if t not in backlink_index[link]:
-                        backlink_index[link].append(t)
-        body_links = _extract_wiki_links(body)
-        for link in body_links:
-            if link != t:
-                backlink_index.setdefault(link, [])
-                if t not in backlink_index[link]:
-                    backlink_index[link].append(t)
+            candidates.extend(str(x) for x in links)
+        candidates.extend(_extract_wiki_links(body))
+        for link in candidates:
+            target = id2title.get(link) or id2title.get(_clean_link_name(link))
+            if target and target != t and t not in backlink_index.setdefault(target, []):
+                backlink_index[target].append(t)
 
     core_pages = {"记忆索引", "近期工作动态", "用户画像", "AI身份档案",
                   "Codex 身份档案", "记忆库总规范", "共享记忆库规则"}
@@ -2921,6 +3649,11 @@ def memory_orphans() -> str:
             continue
         if not backlink_index.get(t):
             orphans.append(t)
+
+    if fmt == "json":
+        return _json_out({"count": len(orphans),
+                          "orphans": [{"title": t,
+                                       "path": _rel_display(title_map[t][0])} for t in orphans]})
 
     lines = ["# 孤立笔记 ({} 条)".format(len(orphans)), "",
              "以下笔记没有其他笔记引用它们：", ""]
@@ -3135,8 +3868,17 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
     return "\n".join(lines) + _filter_hint(hidden)
 
 @mcp.tool(annotations=_RO)
-def memory_recent(days: int = 7, limit: int = 20) -> str:
-    """List entries updated within the last N days, most recent first."""
+def memory_recent(days: int = 7, limit: int = 20,
+                  output_format: str | None = None) -> str:
+    """List entries updated within the last N days, most recent first.
+
+    output_format（C1）：`"text"`（默认）或 `"json"`（`{"days", "count", "limit",
+    "shown", "entries": [{"updated", "title", "summary"}]}`）。
+    """
+    try:
+        fmt = _norm_output_format(output_format)
+    except ValueError as e:
+        return f"错误：{e}"
     now = datetime.now(timezone.utc)
     recent: list[tuple[str, str, str]] = []
     for f in _iter_md_files():
@@ -3153,8 +3895,16 @@ def memory_recent(days: int = 7, limit: int = 20) -> str:
             summary = str(meta.get("summary", ""))
             recent.append((updated_str, title, summary[:80]))
     if not recent:
+        if fmt == "json":
+            return _json_out({"days": days, "count": 0, "limit": limit,
+                              "shown": 0, "entries": []})
         return f"近 {days} 天无更新"
     recent.sort(reverse=True)
+    if fmt == "json":
+        return _json_out({"days": days, "count": len(recent), "limit": limit,
+                          "shown": min(limit, len(recent)),
+                          "entries": [{"updated": u, "title": t, "summary": s}
+                                      for u, t, s in recent[:limit]]})
     lines = [f"# 近 {days} 天更新（{len(recent)} 条）", ""]
     for updated_str, title, summary in recent[:limit]:
         lines.append(f"- {updated_str[:10]} [[{title}]]")
@@ -3305,6 +4055,21 @@ def memory_stats() -> str:
     lines.append(f"## 热门标签 TOP 10")
     for tag, count in top_tags:
         lines.append(f"- {tag}: {count} 条")
+    lines.append("")
+    lines.append("## 运行时阈值配置（B5）")
+    _cfg_path = memory_config.config_path()
+    if _cfg_path is None:
+        lines.append("- 未注入 vault 位置 ⇒ 全部使用内置默认值")
+    elif _cfg_path.exists():
+        lines.append(f"- 配置来源: {_cfg_path.name}（vault 根，改动约 {memory_config.CACHE_TTL:g} 秒内生效）")
+    else:
+        lines.append(f"- 配置来源: 无 {memory_config.CONFIG_NAME} ⇒ 全部使用内置默认值"
+                     f"（可在 vault 根新建该文件覆写）")
+    for _k, _v in memory_config.all_values().items():
+        _mark = "  ← 已覆写" if _v != memory_config.DEFAULTS[_k] else ""
+        lines.append(f"  - {_k} = {_v}{_mark}")
+    _cfg_err = memory_config.last_error()
+    lines.append(f"- 配置错误: {_cfg_err}" if _cfg_err else "- 配置错误: 无")
     lines.append("")
     lines.extend(_metrics_report_lines())
     if zero_reads:

@@ -3,6 +3,9 @@
 
 从 server.py 拆分而来（P3 模块化，2026-09-10）。本模块是**无状态工具层**：
 锁文件路径由调用方传入，不依赖 MEMORY_DIR 等全局配置。
+唯一的例外是陈旧回收秒数 —— B5（2026-10-08）起取自 `memory_config`
+（vault 根 `memory.toml` 的 `lock_timeout`）；`memory_config` 本身是最底层、
+不反向依赖任何模块，故不破坏分层。
 
 设计要点：
     - 跨进程：多个 AI 工具（WorkBuddy / Claude / Codex）可能同时写同一个
@@ -21,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 
+import memory_config
+
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT",
     "acquire_lock",
@@ -29,19 +34,29 @@ __all__ = [
     "current_depth",
 ]
 
-# 锁文件最长持有时间（秒）：超过视为陈旧锁并回收
-DEFAULT_LOCK_TIMEOUT = 15
+# 锁文件最长持有时间（秒）：超过视为陈旧锁并回收。
+# B5（2026-10-08）：真值已外置到 memory.toml 的 `lock_timeout`。本常量保留为
+# **向后兼容别名 / 文档性默认值**，但**不再用作 acquire_lock 的默认参数** ——
+# 默认参数在 `def` 期求值一次，那样改配置文件将永远不生效（B5 热重载的硬要求）。
+DEFAULT_LOCK_TIMEOUT = memory_config.DEFAULTS["lock_timeout"]
 
 # 每线程的重入深度（0 / 未设置为未持有）
 _lock_state = threading.local()
 
 
-def acquire_lock(lock_path: Path, stale_timeout: float = DEFAULT_LOCK_TIMEOUT) -> bool:
+def acquire_lock(lock_path: Path, stale_timeout: float | None = None) -> bool:
     """获取跨进程文件锁，返回是否成功。
 
     同线程可重入：已持有时仅递增深度计数并直接返回 True。
     等待超过 stale_timeout 秒仍未获取则返回 False（由调用方决定如何处理）。
+
+    Args:
+        stale_timeout: 陈旧锁回收秒数。``None``（默认）= 取 ``memory.toml`` 的
+            ``lock_timeout``（内置默认 15）。**每次调用只解析一次**（在循环外），
+            免得在抢锁自旋里反复 stat 配置文件。
     """
+    if stale_timeout is None:
+        stale_timeout = memory_config.get("lock_timeout")
     if getattr(_lock_state, "depth", 0) > 0:
         _lock_state.depth += 1
         return True

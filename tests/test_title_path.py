@@ -120,7 +120,7 @@ def main() -> int:
           str([p.name for p in server._iter_md_files()]))
     found = server.memory_search("正文内容 B1")
     check("B6 memory_search 能检索到子目录条目", "第一条" in found, found[:200])
-    idx = (_ROOT / "记忆索引.md").read_text(encoding="utf-8")
+    idx = (_ROOT / ".记忆索引.md").read_text(encoding="utf-8")   # B6：生成物带 `.` 前缀
     check("B7 索引收录了该条目", "第一条" in idx, idx[:200])
 
     # =================================================================

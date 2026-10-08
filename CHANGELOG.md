@@ -5,6 +5,73 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.0] - 2026-10-08
+
+本版三条主线：**目录化**（记忆库不再只能是扁平一层 —— 可建子目录、写入端还会按语义自动归位）、**稳定标识与索引增量化**（改名不再静默失联，索引不再每次全量重解析）、**可脚本化与可配置**（四个只读工具可出 JSON，8 个运行时阈值外置到 `memory.toml` 并热重载）。
+
+### Added
+
+- **多级目录分类（递归枚举层）**：此前 21 处扫描都是非递归 `glob("*.md")`，把文件放进子目录就等同「脱离检索」—— 这也是 2.2.0 明确否决目录分层的原因。本版先把**枚举层**统一收口：
+  - `_iter_md_files()` —— 唯一的 `.md` 枚举入口（`os.walk` + 保留目录剪枝 + 按「深度 → relpath」确定性排序）。21 处 `glob` 全部替换，只此一处可改枚举行为
+  - `RESERVED_DIRS`（8 项：`.archive` / `.trash` / `.git` / `.obsidian` / `ai-memory` / `__pycache__` / `.ruff_cache` / `.pytest_cache`）—— 新增 `.md` 目录必须同步登记，否则会被当记忆收录
+  - `_vault_fingerprint()` 的指纹键由文件名改为 **relpath**。⚠️ 任何枚举范围变化都必须同批改它，否则子目录内变更不触发缓存失效 ⇒ **静默返回陈旧数据且无报错**
+  - 专项测试 `tests/test_folders.py`（43 断言）
+- **`memory_write` 支持写入分类子目录**（阶段二）：`safe_filename()` 把 `/` 当**子目录分隔符**并逐段消毒（非法字符 → `_`、丢弃控制字符与空段、`strip("._")`、每段 80 字上限）；**不含 `/` 的标题行为与旧实现逐字节一致**。
+  三条边界：① 旧口径保留为**独立的** `legacy_flat_filename()` —— 旧实现把 `/` 与其它非法字符放在**同一个正则字符类**里（连续非法串折叠成一个 `_`），拆成两步替换会破坏折叠语义（`a/ b` → `a__b` ≠ 旧值 `a_b`），历史标题的幂等匹配会失手；② `_title_path_error()` 是**政策层**而非消毒层：保留目录、`.` / `..` 段、盘符、绝对路径、层级 > 3 一律**显式拒绝并说明原因**（`strip("._")` 会把 `.archive/x` 静默改写成 `archive/x` —— 写进了不该写的地方却毫无报错）；③ `memory_write` 在 `"/" in title` 时**追加一次「旧口径 stem」匹配**，否则历史标题含 `/` 的笔记会被当成新路径、**凭空造重复件**。
+  - 专项测试 `tests/test_title_path.py`（42 断言）
+- **写入端自动归类 + 叶子名口径**（阶段三）：`memory_write` **新建**且标题不含 `/` 时，按 `_entry_bucket()` 的 11 个语义桶映射到规范目录。四档 `AI_MEMORY_DIR_POLICY`：**`warn`（默认：只提示不改落点）** / `auto` / `strict` / `off`。
+  - ⚠️ **默认值为什么是保守的 `warn`**：auto 作默认时 **18 套里 11 套失败（50 断言）**，全是「`<根>/<标题>.md` 读不到」—— 既有辅助函数编码的正是「新条目落在根」这一心智模型，多客户端与既有习惯同样依赖它；且 `_auto_suggest_tags()` 与 `_entry_bucket` 两个启发式叠加会让落点对写入方**不可预测**
+  - 三条边界：只作用于**新建**（更新绝不搬运，否则存量根核心页会被搅动）；落盘目录**不写进 frontmatter 的 `title`**（title 恒为裸叶子名，防「title 写路径 ⇒ 一切按 title 比对的判定失配」复发）；标题已含 `/` 时完全尊重写入方
+  - 首版残留缺陷（同日修复）：只在 `auto` 分支改落点，显式 `title="目录/条目"` 分支仍把整串路径写进 frontmatter ⇒ 该条目在所有按 title 比对的判定里全部失配。现口径为「`leaf_title = title.rsplit("/", 1)[-1]` 写盘」，且按路径精确命中后**必须再核对 `title == leaf_title`**（防覆盖「同茎异主」= 不可逆丢失）；存量带前缀 title **被再次写入时自动回正**，无需迁移脚本
+  - 专项测试 `tests/test_dir_policy.py`（71 断言）
+- **`permalink` 稳定标识**（A3）：解决「改名即静默失联」。`permalink` 在**首次写入时冻结为当时的文件名 stem，此后永不覆盖**；查找链为 **`permalink → title → stem`**。
+  要点：① `_entry_matches(meta, path, key)` 是**唯一入口**（9 处手写 `== k or stem == k` 全部替换）；② `_resolve_title_via_index` 的 SQL 与 `memory_index.find` 必须**同口径**加 `permalink=?`，否则同入参下命中/回退行为不同；③ `memory_rebuild_links` 的 `known` 集合收 `permalink` ⇒ 指向旧标识的双链不再误报死链；④ `_write_memory` 的继承块判 `is None` 而非 `or`（写成 `or path.stem` 会在改名时悄悄改掉冻结值）；⑤ `memory_index` 加列**只能靠 `_migrate()` 的 `ALTER TABLE`**，**`CREATE INDEX` 绝不能放进 SCHEMA** —— 老库无此列时会抛错并中止整个 `executescript`，`_migrate` 连执行机会都没有
+  - 专项测试 `tests/test_permalink.py`（25 断言）
+- **`memory_schema_diff` 结构对账（第 24 个工具）**（B4）：只读工具，把「写入端承诺写出什么」与「磁盘上实际有什么」对账。**契约来源就是代码**（`yaml_io.build_frontmatter` 是唯一写出源），**不另立 schema 文件**（两份真相必然分叉）。
+  键分三层：**core**（`title`/`tags`/`created`/`updated`/`tier`/`access_count`，缺 = 真实缺陷）/ **v2**（`type`/`confidence`/`verified`/`scope`/`status`/`schema_version`，v1 缺属预期、声明 v2 却缺 = 写入端 bug）/ **opt**（按需写出）。⚠️ 必须把 `archived_to` 收为已知键 —— 漏掉它会把 15 条归档 stub 全报成「未知键」。
+  输出六节：核心键缺失 / v2 缺键 / v1 存量迁移清单 / 未知键（附行号）/ 可选键使用率 / **无 frontmatter 文件**。⚠️ 关键设计是**区分「无 frontmatter」与「核心键缺失」**：`README.md` / `IDENTITY.md` 这类完全没有 frontmatter 的普通 Markdown 混在 Vault 里，本就不受结构契约约束，首版把它们算成缺陷 ⇒ 11 条里 2 条是噪声；现在单列一类且**不计入缺陷数**。
+  - 专项测试 `tests/test_schema_diff.py`（32 断言）
+- **`memory.toml` 运行时阈值外置 + 热重载**（B5）：新增 `memory_config.py`，把原先散落在 `server.py` / `locks.py` / `text_utils.py` 的 **8 个阈值**收口到 vault 根的可选 `memory.toml`：`dup_title_jaccard`、`dup_body_jaccard`、`body_truncate_chars`、`lock_timeout`、`heat_cold_max`、`heat_demote_hot_max`、`heat_hot_min`、`heat_decay_lambda`。优先级 **环境变量 `AI_MEMORY_CFG_<KEY>` > `[thresholds]` 区 > 顶层同名键 > 内置默认**；**默认值与改动前的硬编码值逐项相同** ⇒ 不建文件行为零变化。
+  - **为什么不用 `tomllib`**：它是 3.11+ 才进标准库，而本仓 CI 矩阵仍覆盖 **Python 3.10** ⇒ 直接用会当场打穿那一格；把最低版本抬到 3.11 属破坏性变更、远超本项范围。改为**自写最小 TOML 子集解析器**（与既有手写 YAML 解析同一条路线）
+  - 子集**窄且明确拒绝**：数组、内联表、多行字符串、日期、裸词、缺值、非法键名、未闭合小节、重复键一律 `ValueError`，并给出**行号与原文** —— 配置写错时静默取默认值会让「我明明改了却不生效」极难排查
+  - 热重载 TTL 2 秒，且**变更检测用文件内容本身做签名**，不用 `(mtime_ns, size)`：实测本机 NTFS 的 mtime 粒度约 **0.51 ms**，同尺寸连续两次改写在 20 次里有 **10 次** `st_mtime_ns` 完全相同 ⇒ 用 (mtime, size) 会**漏掉**真改动
+  - ⚠️ **阈值读取必须走函数、不能写成默认参数**：Python 的默认参数在 `def` 期只求值一次，写成字面量就等于把阈值钉在「进程启动那一刻」，之后改 `memory.toml` 永不生效（`memory_read` / `memory_context` 的 `max_chars` 已改为 `int | None = None`）。`locks.DEFAULT_LOCK_TIMEOUT` / `text_utils.HEAT_DECAY_LAMBDA` 保留为**向后兼容别名**
+  - `memory_stats` 新增「运行时阈值配置」小节：打印配置文件路径、8 个生效值（覆写项标 `← 已覆写`）与**最近一次解析错误**（配置坏了要能看见，而不是悄悄退回默认值）
+  - 安装脚本同步登记 `memory_config.py`
+  - 专项测试 `tests/test_memory_config.py`（79 断言）
+- **模块分层守卫**（A2）：原计划用 import-linter，但它要求在 `pyproject.toml` / `setup.cfg` 里声明 contracts —— 本仓刻意**零配置、零构建步骤**（模板仓直接 `cp` 即用），为一条守卫引入打包元数据得不偿失 ⇒ 改为**手写 AST 守卫** `tests/test_import_layers.py`（35 断言，纯标准库）。规则：叶子模块（`locks` / `memory_config` / `memory_index` / `metrics` / `text_utils` / `yaml_io`）**不得** import `server`（含函数体内延迟 import 与 `importlib` 动态拉起）；本地模块之间**无环**；叶子之间的依赖只能在显式白名单内，且白名单**不得腐烂**（登记的边必须真实存在）；`server` 必须 import 全部叶子且**真的加载**（`sys.modules` + 绑定名双重佐证）；本地 import 必须都在模块顶层；新增模块必须登记进清单（否则会从守卫视野里消失 —— 漏检比误报危险）。
+
+### Changed
+
+- **自动生成的 MOC 索引改名为隐藏文件 `.记忆索引.md`**（B6）：生成物混在用户笔记里（既污染 `memory_list`、又会被当成「一篇记忆」被引用/检索）是长期噪声源。改动含**一次性保守迁移**：仅当旧文件 `title` 恰为 `记忆索引` **且** tags 命中 `moc` / `index` / `navigation` 才判定为「确认的生成物」并删除（附带的索引行也一并清除，否则会留下死索引），疑似人工文件一律跳过并告警。
+  - 两个连带修复：① `memory_rebuild_links` 的 `known` 集合补 **`f.stem`** —— MOC 用 `[[stem|title]]` 渲染，只认 title 会把 36 篇 `title ≠ stem` 的条目全报成死链；② 安装脚本原先用 shell glob 复制 `template/*`，**点文件会被漏掉** ⇒ 改为 `cp -r "$SCRIPT_DIR/template/." "$MEM_DIR/"`（bash）与 `Get-ChildItem -Force`（PowerShell）
+  - 专项测试 `tests/test_hidden_index.py`（33 断言）
+- **索引增量化**（B2）：`_iter_entries()` 由「每次全量 walk + 解析」改为两层缓存 —— ① 整库指纹 `_DIR_FINGERPRINT` 未变则直接回放 `_ENTRY_SNAPSHOT`（连 `os.walk`/`stat` 都省）；② 指纹变了则逐文件按 `(size, mtime_ns)` 判新鲜，**只重解析真变化的文件**。判据是「改 1 个文件只新增 1 次解析」（旧实现为 +全库）。
+  - 配套：`_refresh_index()` 加**内容签名短路**（MOC 正文只由 `(bucket, stem, title)` 决定 ⇒ 三者未变则跳过渲染与写盘，但**必须同时要求文件存在**，否则索引被删时不会重建）；缓存键由 **title 改为 relpath**（顺带修掉「同名文件互相污染元数据」的遗留缺陷）；返回的 meta 一律**浅拷贝**。
+  - ⚠️ **刻意不做「桶级增量渲染」**：MOC 是单文件、写盘量恒定，渲染成本比 frontmatter 解析低一个量级 —— **瓶颈在解析不在渲染**。目标是「写入延迟不随库增长」，不是检索性能
+  - 专项测试 `tests/test_index_cache.py`（17 断言）
+- **四个只读工具新增 `output_format`**（C1，默认 `"text"`）：`memory_read` / `memory_list` / `memory_recent` / `memory_orphans` 可传 `output_format="json"`，脚本化调用不必再用正则扒字段。
+  - **范围即契约**：报告型工具（`stats` / `doctor` / `audit` / `schema_diff` / `context` / `graph`）**刻意不给** —— 它们的产出是「分节标题 + 计数说明 + 提示语」的叙事，整体转 JSON 等于另立一套真相；写工具的返回值是操作回执，结构化无意义。于是范围只覆盖「文本本身就是记录的渲染」的那几个，**JSON 是文本的同源投影而非第二份实现**
+  - 非法取值**报错**而不静默回落 `text`：脚本化调用最怕「以为拿到 JSON、实际拿到一句中文」，那样 `json.loads` 会在很远的地方才炸；合法值宽容大小写与首尾空白
+  - JSON 的 `body` **不含中文截断说明**（改由 `truncated` / `total_chars` 两个字段表达），否则脚本还得正则剥中文；截断说明仍**逐字节保留**在文本形态里
+  - 专项测试 `tests/test_output_json.py`（76 断言）
+- **`memory_orphans` 的反链判定改用标识映射**：正文里的 `[[X]]` 有三种合法写法（`title` / 文件名 stem / A3 的 `permalink`），原实现直接拿 target 当 key ⇒ 生成索引里的 `[[stem|title]]` 对「`title ≠ stem`」的条目**压根连不上**，那些条目全被算成孤立；同时 `{title}` / `{stem}` 之类的模板占位文本会被当成真实链接目标、凭空造出反链。现统一经 `id2title` 映射解析。
+  另修复：生成页 `.记忆索引` 的链接只是**全库罗列**而非真实引用，把它算作引用方会让所有条目都「被引用过」⇒ **孤立数恒为 0、工具直接失去意义**，现与 `memory_context`（周边遍历排除生成页）、`memory_stats` 同源排除。
+
+### Fixed
+
+- **条目缓存按 title 为键导致同名文件互相污染元数据**（`_ENTRY_CACHE`）：缓存键改为 **relpath**，并拆出条目级缓存、`_ENTRY_STAT`（relpath → `(size, mtime_ns)`）与 `_ENTRY_SNAPSHOT`（整库回放）。此前同名文件会让后读到的 size/mtime 覆盖前一个，且只有重启 MCP 进程才能净化（删索引 db 无效）。
+- **`cleanup_residue.py` 的「活索引可 open」与「真实库对账」两项判据从未生效**（工具侧，随本版同批修正）：脚本引用了 `sqlite3` 却**没有 import** ⇒ 两项最关键的验收判据恒报「索引不可读」，属**永远红的假判据**。修好后实测运行版 `entries=248 = 活跃 232 + 归档 16` **MATCH**。
+
+### Dependencies
+
+- 无变化（`requirements.txt` 仍为 `mcp>=1.27,<2`，`requirements-dev.txt` 仍为 `pytest>=8.0` + `ruff>=0.5`）。
+
+### 工程化
+
+- 测试资产由 **17 套 / 594 断言**（v2.3.0 之后）扩到 **25 套 / 964 断言**；本批新增 `test_folders.py`(43) / `test_title_path.py`(42) / `test_dir_policy.py`(71) / `test_index_cache.py`(17) / `test_permalink.py`(25) / `test_schema_diff.py`(32) / `test_memory_config.py`(79) / `test_hidden_index.py`(33) / `test_output_json.py`(76) / `test_import_layers.py`(35)。
+- 每项新增判据都做了**可证伪验证**（把产品改回旧行为，断言必须变红）：B5 8/8 根针、B6 7/7、C1 7/7、A2 8/8。其中三次失败的证伪实验反而推动了设计修正：① 依赖时钟/调度的判据不算判据（`os.utime` 钉 mtime + 令测试正文大于默认预算）；② 同一语义若存在「索引快路径 + 全库兜底」两条实现，反证必须**两条一起禁**；③ `test_*` 是独立脚本，`-m pytest` 会 `No module named pytest` 且 rc=1 **无输出**，极易误读成「断言红了」。
+
 ## [2.3.0] - 2026-09-18
 
 本版两条主线：**把「记忆怎么被取回来用」补成一个工具**（`memory_context` 上下文组装，跨会话延续从 3~5 次调用降到 1 次），以及**让改动立刻生效**（`memory_restart` 原地热重启，不必重连客户端）。同时把 Phase 3 的三项机制收成闭环 —— 回收站可进可出、重复写入主动提示、热度可预览可落地 —— 并修掉 4 个隐蔽的正确性问题（双 frontmatter 与摘要污染、重复防护漏掉核心页、索引自动生成死链、Windows 下跨进程缓存永不失效）。
@@ -239,7 +306,8 @@
 - 跨平台安装脚本：Windows PowerShell + Linux/macOS bash
 - 零外部依赖：仅需 Python 3.10+ 与 `mcp` 包
 
-[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.2.0
 [2.1.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.1.0

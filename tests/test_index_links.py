@@ -53,8 +53,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def index_targets() -> list[str]:
-    """取出 记忆索引.md 中所有双链的 target（别名被忽略）。"""
-    p = Path(_TMP) / "记忆索引.md"
+    """取出生成索引中所有双链的 target（别名被忽略）。"""
+    p = Path(_TMP) / ".记忆索引.md"      # B6：生成物自 2026-10-08 起带 `.` 前缀
     if not p.exists():
         return []
     return extract_wiki_links(p.read_text(encoding="utf-8"))
@@ -82,6 +82,9 @@ l_alias = server._wiki_link(Path(_TMP) / "A_B.md", "A B")
 check("IL1b 标题!=stem 时 target 用 stem、标题进别名位", l_alias == "[[A_B|A B]]", l_alias)
 check("IL1c 别名形式 target 不含空格", "[[A B" not in l_alias, l_alias)
 check("IL1d 无标题时退化为裸链接", server._wiki_link(Path(_TMP) / "X.md") == "[[X]]")
+# 阶段三：frontmatter 的 title 只存叶子名，目录仅由路径表达 ⇒ 别名位不得出现目录
+l_dir = server._wiki_link(Path(_TMP) / "目录" / "叶子.md", "叶子")
+check("IL1e 子目录条目的别名位不含目录前缀", l_dir == "[[叶子]]", l_dir)
 
 # =====================================================================
 # IL2: 标题含空格 —— 真实缺陷场景
@@ -106,9 +109,16 @@ stem_junk = Path(safe_filename(t_junk)).stem
 server.memory_write(t_junk, "标题含 / : * ? 等字符。")
 targets = index_targets()
 check("IL3a 含非法字符的标题可解析", stem_junk in targets and resolves(stem_junk), f"{stem_junk} in {targets}")
-idx_text = (Path(_TMP) / "记忆索引.md").read_text(encoding="utf-8")
-check("IL3b 原始标题保留在别名位", f"[[{stem_junk}|{t_junk}]]" in idx_text,
-      f"期望 [[{stem_junk}|{t_junk}]]")
+idx_text = (Path(_TMP) / ".记忆索引.md").read_text(encoding="utf-8")   # B6：生成物带 `.` 前缀
+# 阶段三（2026-09-20）改口径：frontmatter 的 `title` 只存**叶子名**，目录仅由文件
+# 路径表达 ⇒ 别名位是叶子标题（非法字符的原始写法照旧保真），不再是 `测试/…` 全串。
+# 依据：`title` 夹带 `目录/` 前缀会让该条目在所有「按 title 比对」的判定（入链解析、
+# MOC 渲染）里全部失配 —— 见 tests/test_dir_policy.py J2/J3/J9。
+check("IL3b 原始标题（叶子名）保留在别名位",
+      f"[[{stem_junk}|非法:字符*案例?x]]" in idx_text,
+      f"期望 [[{stem_junk}|非法:字符*案例?x]]")
+check("IL3b2 别名位不得夹带目录前缀（目录由路径表达）",
+      f"|{t_junk}]]" not in idx_text, idx_text[:400])
 check("IL3c 索引全部链接可解析", not unreachable(targets), f"死链={unreachable(targets)}")
 check("IL3d '/' 解释为子目录（条目落在 测试/ 下）",
       (Path(_TMP) / "测试" / f"{stem_junk}.md").exists(),

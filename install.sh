@@ -60,9 +60,11 @@ mkdir -p "$MEM_DIR"
 echo "[OK] 记忆库目录: $MEM_DIR"
 
 # 4. Copy template files
+#    ⚠️ 用 `template/.` 而不是 `template/*`：shell 通配符**不含点文件**，而 B6 之后
+#    生成的索引种子正是 `template/.记忆索引.md` —— 用 `*` 会静默漏拷。
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -d "$SCRIPT_DIR/template" ]; then
-    cp -r "$SCRIPT_DIR/template/"* "$MEM_DIR/" 2>/dev/null || true
+    cp -r "$SCRIPT_DIR/template/." "$MEM_DIR/" 2>/dev/null || true
     echo "[OK] 初始记忆文件已复制"
 fi
 
@@ -74,10 +76,10 @@ if [ -d "$SCRIPT_DIR/rules" ]; then
 fi
 
 # 6. Copy server.py 及其同目录模块
-#    server.py 依赖 memory_index / yaml_io / text_utils / locks / metrics，
-#    只复制 server.py 会导致启动即 ImportError。
+#    server.py 依赖 memory_index / yaml_io / text_utils / locks / metrics /
+#    memory_config，只复制 server.py 会导致启动即 ImportError。
 if [ -f "$SCRIPT_DIR/server.py" ]; then
-    for mod in server.py memory_index.py yaml_io.py text_utils.py locks.py metrics.py; do
+    for mod in server.py memory_index.py yaml_io.py text_utils.py locks.py metrics.py memory_config.py; do
         if [ -f "$SCRIPT_DIR/$mod" ]; then
             cp "$SCRIPT_DIR/$mod" "$MEM_DIR/"
         fi

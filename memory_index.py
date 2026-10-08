@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS entries (
     version      INTEGER,
     access_count INTEGER NOT NULL DEFAULT 0,
     summary      TEXT,
+    permalink    TEXT,               -- A3: 稳定标识（首次写入冻结），文件改名后仍可定位
     size         INTEGER NOT NULL DEFAULT 0,
     mtime        REAL NOT NULL DEFAULT 0
 );
@@ -47,6 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title);
 CREATE INDEX IF NOT EXISTS idx_entries_stem ON entries(stem);
 CREATE INDEX IF NOT EXISTS idx_entries_tier ON entries(tier);
 """
+# ⚠️ permalink 的索引**刻意不写在这里**，见 _migrate 的说明。
 
 
 def db_path(server_dir: Path, memory_dir: Path) -> Path:
@@ -63,7 +65,34 @@ def connect(db_file: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """幂等补列（A3, 2026-10-08）。
+
+    `CREATE TABLE IF NOT EXISTS` **不会**给已存在的表加列，所以 A3 之前建的索引库
+    缺 `permalink` 列。而缺列的报错 `no such column: permalink` 属
+    `OperationalError`，会被 `server._is_index_corrupted` 判为「锁竞争」⇒ **不会**
+    触发丢弃重建。因此若不在连接层显式补齐，索引定位会持续报错（只剩全库回退），
+    而且症状是「静默降级」而非报错。
+
+    索引定位为「可重建缓存」，补列是最轻的处置；失败也不阻塞连接 —— 查询报错后
+    调用方自会回退全库扫描，功能不降级。
+
+    ⚠️ permalink 的**索引也一并放在这里**，绝不能写进 SCHEMA：SCHEMA 是在
+    `CREATE TABLE IF NOT EXISTS` 之后立即执行的，而旧库的表**已存在且没有该列**，
+    于是 `CREATE INDEX ... ON entries(permalink)` 会抛 `no such column: permalink`
+    并把整个 `executescript(SCHEMA)` 打断 —— 连补列的机会都不会有（实测踩到）。
+    """
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(entries)")}
+        if "permalink" not in cols:
+            conn.execute("ALTER TABLE entries ADD COLUMN permalink TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_permalink ON entries(permalink)")
+    except sqlite3.Error:
+        pass
 
 
 def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str, Any]:
@@ -91,6 +120,7 @@ def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str,
         "version": meta.get("version") if isinstance(meta.get("version"), int) else None,
         "access_count": meta.get("access_count") if isinstance(meta.get("access_count"), int) else 0,
         "summary": str(meta.get("summary") or ""),
+        "permalink": str(meta.get("permalink") or ""),
         "size": size,
         "mtime": mtime,
     }
@@ -99,14 +129,15 @@ def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str,
 def upsert(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     conn.execute(
         """INSERT INTO entries(relpath, title, stem, tags, tier, created, updated,
-                              source, version, access_count, summary, size, mtime)
+                              source, version, access_count, summary, permalink, size, mtime)
            VALUES(:relpath,:title,:stem,:tags,:tier,:created,:updated,
-                  :source,:version,:access_count,:summary,:size,:mtime)
+                  :source,:version,:access_count,:summary,:permalink,:size,:mtime)
            ON CONFLICT(relpath) DO UPDATE SET
              title=excluded.title, stem=excluded.stem, tags=excluded.tags,
              tier=excluded.tier, created=excluded.created, updated=excluded.updated,
              source=excluded.source, version=excluded.version,
              access_count=excluded.access_count, summary=excluded.summary,
+             permalink=excluded.permalink,
              size=excluded.size, mtime=excluded.mtime""",
         row,
     )
@@ -117,12 +148,15 @@ def remove(conn: sqlite3.Connection, relpath: str) -> None:
 
 
 def find(conn: sqlite3.Connection, title_or_stem: str) -> list[sqlite3.Row]:
-    """按 title 或 stem 匹配的所有行 (同 title 可能有根 stub + .archive 副本).
-    根目录条目在前, 同目录内 updated 新者在前——与 server 原 glob 语义一致."""
+    """按 permalink / title / stem 匹配的所有行 (同 title 可能有根 stub + .archive 副本).
+    根目录条目在前, 同目录内 updated 新者在前——与 server 原 glob 语义一致.
+
+    A3：permalink 也参与匹配 ⇒ 文件被改名（stem 变）后，用旧标识仍能定位到它。
+    """
     return conn.execute(
-        """SELECT * FROM entries WHERE title=? OR stem=?
+        """SELECT * FROM entries WHERE permalink=? OR title=? OR stem=?
            ORDER BY (relpath LIKE '.archive/%') ASC, updated DESC""",
-        (title_or_stem, title_or_stem),
+        (title_or_stem, title_or_stem, title_or_stem),
     ).fetchall()
 
 

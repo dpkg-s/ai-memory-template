@@ -68,10 +68,14 @@ if (-not (Test-Path $memDir)) {
 Write-Host "[OK] 记忆库目录: $memDir" -ForegroundColor Green
 
 # 4. Copy template files
+#    ⚠️ 必须显式用 -Force 逐项复制：`Copy-Item "$templateDir\*"` 会**跳过隐藏项**，
+#    而 B6 之后生成的索引种子正是 `template\.记忆索引.md` —— 用 `*` 会静默漏拷。
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $templateDir = Join-Path $scriptDir "template"
 if (Test-Path $templateDir) {
-    Copy-Item "$templateDir\*" -Destination $memDir -Recurse -Force
+    Get-ChildItem -Path $templateDir -Force | ForEach-Object {
+        Copy-Item $_.FullName -Destination $memDir -Recurse -Force
+    }
     Write-Host "[OK] 初始记忆文件已复制" -ForegroundColor Green
 }
 
@@ -85,10 +89,10 @@ if (Test-Path $rulesDir) {
 }
 
 # 6. Copy server.py 及其同目录模块
-#    server.py 依赖 memory_index / yaml_io / text_utils / locks / metrics，
-#    只复制 server.py 会导致启动即 ImportError。
+#    server.py 依赖 memory_index / yaml_io / text_utils / locks / metrics /
+#    memory_config，只复制 server.py 会导致启动即 ImportError。
 if (Test-Path (Join-Path $scriptDir "server.py")) {
-    $runtimeModules = @("server.py", "memory_index.py", "yaml_io.py", "text_utils.py", "locks.py", "metrics.py")
+    $runtimeModules = @("server.py", "memory_index.py", "yaml_io.py", "text_utils.py", "locks.py", "metrics.py", "memory_config.py")
     foreach ($mod in $runtimeModules) {
         $src = Join-Path $scriptDir $mod
         if (Test-Path $src) {

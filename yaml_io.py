@@ -391,7 +391,8 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
                       scope: str | None = None, project: str | None = None,
                       status: str | None = None, supersedes: str | None = None,
                       conflicts: list[str] | None = None,
-                      source_context: str | None = None) -> str:
+                      source_context: str | None = None,
+                      permalink: str | None = None) -> str:
     """构造 frontmatter 文本（含 title/tags/created/updated/tier/access_count 等）。
 
     P0 可信度字段（type/confidence/verified）与 P1 生命周期字段
@@ -401,19 +402,25 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
 
     按需写出的字段（project / supersedes / conflicts / source_context）只在有值时
     出现，避免给绝大多数条目增加无意义的空行。
+
+    A3（2026-10-08）新增 ``permalink``：**条目首次写入时冻结的稳定标识**，此后
+    永不覆盖（含文件改名）。它同样是「有值才写出」—— 存量条目在再次被写入前不会
+    多出这一行（渐进补齐，与 P0/P1 字段同一迁移风格）。
     """
     now = datetime.now(timezone.utc).isoformat()
-    meta: dict[str, Any] = {
-        "title": title,
-        "tags": tags,
-        "created": created or now,
-        "updated": now,
-        "tier": tier or "warm",
-        "access_count": access_count,
-        "type": mem_type if mem_type in MEMORY_TYPES else DEFAULT_MEMORY_TYPE,
-        "confidence": confidence if confidence in CONFIDENCE_LEVELS else DEFAULT_CONFIDENCE,
-        "verified": bool(verified) if verified is not None else DEFAULT_VERIFIED,
-    }
+    # permalink 语义上紧跟 title，因此不能塞进下面的字面量尾部 —— dict 的键序
+    # 就是写出顺序，必须按赋值顺序构造。
+    meta: dict[str, Any] = {"title": title}
+    if permalink:
+        meta["permalink"] = permalink
+    meta["tags"] = tags
+    meta["created"] = created or now
+    meta["updated"] = now
+    meta["tier"] = tier or "warm"
+    meta["access_count"] = access_count
+    meta["type"] = mem_type if mem_type in MEMORY_TYPES else DEFAULT_MEMORY_TYPE
+    meta["confidence"] = confidence if confidence in CONFIDENCE_LEVELS else DEFAULT_CONFIDENCE
+    meta["verified"] = bool(verified) if verified is not None else DEFAULT_VERIFIED
     if verified_at:
         meta["verified_at"] = verified_at
     meta["scope"] = scope if scope in SCOPES else DEFAULT_SCOPE

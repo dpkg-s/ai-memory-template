@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.4.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.1-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
 [![Tests](https://img.shields.io/badge/tests-964%20assertions-brightgreen)](#测试与-ci)
@@ -156,11 +156,12 @@ supersedes: 项目_xxx_旧索引方案
   | 档位 | 行为 |
   |------|------|
   | `warn`（**默认**） | 只提示「这条更适合放到 `工具/`」，**不改你的落点** |
-  | `auto` | 按语义桶（11 个）自动落到规范目录 |
+  | `auto` | 先按**标题前缀**命中 vault 里既有的分类目录，否则按语义桶（11 个）落到规范目录 |
   | `strict` | 无可归的规范目录时**拒写** |
   | `off` | 完全关闭 |
 
   默认保守是有意的：目录落点会改变「笔记在哪」这一心智模型，而多客户端与既有脚本都依赖它，所以先只提示、由你决定要不要开。
+- **落点有两级判据**（v2.4.1 起）：① **标题前缀命中既有目录** —— 标题第一个 `_` 之前那段若恰好是 vault 根下已有的一级目录（`故障/` `核验/` `经验/` …），就以它为准（`故障_XXX` → `故障/`）；② 否则退回**语义桶表**（11 个规范目录）。核心页（含 `_`／空格两种写法）一律留根、不参与归类。四档策略都受此影响（`warn` 只改**建议**、`auto` 才改**落点**）。
 - **两条硬边界**：① 自动归类**只作用于新建** —— 更新绝不搬运，否则存量笔记会被搅动；② 落地目录**不写进 frontmatter 的 `title`** —— `title` 恒为裸叶子名。若把路径写进 `title`，一切「按标题比对」的判定（双链、更新、去重）都会失配，这是本项目踩过的真实坑。
 
 > 存量笔记**一律不改名、不搬迁**。想收编旧目录可以手工搬，风险自担；服务端不会替你做迁移。

@@ -702,6 +702,14 @@ def _title_path_error(title: str) -> str | None:
 # 不可预测（实测「测试_索引命中」因正文含 mcp 字样被自动补 tag，进而落到 工具/）。
 # ⇒ 先用 warn 观察一段时间，确认误判率可接受，再按需切 auto。
 # 要立刻启用自动归类：设 ``AI_MEMORY_DIR_POLICY=auto``。
+#
+# 2026-10-09 补：语义桶表只覆盖 11 个规范目录，而 vault 里另有十余个**语义同样
+# 明确**的既有目录（故障 / 排坑 / 排查 / 经验 / 调研 / 核验 / 技能 / 移动端 /
+# 素材 / 需求 / 偏好 / 技术）。实测 22 篇根目录笔记里 **8 篇**因此被兜底成「其他」
+# 桶，判准率仅 11/22 —— 即「把语义清晰的笔记扫进垃圾桶」。故新增一条**前缀命中
+# 既有目录**的判定（`_dir_prefix_hit`），插在语义桶表之前：`故障_XX` → `故障/`。
+# 该规则不动 BUCKET_DIRS（规范目录清单不变），也不搬迁任何存量条目；传
+# ``dirs=None`` 的旧调用形态行为与改动前逐字一致。存量归位走一次性搬迁。
 DIR_POLICY_ENV = "AI_MEMORY_DIR_POLICY"
 DIR_POLICIES = ("off", "warn", "auto", "strict")
 DEFAULT_DIR_POLICY = "warn"
@@ -733,6 +741,67 @@ BUCKET_DIRS: dict[str, str | None] = {
 }
 
 
+
+# ---- 归类目标目录集 (2026-10-09) --------------------------------------
+# 前缀命中既有目录会产生「目录名桶」（故障 / 核验 / 经验 …），它们不在规范序里。
+# 渲染循环只遍历序 ⇒ 不动态补充就会**静默丢条目**（索引里少链接却不报错），
+# 故一律走 _bucket_order() 取序。
+_BUCKET_ORDER = ("索引", "规则", "身份与配置", "项目", "工具", "运维", "修复",
+                 "时间线", "模板", "AI相关", "其他")
+
+
+def _bucket_order(groups: dict[str, list]) -> list[str]:
+    """渲染顺序：规范桶（仅有内容的）按固定序在前，其余桶按字典序附后。"""
+    extra = sorted(b for b in groups if b not in _BUCKET_ORDER)
+    return [b for b in _BUCKET_ORDER if groups.get(b)] + extra
+
+
+def _known_dirs() -> frozenset[str]:
+    """vault 根下**可作归类目标**的一级目录名集（滤掉保留目录与点目录）。
+
+    批量判定时应在循环外取一次复用 —— 本函数每次都扫一遍 vault 根目录。
+    """
+    try:
+        entries = list(MEMORY_DIR.iterdir())
+    except OSError:
+        return frozenset()
+    return frozenset(
+        p.name for p in entries
+        if p.is_dir() and not p.name.startswith(".") and p.name not in RESERVED_DIRS
+    )
+
+
+def _core_variant(title: str) -> str:
+    """把标题里的 `_` 视作空格归一化，用于核心页豁免的宽松匹配。
+
+    全库核心页文件名用 `_` 连接（`Codex_身份档案`），而 CORE_PAGES 里写的是
+    空格形态（`Codex 身份档案`）—— 不归一化就会漏判，进而被前缀规则误送进
+    同名目录（`Codex/`）。
+    """
+    return title.replace("_", " ").strip()
+
+
+def _dir_prefix_hit(title: str, dirs: frozenset[str]) -> str | None:
+    """标题前缀命中**同名既有目录**时返回该目录名，否则 ``None``。
+
+    `故障_XX` → `故障/`、`核验_YY` → `核验/`。与 ``BUCKET_DIRS`` 的分工：后者是
+    写死的规范目录表（11 个桶），本函数让 vault 里**既有**的分类目录自动成为
+    归类目标，不必逐个登记；传空集 ``dirs`` 时恒不命中。
+
+    三条边界：
+      1. 只取第一个 `_` 之前的一段 —— 无 `_`、或该段不是目录名即不命中；
+      2. 核心页（含 `_`/空格变体）一律豁免，避免 `Codex_身份档案` 被送进 `Codex/`；
+      3. 目录存在性来自调用方传入的 ``dirs``，本函数**不做任何 IO**（便于测试）。
+    """
+    if title in CORE_PAGES or _core_variant(title) in CORE_PAGES:
+        return None
+    stem = title.split("_", 1)[0].strip()
+    if not stem or stem == title or stem not in dirs:
+        return None
+    return stem
+
+
+
 def _dir_policy() -> str:
     """当前目录策略；未设置或取值非法时回落 ``DEFAULT_DIR_POLICY``。
 
@@ -743,16 +812,27 @@ def _dir_policy() -> str:
     return raw if raw in DIR_POLICIES else DEFAULT_DIR_POLICY
 
 
-def _suggest_dir(title: str, tags: list[str]) -> str | None:
+def _suggest_dir(title: str, tags: list[str],
+                 dirs: frozenset[str] | None = None) -> str | None:
     """推断条目的规范存放目录；``None`` 表示应留在 vault 根。
 
     核心页（``CORE_PAGES``）一律留根 —— 它们是全库导航入口，散进子目录会让
     「根目录 = 书架第一层」这个约定失效，而历史双链多以根路径书写。
+
+    判定顺序（2026-10-09 起）：
+      ① 核心页豁免（含 `_`/空格变体）；
+      ② `_entry_bucket` 内的**标题前缀命中既有目录**（`故障_XX` → `故障/`）；
+      ③ 语义桶表 ``BUCKET_DIRS`` 兜底。
+    ``dirs`` 省略时内部取一次 ``_known_dirs()``；批量调用方应传入复用。
     """
-    if title in CORE_PAGES:
+    if title in CORE_PAGES or _core_variant(title) in CORE_PAGES:
         return None
+    dirs = _known_dirs() if dirs is None else dirs
     bucket, _reason = _entry_bucket({"title": title, "tags": tags},
-                                    Path(_safe_filename(title)))
+                                    Path(_safe_filename(title)), dirs)
+    # 前缀命中时桶名**就是**目录名；否则按桶表映射（索引桶 -> None 即留根）。
+    if bucket in dirs:
+        return bucket
     return BUCKET_DIRS.get(bucket)
 
 
@@ -1007,7 +1087,8 @@ def _entry_tags(meta: dict[str, Any]) -> list[str]:
         return [tags.strip()]
     return []
 
-def _entry_bucket(meta: dict[str, Any], path: Path) -> tuple[str, str]:
+def _entry_bucket(meta: dict[str, Any], path: Path,
+                  dirs: frozenset[str] | None = None) -> tuple[str, str]:
     title = _entry_title(meta, path)
     tags = {tag.lower() for tag in _entry_tags(meta)}
     title_lower = title.lower()
@@ -1020,6 +1101,14 @@ def _entry_bucket(meta: dict[str, Any], path: Path) -> tuple[str, str]:
         or title.endswith("索引")
     ):
         return "索引", "导航入口或总索引"
+
+    # 前缀命中既有分类目录（2026-10-09）—— 位置刻意排在 tags 判定**之前**：
+    # tags 可能被 `_auto_suggest_tags()` 自动补出来，可靠性低于写入方手写的标题
+    # 前缀。`dirs` 为 None（旧调用形态）时整体跳过，行为与改动前一致。
+    if dirs:
+        hit = _dir_prefix_hit(title, dirs)
+        if hit:
+            return hit, f"标题前缀命中既有目录 {hit}/"
 
     if (
         title == "近期工作动态"
@@ -1521,13 +1610,14 @@ def _refresh_index() -> None:
     global _INDEX_SIG
     try:
         entries = _iter_entries()
-        order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复",
-                 "时间线", "模板", "AI相关", "其他"]
-        groups: dict[str, list[tuple[Path, str]]] = {b: [] for b in order}
+        # `dirs` 在循环外取一次：`_known_dirs()` 要扫 vault 根目录，逐篇调用等于
+        # 把 250 次目录枚举压进一次索引重建。
+        dirs = _known_dirs()
+        groups: dict[str, list[tuple[Path, str]]] = {}
         sig_parts: list[tuple[str, str, str]] = []
         for path, meta, _body in entries:
             title = _entry_title(meta, path)
-            bucket, _reason = _entry_bucket(meta, path)
+            bucket, _reason = _entry_bucket(meta, path, dirs)
             groups.setdefault(bucket, []).append((path, title))
             sig_parts.append((bucket, path.stem, title))
         # tier / updated / 正文篇幅等变化都不改变索引正文，故一律不纳入签名。
@@ -1541,7 +1631,7 @@ def _refresh_index() -> None:
         _INDEX_SIG = index_sig
         lines = ["# 记忆索引（自动维护）", "",
                  "> 本索引由 ai-memory MCP 在每次写入后自动更新。如确需手工调整，请改各笔记自身而非此处。", ""]
-        for bucket in order:
+        for bucket in _bucket_order(groups):
             items = groups.get(bucket, [])
             if not items:
                 continue
@@ -2513,9 +2603,10 @@ def memory_audit() -> str:
     p1_issues: list[str] = []      # P1：生命周期/作用域/冲突字段的一致性问题
     old_schema_count = 0           # P1：仍为旧 frontmatter 结构的条目数
 
+    audit_dirs = _known_dirs()
     for path, meta, body in entries:
         title = _entry_title(meta, path)
-        bucket, reason = _entry_bucket(meta, path)
+        bucket, reason = _entry_bucket(meta, path, audit_dirs)
         bucket_counts[bucket] += 1
 
         source = str(meta.get("source", "")).strip()
@@ -2918,29 +3009,17 @@ def memory_index_draft() -> str:
     if not entries:
         return "记忆库为空"
 
-    groups: dict[str, list[tuple[Path, str]]] = {
-        "索引": [],
-        "规则": [],
-        "项目": [],
-        "工具": [],
-        "运维": [],
-        "修复": [],
-        "时间线": [],
-        "身份与配置": [],
-        "模板": [],
-        "AI相关": [],
-        "其他": [],
-    }
+    dirs = _known_dirs()
+    groups: dict[str, list[tuple[Path, str]]] = {}
 
     for path, meta, _body in entries:
         title = _entry_title(meta, path)
-        bucket, _reason = _entry_bucket(meta, path)
+        bucket, _reason = _entry_bucket(meta, path, dirs)
         groups.setdefault(bucket, []).append((path, title))
 
-    order = ["索引", "规则", "身份与配置", "项目", "工具", "运维", "修复", "时间线", "模板", "AI相关", "其他"]
     lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `.记忆索引.md`。", ""]
 
-    for bucket in order:
+    for bucket in _bucket_order(groups):
         items = groups.get(bucket, [])
         if not items:
             continue

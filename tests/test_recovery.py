@@ -5,6 +5,7 @@
     R1 索引 db 被删除          → 新进程启动后自动重建，数据不丢
     R2 索引 db 被写垃圾字节    → 功能不降级 + 损坏文件被丢弃重建（自愈）
     R3 锁文件残留 / 内容损坏   → 陈旧检测接管，不永久卡死
+       （含 Windows 特有：抢锁/回收撞上 PermissionError 时不得逃逸）
     R4 进程被 kill（模拟崩溃） → 不留半截文件、不留锁、不阻塞后续写入
     R5 外部编辑器改写文件      → 读盘为准（正文永不入库），索引 (size,mtime) 自愈
     R6 外部增删文件（git 切版本）→ 检索以磁盘为准，重建后索引与磁盘一致
@@ -26,6 +27,7 @@
 """
 from __future__ import annotations
 
+import builtins
 import gc
 import json
 import os
@@ -211,6 +213,36 @@ _r3e = locks.acquire_lock(_LOCK, stale_timeout=0.3)
 _dt = time.time() - _t0
 check("R3e 新鲜锁会阻塞并在超时后返回 False（不会误判为陈旧）",
       _r3e is False and _dt >= 0.2, f"acquired={_r3e} elapsed={_dt:.2f}s")
+locks.reset_lock_state()
+
+# R3f（2026-10-12）：Windows 下 open(锁文件, "x") 走 O_CREAT|O_EXCL，但目标
+# **已存在且被其他进程持有**时返回 ERROR_ACCESS_DENIED(5) ⇒ Python 抛
+# PermissionError 而不是 FileExistsError。旧代码只 `except FileExistsError`，
+# 于是异常直接逃逸出 acquire_lock，把「没抢到锁」变成调用方崩溃
+# （实测：10 进程并发写，8 轮里有 2 轮随机报 .memory.lock 的 PermissionError）。
+# 这里打桩 open 确定性复现「创建 / 读取 / 回收三个动作全部 PermissionError」，
+# 断言契约是「不逃逸、按抢锁失败返回 False」而非抛异常。
+_bi_open_orig = builtins.open
+
+
+def _locked_open(file, mode="r", *a, **k):
+    if str(file).endswith(".memory.lock"):
+        raise PermissionError(13, "Permission denied")
+    return _bi_open_orig(file, mode, *a, **k)
+
+
+_LOCK.write_text(json.dumps({"pid": os.getpid(), "time": time.time()}), encoding="utf-8")
+builtins.open = _locked_open
+try:
+    _t0 = time.time()
+    _r3f = locks.acquire_lock(_LOCK, stale_timeout=0.5)
+    _r3f_dt = time.time() - _t0
+except Exception as _e:  # noqa: BLE001 - 「异常逃逸」正是本次要防的回归
+    _r3f, _r3f_dt = f"RAISED:{type(_e).__name__}", 0.0
+finally:
+    builtins.open = _bi_open_orig
+check("R3f 锁被占用（PermissionError）不逃逸，按抢锁失败返回 False",
+      _r3f is False, f"acquired={_r3f} elapsed={_r3f_dt:.2f}s")
 locks.reset_lock_state()
 try:
     _LOCK.unlink(missing_ok=True)

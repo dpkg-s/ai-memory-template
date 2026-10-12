@@ -6,7 +6,7 @@
 扁平格局照旧长回来。阶段三把既有的语义分桶 `_entry_bucket()`（原本只服务索引
 草稿）接到写入路径上：新建条目按标题与 tags 自动推断规范目录。
 
-本测试守八类风险：
+本测试守十一类风险：
 
     A. 自动归类落点 —— 各语义桶落到对应规范目录、目录不存在时自动创建
     B. **裸标题** —— frontmatter 的 title 绝不能带目录前缀（目录只体现在路径上）
@@ -16,6 +16,11 @@
     F. 桶 -> 目录映射表完备（新增桶而漏配会静默落根，是最隐蔽的回归）
     G. 与阶段二政策共存（保留目录 / 层级上限仍生效）
     H. 核心页豁免 —— CORE_PAGES 始终留根
+    I. title 与落点分离 —— 显式 `目录/条目` 只把叶子名写进 frontmatter
+    J. 同茎异主不串档 —— 不同目录下的同名叶子条目各写各的
+    K. **前缀命中既有目录**（2026-10-09）—— `故障_XX` → `故障/`；前缀优先于
+       tags 推断、核心页下划线变体豁免、无同名目录时回落语义桶、保留目录与
+       点目录不作为归类目标、传 `dirs=None` 时行为与改动前逐字一致
 
 脚本把 AI_MEMORY_DIR 指向临时目录，绝不触碰真实记忆库。
 
@@ -300,6 +305,54 @@ def main() -> int:
           "第二个目录的第二版" in
           (_ROOT / "阶段三" / "另一目录" / "叶子名条目.md").read_text(encoding="utf-8")
           and "第二个目录的第二版" not in p_j.read_text(encoding="utf-8"))
+
+    # =================================================================
+    # K. 前缀命中既有分类目录（2026-10-09）
+    # 背景：语义桶表 `BUCKET_DIRS` 只覆盖 11 个规范目录，而真实 vault 里另有十余个
+    # **语义同样明确**的既有目录（故障 / 排坑 / 排查 / 经验 / 调研 / 核验 / 技能 /
+    # 移动端 / 素材 / 需求 / 偏好 / 技术）。不接这条规则，`故障_XX` 会被兜底成
+    # 「其他」—— 2026-10-09 实测：22 篇根目录笔记里错 8 篇（判准 11/22）。
+    print("\n[K] 标题前缀命中既有分类目录")
+    for d in ("故障", "核验", "Codex", "ai-memory", ".trash"):
+        (_ROOT / d).mkdir(exist_ok=True)
+
+    _set_policy("auto")
+    title_k = "故障_前缀归类测试"
+    rel_k = f"故障/{server._safe_filename(title_k)}"
+    r = server.memory_write(title_k, "前缀命中测试。", tags=["project"])
+    check("K1 前缀命中既有目录 -> 故障/", _exists(rel_k), repr(r))
+    check("K2 前缀优先于 tags 推断（带 project 也不落 项目/）",
+          not _exists(f"项目/{server._safe_filename(title_k)}"), str(_all_md()))
+    check("K3 返回消息注明落点", "已自动归类到 故障/" in r, repr(r))
+    meta_k, _bk = server._load_memory(_ROOT / rel_k)
+    check("K4 frontmatter 仍是裸标题", meta_k.get("title") == title_k,
+          repr(meta_k.get("title")))
+
+    title_o = "无同名目录的前缀_兜底测试"
+    r = server.memory_write(title_o, "无同名目录应回落桶表。", tags=[])
+    check("K5 无同名目录时回落语义桶（其他/）",
+          _exists(f"其他/{server._safe_filename(title_o)}"), repr(r))
+
+    check("K6 核心页下划线变体豁免（Codex/ 存在也不送进去）",
+          server._suggest_dir("Codex_身份档案", []) is None,
+          repr(server._suggest_dir("Codex_身份档案", [])))
+    check("K7 _known_dirs 不含保留目录与点目录",
+          not (server._known_dirs() & set(server.RESERVED_DIRS))
+          and not any(d.startswith(".") for d in server._known_dirs()),
+          str(sorted(server._known_dirs())))
+
+    b_with, reason_k = server._entry_bucket(
+        {"title": "故障_X", "tags": []}, Path("故障_X"), server._known_dirs())
+    b_without, _rk = server._entry_bucket({"title": "故障_X", "tags": []}, Path("故障_X"))
+    check("K8 传 dirs 时桶名 == 目录名", b_with == "故障", f"{b_with} / {reason_k}")
+    check("K9 dirs=None 行为与改动前一致（向后兼容）", b_without == "其他", b_without)
+
+    draft = server.memory_index_draft()
+    check("K10 索引草稿渲染出目录名桶（不丢条目）",
+          "## 故障" in draft and title_k in draft, draft[-300:])
+    probe_order = server._bucket_order({"故障": [1], "项目": [1], "其他": [1]})
+    check("K11 渲染序：规范桶在前、额外桶附后",
+          probe_order == ["项目", "其他", "故障"], str(probe_order))
 
     # =================================================================
     # 汇总

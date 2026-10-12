@@ -5,6 +5,27 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.1] - 2026-10-12
+
+本版是 2.4.0 目录化的一次**校正**：写入端自动归类当时只认 11 个写死的语义桶，遇到 vault 里**既有的**分类目录（`故障/` `核验/` `经验/` `调研/` `排坑/` …）一律兜底成「其他」，等于把标题前缀语义本已清晰的笔记扫进垃圾桶；索引渲染又只遍历固定桶序，前缀命中的「目录名桶」不在序里，会**静默丢条目**（索引少链接却不报错）。两处均已修正，且**旧调用形态的行为与改动前逐字一致**。另顺带修掉一个 **Windows 专属的并发崩溃**：抢锁撞上 `ERROR_ACCESS_DENIED` 时异常会逃逸出 `acquire_lock`，把「没抢到锁」变成调用方崩溃。
+
+### Fixed
+
+- **`acquire_lock` 在 Windows 下抛 `PermissionError` 逃逸（并发写随机崩）**：`open(path, "x")` 落到 `O_CREAT|O_EXCL` —— POSIX 下目标已存在返回 `EEXIST`（`FileExistsError`），而 **Windows 下目标已存在且被其他进程持有时返回 `ERROR_ACCESS_DENIED(5)`**，Python 抛的是 `PermissionError`。代码只 `except FileExistsError`，于是该异常**直接逃逸出 `acquire_lock`**：调用方（`memory_write` 等）拿到的是异常而非「抢锁失败」。同一陷阱也存在于回收侧 —— `unlink` 删除「正被其他进程打开」的文件同样抛 `PermissionError`，旧代码在 `except (JSONDecodeError, OSError)` 分支里**再删一次**，第二次照样逃逸。现改为：创建时一并捕获 `PermissionError`；删除统一走新增的 `_unlink_quiet()`（失败静默、下轮重试）。**实测**：10 进程并发写，脱链环境下 8 轮里 **2 轮**随机报 `.memory.lock` 的 `PermissionError`（`WinError 5` / `Errno 13`），修复后同一循环不再复现。⚠️ 该缺陷**只在 Windows 触发** —— POSIX 下 `open("x")` 恒为 `EEXIST`、`unlink` 不留占用，所以 ubuntu CI 上从未暴露。
+- **自动归类漏判「既有分类目录」**：新增 `_dir_prefix_hit()` —— 标题**第一个 `_` 之前**那段若恰好是 vault 根下既有的一级目录，就直接以该目录为落点（`故障_H29K_dnsmasq崩溃循环` → `故障/`），不再兜底成「其他」。实施时实测：根目录 22 篇里 **8 篇**被兜底成「其他」，判准率仅 **11/22**。该判定**刻意排在 tags 判定之前** —— tags 可能由 `_auto_suggest_tags()` 自动补出，可靠性低于写入方手写的标题前缀。四档策略都受此影响（`warn` 下体现为**建议**落点变化，`auto` 下才是**真实**落点变化）；**不搬迁任何存量条目**，存量归位仍走一次性手工搬迁。
+- **核心页被前缀规则误送进同名目录**：全库核心页文件名用 `_` 连接（`Codex_身份档案`），而 `CORE_PAGES` 里写的是空格形态（`Codex 身份档案`）⇒ 不归一化就漏判，`Codex_身份档案` 会被送进 `Codex/`。新增 `_core_variant()` 做 `_`／空格等价归一化，核心页（含两种变体）一律留根。
+- **索引渲染静默丢条目**：渲染循环此前只遍历写死的 11 个桶序，而前缀命中会产生「目录名桶」（`故障` / `核验` / …），它们不在序里 ⇒ 这些桶下的条目**不会出现在 `.记忆索引.md` 中，且不报任何错**。改为由 `_bucket_order()` 生成渲染序：规范桶（仅有内容的）按固定序在前，其余桶按字典序附后。
+
+### Changed
+
+- `_entry_bucket()` 与 `_suggest_dir()` 增加**可选** `dirs` 参数：省略时内部取一次 `_known_dirs()`；传入 `None` 的旧调用形态**整体跳过前缀判定，行为与改动前逐字一致**。
+- 三处批量调用点（索引重建 / `memory_audit` / `memory_index_draft`）改为**在循环外取一次目录集**复用 —— `_known_dirs()` 要扫一遍 vault 根目录，逐篇调用等于把 250 次目录枚举压进一次索引重建。
+
+### Tests
+
+- `tests/test_dir_policy.py`：断言 **51 → 62**（+11），覆盖前缀命中落点、核心页 `_`／空格变体豁免、`dirs=None` 旧形态等价性、渲染序含「目录名桶」四项。
+- `tests/test_recovery.py`：新增 **R3f**（36 断言，原 35）—— 打桩 `open` 让锁文件的所有访问都抛 `PermissionError`，断言 `acquire_lock` **不逃逸**、按抢锁失败返回 `False`。该断言对旧实现**确定性变红**（实测输出 `acquired=RAISED:PermissionError`），故是真判据而非恒绿装饰。
+
 ## [2.4.0] - 2026-10-08
 
 本版三条主线：**目录化**（记忆库不再只能是扁平一层 —— 可建子目录、写入端还会按语义自动归位）、**稳定标识与索引增量化**（改名不再静默失联，索引不再每次全量重解析）、**可脚本化与可配置**（四个只读工具可出 JSON，8 个运行时阈值外置到 `memory.toml` 并热重载）。

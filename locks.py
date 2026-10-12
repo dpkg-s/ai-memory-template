@@ -44,6 +44,19 @@ DEFAULT_LOCK_TIMEOUT = memory_config.DEFAULTS["lock_timeout"]
 _lock_state = threading.local()
 
 
+def _unlink_quiet(path: Path) -> None:
+    """尽力删除锁文件，失败静默（下一轮重试会接管）。
+
+    为什么不能裸调 ``unlink``：Windows 下删除「正被其他进程打开」的文件会抛
+    ``PermissionError``（WinError 5 / 删除共享冲突）。该异常原先会从
+    ``acquire_lock`` 里**逃逸出去**，把并发写变成随机崩溃（而不是「没抢到锁」）。
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def acquire_lock(lock_path: Path, stale_timeout: float | None = None) -> bool:
     """获取跨进程文件锁，返回是否成功。
 
@@ -54,6 +67,14 @@ def acquire_lock(lock_path: Path, stale_timeout: float | None = None) -> bool:
         stale_timeout: 陈旧锁回收秒数。``None``（默认）= 取 ``memory.toml`` 的
             ``lock_timeout``（内置默认 15）。**每次调用只解析一次**（在循环外），
             免得在抢锁自旋里反复 stat 配置文件。
+
+    Windows 陷阱（2026-10-12 修复）：
+        ``open(path, "x")`` 落到 O_CREAT|O_EXCL。POSIX 下目标已存在 ⇒ EEXIST ⇒
+        ``FileExistsError``；**Windows 下目标已存在且被其他进程持有时**返回
+        ERROR_ACCESS_DENIED(5) ⇒ ``PermissionError``。只捕获 FileExistsError 会让
+        后者逃逸 —— 调用方拿到的是异常而不是「抢锁失败」，并发写随即崩掉。
+        故两者必须一并按「锁被占用」处理。同类问题也存在于 unlink 侧（见
+        ``_unlink_quiet``）。
     """
     if stale_timeout is None:
         stale_timeout = memory_config.get("lock_timeout")
@@ -67,19 +88,21 @@ def acquire_lock(lock_path: Path, stale_timeout: float | None = None) -> bool:
                 json.dump({"pid": os.getpid(), "time": time.time()}, f)
             _lock_state.depth = 1
             return True
-        except FileExistsError:
-            try:
-                with open(lock_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if time.time() - data.get("time", 0) > stale_timeout:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except (json.JSONDecodeError, OSError):
-                lock_path.unlink(missing_ok=True)
-                continue
-            time.sleep(0.2)
-            if time.time() - start > stale_timeout:
-                return False
+        except (FileExistsError, PermissionError):
+            pass  # 锁被占用：交给下面的陈旧检测
+        # 读内容判是否陈旧。读不到 / 解析不了 ⇒ 按损坏锁回收（R3c 口径）；
+        # 但**回收动作本身**也可能因占用失败，必须静默，绝不让异常逃逸。
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            stale = time.time() - data.get("time", 0) > stale_timeout
+        except (json.JSONDecodeError, OSError):
+            stale = True
+        if stale:
+            _unlink_quiet(lock_path)
+        time.sleep(0.2)
+        if time.time() - start > stale_timeout:
+            return False
     return False
 
 

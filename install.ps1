@@ -68,8 +68,9 @@ if (-not (Test-Path $memDir)) {
 Write-Host "[OK] 记忆库目录: $memDir" -ForegroundColor Green
 
 # 4. Copy template files
-#    ⚠️ 必须显式用 -Force 逐项复制：`Copy-Item "$templateDir\*"` 会**跳过隐藏项**，
-#    而 B6 之后生成的索引种子正是 `template\.记忆索引.md` —— 用 `*` 会静默漏拷。
+#    ⚠️ 必须显式用 -Force 逐项复制：`Copy-Item "$templateDir\*"` 会**跳过隐藏项**。
+#    v2.4.2 起索引种子已改回可见名 `记忆索引.md`，但这条规则仍要保留 ——
+#    模板目录里将来任何一个隐藏项都会因为 `*` 而被静默漏拷。
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $templateDir = Join-Path $scriptDir "template"
 if (Test-Path $templateDir) {

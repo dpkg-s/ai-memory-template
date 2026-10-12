@@ -60,8 +60,9 @@ mkdir -p "$MEM_DIR"
 echo "[OK] 记忆库目录: $MEM_DIR"
 
 # 4. Copy template files
-#    ⚠️ 用 `template/.` 而不是 `template/*`：shell 通配符**不含点文件**，而 B6 之后
-#    生成的索引种子正是 `template/.记忆索引.md` —— 用 `*` 会静默漏拷。
+#    用 `template/.` 而不是 `template/*`：这样连点文件（`.gitignore` 之类）也一并带上。
+#    ⚠️ v2.4.2 起索引种子已改回可见名 `记忆索引.md`，但这条规则仍要保留 ——
+#    模板目录里将来任何一个点文件都会因为 `*` 而被静默漏拷。
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -d "$SCRIPT_DIR/template" ]; then
     cp -r "$SCRIPT_DIR/template/." "$MEM_DIR/" 2>/dev/null || true

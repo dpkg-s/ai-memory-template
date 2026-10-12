@@ -186,7 +186,7 @@ check("B2-7a 篡改返回值不影响后续枚举",
 # =====================================================================
 # B2-8: _refresh_index 内容签名短路
 print("\n[B2-8] 索引刷新签名短路")
-idx = ROOT / ".记忆索引.md"     # B6：生成物自 2026-10-08 起带 `.` 前缀
+idx = ROOT / "记忆索引.md"      # v2.4.2：生成物回到可见名（B6 的 `.` 前缀已撤销）
 server._refresh_index()
 mt0 = idx.stat().st_mtime_ns
 server._refresh_index()

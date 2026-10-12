@@ -45,7 +45,8 @@ _SERVER_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SERVER_DIR))
 
 import server  # noqa: E402
-from yaml_io import strip_leading_frontmatter  # noqa: E402
+from yaml_io import (dump_yaml_frontmatter, parse_yaml_frontmatter,  # noqa: E402
+                     strip_leading_frontmatter)
 
 _passed: list[str] = []
 _failed: list[str] = []
@@ -198,6 +199,43 @@ def main() -> int:
         check(f"K-{t} 摘要不含 frontmatter 残留",
               "---" not in s.replace('summary: "', "", 1) and "title:" not in s,
               repr(s[:160]))
+
+    print("\n== L. 多行标量的转义往返（yaml_quote_scalar，2026-10-12）==")
+    # 缺陷形态：`needs_quote` 判据此前不含换行 ⇒ 含 `\n` 的值被当作**裸多行标量**写出，
+    # 解析时第二行因不含 `:` 被 `continue` 掉 —— 内容**无声消失**（实测：显式传两行
+    # summary，读回只剩第一行）。修法 = 判据纳入控制空白，escape 侧同步写 `\n`/`\r`/`\t`
+    # （解析端 yaml_unescape_double 本就认这几个转义）。
+    _multi = "第一行摘要\n第二行摘要尾巴"
+    _fm = dump_yaml_frontmatter({"title": "L", "summary": _multi})
+    check("L1 含换行的值被加引号（不再裸写多行）",
+          'summary: "' in _fm and _fm.count("\n") == 1, repr(_fm))
+    # ⚠️ 判据要落在**值**上：`_fm` 里本来就有 1 个裸换行（title 行与 summary 行之间的
+    # 分隔），只看「全文不含裸换行」会恒 FAIL —— 这是判据写错，不是产品问题。
+    check("L2 值内的换行被转义为 \\n 序列",
+          _fm.endswith('summary: "第一行摘要\\n第二行摘要尾巴"'), repr(_fm))
+    check("L3 解析回来逐字符相同",
+          parse_yaml_frontmatter(_fm).get("summary") == _multi,
+          repr(parse_yaml_frontmatter(_fm).get("summary")))
+    check("L4 二次往返幂等（不丢尾、不雪崩）",
+          parse_yaml_frontmatter(dump_yaml_frontmatter(parse_yaml_frontmatter(_fm))).get("summary") == _multi,
+          repr(parse_yaml_frontmatter(dump_yaml_frontmatter(parse_yaml_frontmatter(_fm))).get("summary")))
+    check("L5 制表符同样转义",
+          dump_yaml_frontmatter({"k": "a\tb"}) == 'k: "a\\tb"',
+          repr(dump_yaml_frontmatter({"k": "a\tb"})))
+    check("L6 普通标量行为不变（不加引号）",
+          dump_yaml_frontmatter({"k": "plain"}) == "k: plain",
+          repr(dump_yaml_frontmatter({"k": "plain"})))
+    check("L7 既有引号判据不回归（语法字符 / 首尾空格仍加引号）",
+          dump_yaml_frontmatter({"k": "a: b"}) == 'k: "a: b"'
+          and dump_yaml_frontmatter({"k": " x "}) == 'k: " x "',
+          repr(dump_yaml_frontmatter({"k": "a: b"})))
+
+    # 端到端：memory_write 传入多行 summary 必须**完整**落盘
+    server.memory_write("Norm_L", "正文。", summary=_multi, tags=["测试"])
+    _sum_lines = [l for l in read("Norm_L").splitlines() if l.startswith("summary:")]
+    check("L8 memory_write 后多行 summary 完整落盘",
+          len(_sum_lines) == 1 and "第二行摘要尾巴" in _sum_lines[0],
+          repr(_sum_lines))
 
     print("\n" + "=" * 54)
     print(f"==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")

@@ -345,15 +345,32 @@ def strip_leading_frontmatter(text: str) -> str:
 
 
 def yaml_quote_scalar(value: Any) -> str:
-    """Quote a scalar for YAML safety (handles colons, #, brackets, quotes, leading/trailing space)."""
+    """Quote a scalar for YAML safety.
+
+    判据覆盖：空串、首尾空白、YAML 语法字符（``: # [ ] { } , & * ? | < > = ! % @ ` " '``），
+    以及**换行/制表等控制空白**（2026-10-12 补）。
+
+    ⚠️ 控制空白这一条是**静默数据丢失**的修复，不是洁癖：
+    含 ``\\n`` 的值此前被当作裸多行标量写出 ——::
+
+        summary: 第一行摘要
+        第二行摘要尾巴          ← 这一行没有 ``:``，解析时被整行丢弃
+
+    ``parse_yaml_frontmatter`` 遇到不含 ``:`` 的行会 ``continue``，于是尾部内容
+    **无声消失**（实测：显式传入的两行 summary，读回只剩第一行）。escape 侧同步把
+    ``\\n``/``\\r``/``\\t`` 写成转义序列 —— 解析端 ``yaml_unescape_double`` 本就认
+    这几个转义，故「读-改-写」一轮后逐字节稳定、内容零损失。
+    """
     s = str(value)
     needs_quote = (
         s == ""
         or s.strip() != s
+        or "\n" in s or "\r" in s or "\t" in s
         or re.search(r'[:#\[\]\{\},&*?|<>=!%@`"\']', s) is not None
     )
     if needs_quote:
-        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        escaped = (s.replace("\\", "\\\\").replace('"', '\\"')
+                   .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
         return '"' + escaped + '"'
     return s
 

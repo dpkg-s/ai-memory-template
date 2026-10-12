@@ -11,7 +11,7 @@ Features:
 - 24 MCP tools: read/write/search/smart_search/list/recent/graph/context/
   orphans/stats, audit/doctor/schema_diff/index_draft/rebuild_links, batch tag &
   tier, heat-based tier suggestions, archive/restore/delete, in-place hot restart
-  (memory_restart), auto-generated MOC index (.记忆索引.md, hidden by B6)
+  (memory_restart), auto-generated MOC index (记忆索引.md, visible since v2.4.2)
 - YAML frontmatter, Obsidian wikilinks, automatic link extraction,
   title-based dedup upsert, file locking, cross-process cache invalidation,
   SQLite metadata index for O(1) title lookup
@@ -538,21 +538,31 @@ _DIR_FINGERPRINT: tuple = ()  # last seen vault fingerprint, for cross-process c
 _PARSE_COUNT = 0              # 累计 frontmatter 解析次数（B2 可观测性：增量是否真省了活）
 _INDEX_SIG: tuple | None = None  # 上次渲染索引的内容签名（见 _refresh_index）
 
-# ---- B6：生成物隐藏化（2026-10-08）-----------------------------------
+# ---- 索引文件名：v2.4.2 起恢复**可见名**（撤销 B6 的隐藏化）-------------
 # `记忆索引` 是库里**唯一**的纯生成物：每次写入后由 `_refresh_index` 整体重建，
-# 正文不含任何人工内容。给它加 `.` 前缀后：
-#   ① Obsidian 默认不显示点号开头的文件 ⇒ vault 根的人读区立刻干净；
-#   ② 与 EverOS 那套「人看的 / 框架派生的」分层对齐（`.atomic_facts/` 等）。
+# 正文不含任何人工内容。
+#
+# 历史：B6（2026-10-08）曾给它加 `.` 前缀（`.记忆索引.md`），理由是「Obsidian
+# 默认不显示点文件 ⇒ vault 根的人读区干净」。**该取舍在 v2.4.2 被推翻**，因为它
+# 换来的整洁远小于代价（以下三条均为实测，不是推断）：
+#   ① 全库 **25 篇**笔记用 `[[记忆索引]]` 引用索引 —— 改名后 stem 变成
+#      `.记忆索引`，这 25 条链接**全部变死链**（`memory_rebuild_links` 可复现）；
+#   ② **Obsidian 忽略点文件** ⇒ 索引在人侧**根本点不开**，MOC 的导航价值归零；
+#   ③ 人机可达性分叉：AI 靠 legacy 识别仍能 `memory_read("记忆索引")`，
+#      人却什么都看不到 —— 隐藏省下的只是文件树里的一格。
+# ⇒ 恢复可见名；生成物的身份改为靠 **frontmatter 的 title + tags** 标识，而不是
+#    靠文件名前缀。`_drop_legacy_index()` 负责把 B6 期间留下的隐藏名清掉。
 #
 # ⚠️ 三条必须同时成立，否则会造出「同名两条目」或「索引全变死链」：
 #   ① **文件名硬编码只允许出现在这一行**，其余一律走 `_index_path()`；
-#   ② 生成物**必须仍在 `_iter_entries()` 扫描范围内**（os.walk 不跳点文件）——
-#      改名时若顺手把它排除，`memory_read("记忆索引")`、graph、doctor 会一起失联；
+#   ② 生成物**必须仍在 `_iter_entries()` 扫描范围内**（`_iter_md_files` 既不剪
+#      点文件、也不剪根目录）—— 改名时若顺手把它排除，`memory_read("记忆索引")`、
+#      graph、doctor 会一起失联，而索引本身看起来「一切正常」；
 #   ③ `memory_rebuild_links` 的 `known` 必须同时收 `path.stem` —— MOC 用的是
-#      `_wiki_link`（**渲染 stem**），改名后 stem 变成 `.记忆索引`，只认 title 的
-#      判定会当场把新索引判成死链。
-_INDEX_FILENAME = ".记忆索引.md"
-_INDEX_LEGACY_FILENAME = "记忆索引.md"   # B6 之前的名字，仅供一次性迁移识别
+#      `_wiki_link`（**渲染 stem**）。回到可见名后 stem == title == `记忆索引`，
+#      恰好与全库那 25 篇 `[[记忆索引]]` 的写法一致，断链自动归零。
+_INDEX_FILENAME = "记忆索引.md"
+_INDEX_LEGACY_FILENAME = ".记忆索引.md"   # B6 期间的隐藏名，仅供一次性迁移识别
 _TAG_AUTO_MAP: dict[str, str] = {
     "python": "python", "py": "python", "flask": "python", "django": "python", "fastapi": "python",
     "javascript": "javascript", "js": "javascript", "typescript": "typescript", "ts": "typescript",
@@ -1563,16 +1573,20 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
 
 
 def _index_path() -> Path:
-    """自动生成索引的落盘路径（B6 起带 `.` 前缀，见 `_INDEX_FILENAME`）。"""
+    """自动生成索引的落盘路径（v2.4.2 起为可见名，见 `_INDEX_FILENAME`）。"""
     return MEMORY_DIR / _INDEX_FILENAME
 
 
 def _drop_legacy_index() -> None:
-    """一次性迁移（B6）：删掉旧名 `记忆索引.md`。
+    """一次性迁移（v2.4.2）：删掉 B6 期间的隐藏名 `.记忆索引.md`。
 
     只删「确认是生成物」的那份 —— frontmatter 的 title 必须是 `记忆索引`，且 tags
     命中 `moc`/`index`/`navigation`。若用户手工放了一份同名笔记（title 不同、
     或没有 moc 标签），**保留**：那是数据，不是生成物，删了就不可逆。
+
+    ⚠️ 调用点必须在**枚举条目之前**（见 `_refresh_index`）：若先枚举再删，首轮重建
+    会把即将消失的 `.记忆索引` 也渲染成一行 `[[.记忆索引|记忆索引]]`，凭空造出一条
+    指向不存在文件的索引行（doctor 报「死索引」）。
     """
     legacy = MEMORY_DIR / _INDEX_LEGACY_FILENAME
     if not legacy.exists():
@@ -1580,19 +1594,42 @@ def _drop_legacy_index() -> None:
     try:
         meta, _ = _load_memory(legacy)
     except Exception as e:                                   # noqa: BLE001
-        logger.warning("B6 迁移跳过 %s（无法解析 frontmatter：%s）", legacy.name, e)
+        logger.warning("索引迁移跳过 %s（无法解析 frontmatter：%s）", legacy.name, e)
         return
     tags = {str(t).lower() for t in _entry_tags(meta)}
     if _entry_title(meta, legacy) != "记忆索引" or not (tags & {"moc", "index", "navigation"}):
-        logger.warning("B6 迁移跳过 %s（疑似人工文件，不是生成物）", legacy.name)
+        logger.warning("索引迁移跳过 %s（疑似人工文件，不是生成物）", legacy.name)
         return
     try:
         legacy.unlink()
         _idx_remove_path(legacy)
-        logger.info("B6 迁移：已删除旧名生成物 %s（生成物现为 %s）",
+        logger.info("索引迁移：已删除隐藏名生成物 %s（生成物现为 %s）",
                     legacy.name, _INDEX_FILENAME)
     except OSError as e:
-        logger.warning("B6 迁移失败 %s：%s", legacy.name, e)
+        logger.warning("索引迁移失败 %s：%s", legacy.name, e)
+
+
+_INDEX_SUMMARY_MAX = 60   # 索引行尾摘要的字符上限（v2.4.2）
+
+
+def _index_summary(meta: dict[str, Any]) -> str:
+    """索引条目行尾的摘要片段（v2.4.2）。
+
+    `_refresh_index` 此前只渲染 `[[stem|title]]`，索引就只是**标题清单** —— 读的人
+    看到 274 个标题仍不知道哪一篇是自己要找的，只能逐篇 `memory_read`。补上
+    frontmatter 的 `summary` 后，一次读入即可初筛（这也是「AI 在库里的索引路径」
+    里 P1=索引 MOC 这条路径从「能用」变「好用」的关键一步）。
+
+    ⚠️ 必须**压平空白**：summary 里带换行会把一行 MOC 条目劈成两行，破坏「一行为一
+    条目」的读法（也是 `_extract_wiki_links` 逐行解析的前提）。
+    """
+    raw = meta.get("summary", "")
+    if not isinstance(raw, str):
+        return ""
+    flat = " ".join(raw.split())
+    if len(flat) > _INDEX_SUMMARY_MAX:
+        flat = flat[:_INDEX_SUMMARY_MAX] + "…"
+    return flat
 
 
 def _refresh_index() -> None:
@@ -1601,25 +1638,31 @@ def _refresh_index() -> None:
     Called after every successful memory_write so the index stays in sync
     without manual maintenance (improvement #7).
 
-    B2（2026-10-08）：加内容签名短路。索引正文只由 (bucket, stem, title) 三元组
-    决定，三者全未变时重建只会产出逐字节相同的结果 ⇒ 跳过渲染与写盘。
+    B2（2026-10-08）：加内容签名短路。索引正文只由 (bucket, stem, title, summary)
+    决定，四者全未变时重建只会产出逐字节相同的结果 ⇒ 跳过渲染与写盘。
 
-    B6（2026-10-08）：落盘名改 `.记忆索引.md`（见 `_INDEX_FILENAME`）；写完顺带
-    清掉旧名 —— 迁移机会只有这里，因为只有这里会（重）建生成物。
+    v2.4.2（2026-10-12）：
+      ① 落盘名回到**可见**的 `记忆索引.md`（撤销 B6 隐藏化，理由见 `_INDEX_FILENAME`）；
+         迁移（删隐藏名残留）挪到**枚举之前** —— 否则首轮重建会把即将被删的
+         `.记忆索引` 也渲染成一行，凭空造出一条死链；
+      ② 条目行追加 frontmatter 的 `summary`（见 `_index_summary`），索引由「标题清单」
+         升级为「带摘要的 MOC」；`summary` 因此必须进内容签名，否则改摘要不触发重建。
     """
     global _INDEX_SIG
     try:
+        _drop_legacy_index()      # 必须先于枚举：见 docstring ①
         entries = _iter_entries()
         # `dirs` 在循环外取一次：`_known_dirs()` 要扫 vault 根目录，逐篇调用等于
         # 把 250 次目录枚举压进一次索引重建。
         dirs = _known_dirs()
-        groups: dict[str, list[tuple[Path, str]]] = {}
-        sig_parts: list[tuple[str, str, str]] = []
+        groups: dict[str, list[tuple[Path, str, str]]] = {}
+        sig_parts: list[tuple[str, str, str, str]] = []
         for path, meta, _body in entries:
             title = _entry_title(meta, path)
             bucket, _reason = _entry_bucket(meta, path, dirs)
-            groups.setdefault(bucket, []).append((path, title))
-            sig_parts.append((bucket, path.stem, title))
+            summary = _index_summary(meta)
+            groups.setdefault(bucket, []).append((path, title, summary))
+            sig_parts.append((bucket, path.stem, title, summary))
         # tier / updated / 正文篇幅等变化都不改变索引正文，故一律不纳入签名。
         # ⚠️ 短路必须同时要求文件存在 —— 索引被外部删除时签名同样「未变」，
         #    而那时恰恰需要重建。
@@ -1636,12 +1679,15 @@ def _refresh_index() -> None:
             if not items:
                 continue
             lines.append(f"## {bucket}")
-            uniq: dict[str, tuple[Path, str]] = {}
-            for path, title in items:
-                uniq.setdefault(path.stem, (path, title))
+            uniq: dict[str, tuple[Path, str, str]] = {}
+            for path, title, summary in items:
+                uniq.setdefault(path.stem, (path, title, summary))
             for stem in sorted(uniq, key=lambda s: uniq[s][1].lower()):
-                path, title = uniq[stem]
-                lines.append("- " + _wiki_link(path, title))
+                path, title, summary = uniq[stem]
+                line = "- " + _wiki_link(path, title)
+                if summary:
+                    line += " — " + summary
+                lines.append(line)
             lines.append("")
         body = "\n".join(lines).rstrip()
         if idx_path.exists():
@@ -1651,7 +1697,6 @@ def _refresh_index() -> None:
                     "tier": "warm", "source": "ai-memory-server"}
         meta["updated"] = datetime.now(timezone.utc).isoformat()
         _atomic_write_text(idx_path, f"---\n{_dump_yaml_frontmatter(meta)}\n---\n\n{body}")
-        _drop_legacy_index()
     except Exception as e:
         logger.warning("_refresh_index failed: %s", e)
 
@@ -2055,11 +2100,12 @@ def memory_rebuild_links() -> str:
     all_entries = _iter_entries()
     # A3：入库标识集合同时收 title 与 permalink —— 指向「改名前的旧标识」的双链
     # 因此不再被误报为死链（permalink 的稳定意义正在于此）。
-    # B6（2026-10-08）：**必须**再收 path.stem —— 生成器渲染双链走 `_wiki_link`，
-    # 而它按 Obsidian 口径**用 stem 当 target**（`[[stem|title]]`）。此前判定只认
-    # title，于是「title ≠ stem」的条目在索引里一律被误报死链（36 篇），改名后的
-    # `.记忆索引` 更会当场新增一条。此处的 `known` 因此与 `_entry_matches` 的
+    # **必须**再收 path.stem —— 生成器渲染双链走 `_wiki_link`，而它按 Obsidian 口径
+    # **用 stem 当 target**（`[[stem|title]]`）。此前判定只认 title，于是「title ≠ stem」
+    # 的条目在索引里一律被误报死链（36 篇）。此处的 `known` 因此与 `_entry_matches` 的
     # 「permalink → title → stem」查找链**保持同一口径**。
+    # （v2.4.2 索引改回可见名后 stem == title == `记忆索引`，但 title≠stem 的条目仍有
+    #   36 篇，这条口径不可省。）
     known: set[str] = set()
     for f, meta, _b in all_entries:
         known.add(_entry_title(meta, f))
@@ -2175,12 +2221,27 @@ def _bigram_fallback(keyword_lower: str, tag: str | None, mem_type: str | None,
     return lines, len(ranked), hidden
 
 
+def _updated_sort_key(meta: dict[str, Any]) -> str:
+    """「最近优先」排序键（v2.4.2）：`updated` 缺失或非字符串时回退空串。
+
+    空串在**降序**排列里自然落到末尾，正合「没有时间戳的条目排在有时间戳的之后」，
+    且不必把 `None` 混进比较（`str` 与 `None` 相比会 TypeError）。
+    """
+    value = meta.get("updated", "")
+    return value if isinstance(value, str) else ""
+
+
 @mcp.tool(annotations=_RO)
 def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                   mem_type: str | None = None,
                   scope: str | None = None, project: str | None = None,
                   status: str | None = None) -> str:
     """Search memories by keyword across title, tags, and body (recent-first).
+
+    `recent-first` 在 v2.4.2 之前只是**名义上的** —— 实现排的是「路径字符串倒序」，
+    与时间无关（实测聚合页 `近期工作动态` 在 274 条里排第 51 位，而子目录条目的路径
+    前缀整体压过根目录条目）。现按 frontmatter 的 `updated` **真倒序**：缺失 `updated`
+    的条目排末尾，同一时间戳内按相对路径定序（保证跨次调用可复现）。
 
     limit caps the number of returned matches (default 20). Keyword occurrences
     in the body snippet are wrapped in ** for visibility.
@@ -2194,7 +2255,6 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     if not keyword or not keyword.strip():
         return "错误：搜索关键词不能为空。"
     _t0 = time.perf_counter()
-    results: list[str] = []
     hidden = 0
     keyword_lower = keyword.lower()
     archive_dir = MEMORY_DIR / ".archive"
@@ -2203,8 +2263,13 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     if archive_dir.exists():
         search_dirs.append(archive_dir)
 
+    # v2.4.2：旧实现是 `sorted(_iter_md_files(search_dir), reverse=True)` —— 排的是
+    # **路径字符串**，与「最近」毫无关系，且结果稳定（稳定 ⇒ 看起来「确实有排序」，
+    # 反而更难发现它是错的）。改为按 `updated` 排序后就不能再「边遍历边截断」，
+    # 必须**先收全再排** ⇒ 这里显式收集候选行 `hits`。
+    hits: list[tuple[str, str, str]] = []      # (updated, relpath, 渲染行)
     for search_dir in search_dirs:
-        for f in sorted(_iter_md_files(search_dir), reverse=True):
+        for f in _iter_md_files(search_dir):
             try:
                 meta, body = _load_memory(f)
             except Exception:
@@ -2249,9 +2314,14 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
                 tags_display = ", ".join(entry_tags)
                 summary_display = f"\n  {summary}" if summary else ""
 
-                results.append(
-                    f"- [{title}] ({f.name}) | {tags_display} | tier={tier} | reads={count}{source_info}{cred_info}{summary_display}{context}"
-                )
+                hits.append((
+                    _updated_sort_key(meta), f.as_posix(),
+                    f"- [{title}] ({f.name}) | {tags_display} | tier={tier} | reads={count}{source_info}{cred_info}{summary_display}{context}",
+                ))
+
+    # 降序 ⇒ 最近更新的在前；relpath 作 tie-break，使同刻条目次序确定（可断言）。
+    hits.sort(key=lambda h: (h[0], h[1]), reverse=True)
+    results: list[str] = [h[2] for h in hits]
 
     if not results:
         # #4 检索增强：精确子串零命中 → 用字符 bigram 兜底（覆盖自然语言长句），
@@ -3017,7 +3087,7 @@ def memory_index_draft() -> str:
         bucket, _reason = _entry_bucket(meta, path, dirs)
         groups.setdefault(bucket, []).append((path, title))
 
-    lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `.记忆索引.md`。", ""]
+    lines = ["# 记忆索引（半自动草稿）", "", "> 这个草稿由 MCP 自动扫描生成，建议人工确认后再回写到 `记忆索引.md`。", ""]
 
     for bucket in _bucket_order(groups):
         items = groups.get(bucket, [])
@@ -3237,7 +3307,7 @@ _HEAT_HOT_MIN = memory_config.DEFAULTS["heat_hot_min"]                # 高于�
 def _heat_tier_decision(title: str, current_tier: str, score: float) -> str | None:
     """按热度分数给出该条应有的 tier；返回 None 表示维持现状。
 
-    核心页（CORE_PAGES）一律豁免：它们由人工或生成器维护（如 `.记忆索引.md`
+    核心页（CORE_PAGES）一律豁免：它们由人工或生成器维护（如 `记忆索引.md`
     每次写入都会重建），自动改 tier 没有意义。这与 `_maybe_auto_archive`
     的核心页保护同源，也避免出现「预览清单里有核心页、执行时却被跳过」的
     不一致 —— 豁免发生在判据内部，两处行为天然一致。
@@ -3688,7 +3758,7 @@ def memory_orphans(output_format: str | None = None) -> str:
     # ⚠️ 链接 target 必须**先解析回条目**再计入反链。正文里的 `[[X]]` 有三种合法写法：
     # title、文件名 stem（`_wiki_link` 生成器渲染的就是 stem）、以及 A3 的 permalink
     # （改名前的旧标识）。直接拿 target 当 key 会造成两类误报：
-    #   ① 生成索引 `.记忆索引` 里的 `[[stem|title]]` 对「title≠stem」的条目**压根连不上**，
+    #   ① 生成索引 `记忆索引` 里的 `[[stem|title]]` 对「title≠stem」的条目**压根连不上**，
     #      于是那些条目全被算成孤立（与 B6 修掉的死链误报同型）；
     #   ② {title} / {stem} 之类的模板占位文本会被当成真实链接目标，凭空造出反链。
     id2title: dict[str, str] = {}
@@ -3706,7 +3776,7 @@ def memory_orphans(output_format: str | None = None) -> str:
         if t not in backlink_index:
             backlink_index[t] = []
         if t in _CONTEXT_SKIP_TITLES:
-            # 生成页（`.记忆索引`）的链接只是**全库罗列**，不是真实引用。把它算作
+            # 生成页（`记忆索引`）的链接只是**全库罗列**，不是真实引用。把它算作
             # 引用方的话，所有条目都"被引用过" ⇒ 孤立数恒为 0，工具直接失去意义。
             # 这与 memory_context（周边遍历排除生成页）、memory_stats 的豁免同源。
             continue

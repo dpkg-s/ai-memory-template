@@ -5,6 +5,26 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-10-12
+
+> 版本号说明：本版内容原计划随 `2.4.3` 发布，并入本版后改用 **minor** 号 —— 依赖下限从 `mcp>=1.27` 提到 `mcp>=1.30` 会**直接改变使用者的安装结果**（`mcp<1.30` 的环境将装不上），不属 patch 语义。
+
+本版只有一处实质改动：**把运行时依赖下限从 `mcp>=1.27` 提到 `mcp>=1.30`**，并同步散落在安装脚本与文档里的版本引用。上游 **1.x 线已进入维护模式**（此后仅收安全修复），1.30.0 是其最后一版 —— 停在 1.27.2 等于停在维护线的更早位置。
+
+### Changed
+
+- **`requirements.txt`：`mcp>=1.27,<2` → `mcp>=1.30,<2`**。`install.sh` 4 处、`install.ps1` 4 处、`README.md` 3 处，共 **12 处**引用同步。⚠️ 上界 `<2` **保持不变** —— 2.x 的迁移成本不在那两行 import，而在 `memory_restart` 依赖的 `InitializationState` 已被删除（属重写自研补丁，非改名）。
+- **README 测试计数校正为 1000**：正文原写 964、徽章原写 998，**三处互不一致**。本次按 25 套实测逐项重算（`recovery` 35→36、`frontmatter_norm` 41→49、`dir_policy` 71→82、`index_name` 33→49，其余不变，合计 1000），并把 `隐藏索引与迁移` 正名为 `索引命名与迁移`（v2.4.2 已把索引改回可见名）。徽章 Version 由滞后的 `2.4.1` 改为 `2.5.0`。
+- README 版本上界说明补记**第二处破坏点**：2.x 除删除 `FastMCP` 外还删除了 `InitializationState`，`memory_restart` 的会话恢复补丁同样会失效。
+
+### Dependencies
+
+- `mcp>=1.30,<2`（下限 +0.3）。**升级依据（隔离 venv 实测，非推断）**：
+  - `mcp.server.fastmcp` / `mcp.server.session.InitializationState` / `mcp.types.ToolAnnotations` 在 1.30.0 上**全部在位**；
+  - `FastMCP.__init__` 参数 **27 → 30**，新增 `session_idle_timeout` / `max_sessions`（对将来的 HTTP 远程化是直接的 DoS 面收敛）；
+  - 全量回归 **25 套 / 1000 断言全绿、退出码全 0**（含 `test_restart.py` 对会话恢复补丁的 26 项验证）。
+- `requirements-dev.txt` 无变化（`pytest>=8.0` + `ruff>=0.5`）。
+
 ## [2.4.2] - 2026-10-12
 
 本版是一次**回退式修正 + 两处「名不副实」清算**。v2.4.0 把自动生成的 MOC 索引用 `.` 前缀藏了起来（B6），换来「Obsidian 文件树干净」；实测这笔交易的代价远大于收益 —— 全库 25 篇笔记用 `[[记忆索引]]` 引用索引，而 Obsidian 按**文件名 stem** 解析双链，改名后这些链接在人侧**全部点不开**，索引本身也点不开。本版把索引改回可见名，并顺带修掉两处让工具「看起来能用、实际不好用」的缺陷：`memory_search` 的 `recent-first` 其实是路径字符串倒序，索引只有标题没有内容线索。另修一个**静默数据丢失**：含换行的标量写进 frontmatter 后，第二行起会被无声丢掉。
@@ -349,7 +369,10 @@
 - 跨平台安装脚本：Windows PowerShell + Linux/macOS bash
 - 零外部依赖：仅需 Python 3.10+ 与 `mcp` 包
 
-[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.2...v2.5.0
+[2.4.2]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.1...v2.4.2
+[2.4.1]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/dpkg-s/ai-memory-template/releases/tag/v2.2.0

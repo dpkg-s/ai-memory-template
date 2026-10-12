@@ -6,10 +6,10 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.4.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-998%20assertions-brightgreen)](#测试与-ci)
+[![Tests](https://img.shields.io/badge/tests-1000%20assertions-brightgreen)](#测试与-ci)
 
 ---
 
@@ -272,7 +272,7 @@ heat_hot_min = 3.0            # 升为 hot 的热度下限
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **964 条断言的二十五层测试**：语义回归 29 + 全工具冒烟 32 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 35 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 41 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 71 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 79 + 隐藏索引与迁移 33 + JSON 输出 76 + 模块分层守卫 35
+- **1000 条断言的二十五层测试**：语义回归 29 + 全工具冒烟 32 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 36 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 49 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 82 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 79 + 索引命名与迁移 49 + JSON 输出 76 + 模块分层守卫 35
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py` / `memory_index.py` / `memory_config.py`，可观测层拆为 `metrics.py`；`tests/test_import_layers.py` 用手写 AST 守卫钉住分层（叶子模块不得反向依赖 `server.py`、本地模块之间不得成环），**不引入任何打包元数据**
 
@@ -283,10 +283,12 @@ v2.0.0 起，仓库自带测试与持续集成：
 ### 环境要求
 
 - **Python 3.10+**
-- 运行时依赖：`pip install -r requirements.txt`（仅 `mcp`，约束为 `mcp>=1.27,<2`）
+- 运行时依赖：`pip install -r requirements.txt`（仅 `mcp`，约束为 `mcp>=1.30,<2`）
 - 开发/测试额外依赖：`pip install -r requirements-dev.txt`
 
-> **注意版本上界**：依赖锁定在 `mcp<2`。mcp 2.x 已将 `FastMCP` 更名为 `MCPServer`，装到 2.x 会直接 import 失败。
+> **注意版本上界**：依赖锁定在 `mcp<2`。mcp 2.x 已将 `FastMCP` 更名为 `MCPServer`（`mcp.server.fastmcp` 模块整个被删），装到 2.x 会直接 import 失败；若使用了 `memory_restart`，2.x 还移除了 `InitializationState`，其会话恢复补丁同样会失效。
+>
+> **版本下限 1.30**：`mcp.server.fastmcp` / `mcp.server.session.InitializationState` / `mcp.types.ToolAnnotations` 在 1.30.0 上均完好（实测 25 套 / 1000 断言全绿），并新增 `session_idle_timeout` / `max_sessions` 两个 HTTP 会话治理参数。注意 **1.x 线已进入维护模式**，上游此后仅收安全修复。
 
 ### 方式一：交给 AI 助手自动部署（推荐）
 
@@ -306,7 +308,7 @@ https://github.com/dpkg-s/ai-memory-template
 
 ### 方式二：安装脚本
 
-脚本会依次：安装 `mcp` 包（`mcp>=1.27,<2`）→ 创建 `~/ai-memory/` → 复制初始模板与规则 → 复制 `server.py` 及其依赖模块 → 打印各平台的 MCP 配置片段。
+脚本会依次：安装 `mcp` 包（`mcp>=1.30,<2`）→ 创建 `~/ai-memory/` → 复制初始模板与规则 → 复制 `server.py` 及其依赖模块 → 打印各平台的 MCP 配置片段。
 
 **安装脚本会改动你的系统状态，请选择你愿意承担的方式：**
 
@@ -1020,7 +1022,7 @@ CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py
 多数客户端需要**重启**才会加载新的 MCP 配置。若仍无效，检查配置文件里的 `command` 是否为可用的 Python 解释器绝对路径（推荐绝对路径，避免 PATH 差异）。
 
 **`ImportError: cannot import name 'FastMCP'`？**
-装到了 mcp 2.x。执行 `pip install "mcp>=1.27,<2"` 降回 1.x 即可。
+装到了 mcp 2.x。执行 `pip install "mcp>=1.30,<2"` 降回 1.x 即可。
 
 **AI 记不住东西，或者写入报错？**
 先让 AI 调用 `memory_stats` 确认连通。再确认记忆库目录有写权限（默认 `~/ai-memory`）。

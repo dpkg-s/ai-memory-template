@@ -5,7 +5,7 @@
 #  安全声明 / SECURITY NOTICE —— 运行前请先读完
 # ============================================================================
 #  本脚本会做三件改变你系统状态的事：
-#    1. 用 pip 安装 Python 包 mcp（版本约束 mcp>=1.27,<2）
+#    1. 用 pip 安装 Python 包 mcp（版本约束 mcp>=1.30,<2）
 #    2. 创建记忆库目录 ~/ai-memory 并写入初始模板
 #    3. 把 server.py 及其同目录的 .py 模块复制进该目录
 #  它不会：读取或上传你的任何文件、修改 shell 配置文件、请求 sudo、
@@ -46,9 +46,9 @@ echo "[OK] Python: $VER"
 if [ "${AI_MEMORY_SKIP_PIP:-0}" = "1" ]; then
     echo "[SKIP] 按要求跳过 mcp 安装（AI_MEMORY_SKIP_PIP=1）"
 else
-    echo "[...] 安装 mcp 包（mcp>=1.27,<2）..."
-    if ! $PY -m pip install "mcp>=1.27,<2" -q; then
-        echo "[FAIL] mcp 安装失败。请检查网络，或手动执行：$PY -m pip install \"mcp>=1.27,<2\""
+    echo "[...] 安装 mcp 包（mcp>=1.30,<2）..."
+    if ! $PY -m pip install "mcp>=1.30,<2" -q; then
+        echo "[FAIL] mcp 安装失败。请检查网络，或手动执行：$PY -m pip install \"mcp>=1.30,<2\""
         exit 1
     fi
     echo "[OK] mcp 安装完成"

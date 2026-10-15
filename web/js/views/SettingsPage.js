@@ -4,6 +4,7 @@ import { loadAbout, loadHealth, loadOverview, loadTools } from "../core/data.js"
 import { S, askConfirm, toast } from "../core/store.js";
 import { FNS_FIELD_LABEL, parseFnsPayload } from "../features/fnsImport.js";
 import { loadThresholds, saveThresholds } from "../features/settings.js";
+import { applyUpdate, loadUpdate, restartBackend } from "../features/update.js";
 
 var SETTINGS_TABS = [
   { id: "conn", label: "连接", icon: "link" },
@@ -41,6 +42,9 @@ var SettingsPage = {
     },
     thKeys: function () {
       return this.th && this.th.data ? Object.keys(this.th.data.keys) : [];
+    },
+    upd: function () {
+      return S.update.data || {};
     },
   },
   methods: {
@@ -201,8 +205,76 @@ var SettingsPage = {
       if (label && desc) return label + "：" + desc;
       return desc || label;
     },
+
+    /* ---------- 版本与更新（2026-10-15） ----------
+       状态文案与配色全部**派生自服务端返回的字段**（fetched / behind /
+       untracked / can_apply）。前端不重新判断「有没有更新」—— 那种判据一旦
+       在这里复制一份，就会与服务端的白名单与分叉逻辑各说各话。 */
+    checkUpdate: function (withFetch) {
+      loadUpdate(withFetch !== false);
+    },
+    doUpdate: function (force) {
+      applyUpdate(force);
+    },
+    restartBackend: restartBackend,
+    updKind: function () {
+      var d = S.update.data;
+      if (!d || !d.is_repo) return "";
+      if (d.untracked && d.untracked.length) return "warn";
+      if (!d.fetched) return "";
+      if (d.behind > 0 && !d.can_apply) return "err";
+      if (d.behind > 0) return "warn";
+      return "ok";
+    },
+    updText: function () {
+      var d = S.update.data;
+      if (!d) return "未读取";
+      if (!d.is_repo) return "不是 git 仓库";
+      if (d.untracked && d.untracked.length)
+        return "有 " + d.untracked.length + " 个文件未入库";
+      if (!d.fetched) return "本地 " + (d.local_short || "?");
+      if (d.behind > 0) return "落后 " + d.behind + " 个提交";
+      return "已是最新";
+    },
+    localLabel: function () {
+      var d = S.update.data || {};
+      if (!d.local_sha) return "";
+      return (
+        (d.version ? "v" + d.version + "  " : "") +
+        (d.local_short || "") +
+        (d.branch ? "  (" + d.branch + ")" : "")
+      );
+    },
+    remoteLabel: function () {
+      var d = S.update.data || {};
+      if (!d.remote_sha) return "（未检查）";
+      return (d.remote_version ? "v" + d.remote_version + "  " : "") + (d.remote_short || "");
+    },
+    /* 差异状态 → 徽章配色（A 新增 / D 删除 / M 修改）。 */
+    statusKind: function (s) {
+      return s === "D" ? "err" : s === "A" ? "ok" : "info";
+    },
+    /* 长清单只预览前 8 项 —— 整列铺开会把卡片撑爆。 */
+    untrackedPreview: function () {
+      var a = (S.update.data || {}).untracked || [];
+      return a.slice(0, 8).join("、") + (a.length > 8 ? " …（共 " + a.length + " 个）" : "");
+    },
+    conflictsPreview: function () {
+      var a = (S.update.data || {}).conflicts || [];
+      return a.slice(0, 8).join("、") + (a.length > 8 ? " …（共 " + a.length + " 个）" : "");
+    },
   },
   watch: {
+    /* 「关于」页那张版本与更新卡需要数据，但加载点**不能放在 pick()**里：
+       深链直达（#/settings?tab=about）由 `Root.mounted` 直接赋值
+       `S.settingsTab`，压根不经过 pick ⇒ 卡片会是空的（本机实测踩到）。
+       放在对 S.settingsTab 的 watch 上，两条路径就都覆盖了。 */
+    "S.settingsTab": {
+      handler: function (v) {
+        if (v === "about") loadUpdate(false);
+      },
+      immediate: true,
+    },
     "S.about": {
       handler: function (v) {
         if (v && v.resolved) {
@@ -360,9 +432,85 @@ var SettingsPage = {
     '      <div class="divider"></div>' +
     '      <x-banner icon="shield">' +
     '        <div><b>三道闸门</b><div class="small">① 破坏性工具执行前二次确认；② 删除走回收站（可 <span class="mono">memory_restore</span> 找回）；③ 审计记录写在 vault 之外。</div></div></x-banner>' +
-    '      <div class="hint">控制台不直连 vault、不在进程内直调：对记忆库的一切读写都走完整 MCP 协议，因此与其它 AI 客户端共享同一把锁与同一套索引维护。</div>' +
-    '    </x-card>' +
-    "  </div>" +
+'      <div class="hint">控制台不直连 vault、不在进程内直调：对记忆库的一切读写都走完整 MCP 协议，因此与其它 AI 客户端共享同一把锁与同一套索引维护。</div>' +
+'    </x-card>' +
+
+/* -------- 版本与更新（2026-10-15，方案 A：关于页内嵌，骨架零变更） --------
+   设计口径：
+     · 状态与配色全部派生自服务端字段（fetched / behind / untracked / can_apply），
+       前端不复制「有没有更新」这套判据。
+     · git 的报错原文（stderr）原样呈现，不做美化 —— 沙箱/代理/主机密钥问题
+       只有原文能定位。
+     · 「重启后端」独立于更新：只换前端时不必重启，换后端模块才需要。 */
+'    <x-card class="mt" title="版本与更新">' +
+'      <template #head>' +
+'        <x-pill mono>git</x-pill>' +
+'        <x-pill :kind="updKind()">{{ updText() }}</x-pill>' +
+'      </template>' +
+'      <template #actions>' +
+'        <button class="btn btn-sm" :class="{loading:S.update.loading}" @click="checkUpdate(false)">只读本地</button>' +
+'        <button class="btn btn-sm btn-primary" :class="{loading:S.update.loading}" @click="checkUpdate(true)">检查更新</button>' +
+'      </template>' +
+
+'      <x-kv>' +
+'        <x-kv-row label="程序目录" mono :value="upd.root"></x-kv-row>' +
+'        <x-kv-row label="远端仓库" mono :value="upd.remote_url"></x-kv-row>' +
+'        <x-kv-row label="本地版本" mono :value="localLabel()"></x-kv-row>' +
+'        <x-kv-row label="远端版本" mono :value="remoteLabel()"></x-kv-row>' +
+'      </x-kv>' +
+
+'      <x-banner kind="err" icon="alert" v-if="upd.error">' +
+'        <div><b>检查未完成</b>' +
+'          <div class="small">{{ upd.error }}</div>' +
+'          <div class="small mono" style="white-space:pre-wrap" v-if="upd.stderr">{{ upd.stderr }}</div>' +
+'        </div></x-banner>' +
+
+'      <x-banner kind="warn" icon="alert" v-else-if="upd.untracked && upd.untracked.length">' +
+'        <div><b>有 {{ upd.untracked.length }} 个文件未纳入版本控制</b>' +
+'          <div class="small">远端不会有这些文件，更新不会触及它们。</div>' +
+'          <div class="small mono">{{ untrackedPreview() }}</div>' +
+'        </div></x-banner>' +
+
+'      <x-banner kind="warn" icon="alert" v-else-if="upd.fetched && upd.behind > 0 && !upd.can_apply">' +
+'        <div class="small">{{ upd.blocked_reason }}</div></x-banner>' +
+
+'      <x-banner kind="warn" icon="alert" v-if="upd.conflicts && upd.conflicts.length">' +
+'        <div><b>{{ upd.conflicts.length }} 个文件有本地未提交改动</b>' +
+'          <div class="small">直接更新会丢弃这些改动；如需覆盖请用「强制覆盖」（会先备份）。</div>' +
+'          <div class="small mono">{{ conflictsPreview() }}</div>' +
+'        </div></x-banner>' +
+
+'      <div v-if="upd.changed && upd.changed.length">' +
+'        <div class="hint mt">待更新 {{ upd.changed.length }} 个文件</div>' +
+'        <div class="list" style="max-height:200px;overflow:auto">' +
+'          <div class="list-item" v-for="c in upd.changed" :key="c.path">' +
+'            <x-pill mono :kind="statusKind(c.status)">{{ c.status }}</x-pill>' +
+'            <span class="mono small">{{ c.path }}</span>' +
+'          </div>' +
+'        </div>' +
+'      </div>' +
+
+'      <x-banner kind="ok" icon="check" v-if="S.update.result && S.update.result.ok && !S.update.result.up_to_date">' +
+'        <div><b>已更新 {{ (S.update.result.written || []).length }} 个文件</b>' +
+'          <div class="small">备份：{{ S.update.result.backup || "（没有文件被覆盖）" }}</div>' +
+'          <div class="small" v-if="S.update.result.restart_required">后端模块已变化，需重启后端才能生效。</div>' +
+'        </div></x-banner>' +
+
+'      <x-banner kind="warn" icon="alert" v-if="S.update.reconnecting">' +
+'        <div>正在等待后端恢复… 剩余 {{ S.update.seconds }} 秒</div></x-banner>' +
+
+'      <div class="center wrap mt">' +
+'        <button class="btn btn-primary" :class="{loading:S.update.applying}" :disabled="!upd.changed_count" @click="doUpdate(false)">执行更新</button>' +
+'        <button class="btn btn-danger" v-if="upd.conflicts && upd.conflicts.length" :class="{loading:S.update.applying}" @click="doUpdate(true)">强制覆盖</button>' +
+'        <button class="btn btn-ghost" :class="{loading:S.update.restarting}" @click="restartBackend">重启后端</button>' +
+'      </div>' +
+
+'      <div class="hint mt">' +
+'        <div>更新只覆盖<b>程序文件</b>（后端运行时模块 + 前端 web/），不触碰 vault 数据与任何 .md 笔记。</div>' +
+'        <div>覆盖前逐个备份到程序目录下的 <span class="mono">.ai-memory-backup/</span>；版本库里没有的文件不会被更新。</div>' +
+'      </div>' +
+'    </x-card>' +
+"  </div>" +
     "    </div>" +
     "  </div>" +
     "</div>",

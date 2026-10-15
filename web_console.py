@@ -50,6 +50,18 @@
   ``AI_MEMORY_WEB_CONFIG_WRITE=0`` 关闭为只读。
 * **绝不触碰 ``*.md``**。
 
+更新面（2026-10-15）
+--------------------
+* 「更新」= 从 git 远端把**白名单内**的文件取到当前工作区（后端运行时模块 +
+  ``web/``），清单见 ``UPDATE_PATHS``。
+* 用 ``git restore --source=<ref> --worktree``：只写工作区，不碰 HEAD、不碰 index；
+  **行尾转换交给 git**（本机 ``core.autocrlf=true``，前端 ``.js``/``.css``/``.html``
+  在工作区是 CRLF，任何"读对象再自己写盘"的实现都会把行尾改错）。
+* 白名单内**未纳入版本控制**的文件，远端不会有它们 ⇒ 界面显式报「N 个文件未入库」，
+  而不是显示「已是最新」。
+* 重启后端由桌面 launcher 接手（``ai_memory_web.py restart``）：控制台在把响应写回
+  浏览器之后自退，助手先 sleep 再动手 —— 顺序理由见 ``update_restart``。
+
 环境变量
 --------
 ========================================  =====================  ========================
@@ -64,6 +76,7 @@
 ``AI_MEMORY_WEB_CONFIG_WRITE``            ``1``                  0=阈值只读
 ``AI_MEMORY_WEB_STATIC``                  ``<本文件同级>/web``    前端静态资源目录
 ``AI_MEMORY_DIR``                         （空）                 vault 位置（阈值写入需要）
+``AI_MEMORY_RESTARTER``                   （空）                 重启助手路径；默认探测桌面 launcher
 ========================================  =====================  ========================
 """
 from __future__ import annotations
@@ -74,6 +87,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -630,6 +646,463 @@ async def mcp_tools(endpoint: str, timeout: float = MCP_TIMEOUT) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 更新面：从 git 远端拉取「仅程序」白名单（2026-10-15）
+#
+# 为什么不用 `git pull`
+#   程序目录**同时就是 git 工作副本**。`pull` 会做合并、可能移动 HEAD，并与
+#   本地未提交改动冲突 —— 对「工作副本即运行目录」的部署形态不可接受。
+#
+# 为什么不用 `git checkout <ref> -- <path>`
+#   它虽然只动指定路径，但**会改写 index**（被覆盖的文件变成 staged），对仓库
+#   状态产生额外副作用。改用 `git restore --source=<ref> --worktree`：只写工作区，
+#   不碰 HEAD、不碰 index。
+#
+# 为什么必须让 git 自己写文件
+#   本机 `core.autocrlf=true`，而 `.gitattributes` 只对 py/json/toml/sh/txt/yml
+#   锁了 LF，`.js` / `.css` / `.html` 不在其列 ⇒ 前端文件在工作区是 CRLF。
+#   任何「读 git 对象、再自己写盘」的实现都会把整个 web/ 的行尾改错。
+#
+# 范围（「仅程序」）
+#   后端运行时模块 + `web/` 静态资源。vault 数据在程序目录之外（D:\ai记忆），
+#   `*.md` / `*.db` 天然不参与；`.ai-memory-backup/` 亦在白名单之外。
+#
+# 诚实原则
+#   白名单内的文件若**未被版本控制**，远端永远不会有它们 —— 这时界面必须显式
+#   报「N 个文件不在版本库」，而不是显示「已是最新」。本机在 2026-10-15 之前
+#   前端与控制台后端正处于这个状态（内存记录「评估_记忆库GitHub分发更新可行性」）。
+# ---------------------------------------------------------------------------
+UPDATE_BACKEND_FILES = (
+    "server.py",
+    "web_console.py",
+    "memory_config.py",
+    "memory_index.py",
+    "yaml_io.py",
+    "text_utils.py",
+    "locks.py",
+    "metrics.py",
+    "transport_http.py",
+    "serve_http.py",
+    "serve_web.py",
+)
+UPDATE_FRONTEND_DIR = "web"
+UPDATE_PATHS = UPDATE_BACKEND_FILES + (UPDATE_FRONTEND_DIR,)
+
+UPDATE_TIMEOUT = 90.0                       # 单条 git 命令超时（秒）
+UPDATE_BACKUP_DIR = ".ai-memory-backup"
+UPDATE_META_NAME = ".ai-memory-install.json"
+UPDATE_LOG_DIR = Path.home() / ".ai-memory-web" / "logs"
+RESTARTER_ENV = "AI_MEMORY_RESTARTER"       # 覆盖重启助手路径
+RESTARTER_NAME = "ai_memory_web.py"         # 桌面 launcher 的默认文件名
+
+# 重启时序（理由见 update_restart 的文档串）：
+#   助手先睡 WEB_RESTART_DELAY 秒，再执行 launcher 的 restart；
+#   控制台在把 HTTP 响应写回浏览器后，WEB_RESTART_EXIT_DELAY 秒自杀。
+# 两者的先后关系是这个功能安全性的**全部依据**，不能互换。
+WEB_RESTART_DELAY = 3.0
+WEB_RESTART_EXIT_DELAY = 0.4
+
+_UPDATE_LOCK = threading.Lock()
+_VERSION_HEAD_RE = re.compile(r"^##\s*\[(\d+\.\d+(?:\.\d+)?)\]", re.MULTILINE)
+
+
+def update_root() -> Path:
+    """被更新的程序目录 —— 本文件所在目录。"""
+    return Path(__file__).resolve().parent
+
+
+def restarter_path() -> str:
+    """重启助手（桌面 launcher）的路径；找不到返回空串。
+
+    找不到时调用方必须**拒绝**重启 —— 绝不能「先自杀、再发现没人接手」。
+
+    显式设了 ``AI_MEMORY_RESTARTER`` 却指向不存在的文件时**返回空串**，不回落
+    桌面：配置写错要立刻暴露，不能被静默兜底掩盖（这也会让「无法重启」变得不可复现）。
+    """
+    raw = _env_str(RESTARTER_ENV)
+    if raw:
+        return raw if Path(raw).is_file() else ""
+    cand = Path.home() / "Desktop" / RESTARTER_NAME
+    return str(cand) if cand.is_file() else ""
+
+
+def _git(args: list[str], cwd: Path, timeout: float = UPDATE_TIMEOUT) -> tuple[int, str]:
+    """执行一次 git 子命令，返回 ``(返回码, 合并后的输出)``。
+
+    **永不抛异常**：git 缺失、超时、无法启动都收敛成非零返回码，并把真实原因
+    放进输出 —— 调用方据此原样回传浏览器，不吞错。
+    """
+    exe = shutil.which("git")
+    if not exe:
+        return 127, "PATH 里找不到 git 可执行文件。"
+    env = dict(os.environ)
+    # 绝不进入交互：无人值守场景下挂在密码 / 主机密钥提示上就是永久卡死。
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+    try:
+        proc = subprocess.run(
+            [exe, *args], cwd=str(cwd), capture_output=True, timeout=timeout,
+            env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        return 124, f"git {' '.join(args)} 超时（超过 {timeout:g} 秒）。"
+    except OSError as e:                                        # noqa: BLE001
+        return 126, f"无法启动 git：{type(e).__name__}: {e}"
+    # ⚠️ 只裁行尾，**绝不能 strip 整包**：`status --porcelain` 的每行是
+    # `XY 路径`，首行的行首空格是有意义的状态位（` M` = 工作区已改）。
+    # 整包 strip 会把首行变成 `M 路径`，随后按固定宽度取路径就少一个字符
+    # —— 实测把 `memory_config.py` 读成 `emory_config.py`。
+    out = (proc.stdout or b"").decode("utf-8", "replace").rstrip("\r\n")
+    err = (proc.stderr or b"").decode("utf-8", "replace").rstrip("\r\n")
+    return proc.returncode, "\n".join(x for x in (out, err) if x)
+
+
+def _version_from_changelog(root: Path, ref: str | None = None) -> str:
+    """版本号只认 CHANGELOG 首个小节。
+
+    程序本身不自报版本（无 ``__version__`` / ``VERSION`` 文件），所以「有没有
+    新版」只能靠提交号 + CHANGELOG 版本段两路呈现，而不是读一个常量。
+    """
+    text = ""
+    if ref:
+        rc, out = _git(["show", f"{ref}:CHANGELOG.md"], root, timeout=30)
+        text = out if rc == 0 else ""
+    else:
+        path = root / "CHANGELOG.md"
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+    m = _VERSION_HEAD_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def _whitelist_tracking(root: Path) -> tuple[list[str], list[str]]:
+    """白名单内的 ``(已入库, 未入库)`` 两组路径。
+
+    未入库 = 文件在工作区存在、git 却不认识它们 ⇒ 远端不会有它们。这个事实必须
+    显式呈现，否则界面会用「已是最新」掩盖「一半文件根本没被跟踪」。
+    """
+    rc, out = _git(["ls-files", "--", *UPDATE_PATHS], root, timeout=60)
+    tracked = sorted({x for x in out.splitlines() if x}) if rc == 0 else []
+    rc, out = _git(["ls-files", "--others", "--exclude-standard", "--", *UPDATE_PATHS],
+                   root, timeout=60)
+    untracked = sorted({x for x in out.splitlines() if x}) if rc == 0 else []
+    return tracked, untracked
+
+
+def _whitelist_dirty(root: Path, paths: tuple[str, ...] | None = None) -> list[str]:
+    """工作区相对 HEAD 有改动的文件（含未跟踪）。``-uall`` 展开目录。
+
+    ``paths`` 可覆盖白名单 —— 测试用它在一个**真仓库**上钉住「行首状态位不被吞」
+    这条回归（见 tests/test_web.py 的 H 段）。
+    """
+    spec = tuple(paths) if paths else UPDATE_PATHS
+    rc, out = _git(["status", "--porcelain", "-uall", "--", *spec], root, timeout=60)
+    if rc != 0:
+        return []
+    paths: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 3:
+            continue
+        # 固定宽度取路径（2 字符状态位 + 分隔空白），并对行首空白免疫 ——
+        # 双保险：即便上游哪天又 strip 了整包，这里也不会错位。
+        body = line[2:].lstrip()
+        if " -> " in body:                  # 重命名：只记新路径
+            body = body.split(" -> ", 1)[1]
+        paths.append(body.strip().strip('"'))
+    return sorted(set(paths))
+
+
+def _diff_head_to(root: Path, ref: str,
+                  paths: tuple[str, ...] | None = None) -> tuple[list[dict], str]:
+    """「远端自共同祖先以来的变更」在白名单内的清单。
+
+    用**三点** `HEAD...ref`（等价于 `merge-base(HEAD, ref)..ref`），而不是
+    `HEAD..ref`：后者在「本地领先远端」时会算成「从本地回退到远端」，把本地已
+    提交的新文件整批列成待删除。三点只描述远端独有的前进量，正是要应用的部分。
+
+    重命名拆成「删除旧 + 新增新」两条，应用时才有确定的动作。
+
+    ``paths`` 可覆盖白名单 —— 测试用它在真仓库上钉住三点语义（H 段）。
+    """
+    spec = tuple(paths) if paths else UPDATE_PATHS
+    rc, out = _git(["diff", "--name-status", f"HEAD...{ref}", "--", *spec],
+                   root, timeout=60)
+    if rc != 0:
+        return [], out
+    items: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0].strip()
+        if status.startswith("R") and len(parts) >= 3:
+            items.append({"status": "D", "path": parts[1]})
+            items.append({"status": "A", "path": parts[2]})
+        else:
+            items.append({"status": status[:1], "path": parts[-1]})
+    items.sort(key=lambda x: x["path"])
+    return items, ""
+
+
+def update_status(root: Path | None = None) -> dict:
+    """仓库基本面（**纯本地，不联网**）。"""
+    root = root or update_root()
+    info: dict = {
+        "root": str(root),
+        "is_repo": False,
+        "branch": "",
+        "remote_url": "",
+        "local_sha": "",
+        "local_short": "",
+        "version": "",
+        "tracked": [],
+        "untracked": [],
+        "dirty": [],
+        "restarter": restarter_path(),
+        "backup_dir": str(root / UPDATE_BACKUP_DIR),
+        "whitelist": list(UPDATE_PATHS),
+    }
+    rc, _ = _git(["rev-parse", "--is-inside-work-tree"], root, timeout=20)
+    if rc != 0:
+        return info
+    info["is_repo"] = True
+    # 单值输出在这里必须自己 strip（_git 已不再整包 strip）。
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], root, timeout=20)[1].strip()
+    info["branch"] = "" if branch in ("HEAD", "origin/HEAD") else branch
+    info["local_sha"] = _git(["rev-parse", "HEAD"], root, timeout=20)[1].strip()
+    info["local_short"] = info["local_sha"][:7]
+    rc_url, url = _git(["remote", "get-url", "origin"], root, timeout=20)
+    info["remote_url"] = url.strip() if rc_url == 0 else ""
+    info["version"] = _version_from_changelog(root)
+    info["tracked"], info["untracked"] = _whitelist_tracking(root)
+    info["dirty"] = _whitelist_dirty(root)
+    return info
+
+
+def update_check(root: Path | None = None, timeout: float = UPDATE_TIMEOUT) -> dict:
+    """联网检查：``git fetch`` → 比对白名单 → 给出可执行性判断。**只读不写盘**。"""
+    root = root or update_root()
+    state = update_status(root)
+    if not state["is_repo"]:
+        return {**state, "ok": False, "fetched": False,
+                "error": f"程序目录不是 git 仓库：{state['root']}"}
+    if not state["branch"]:
+        return {**state, "ok": False, "fetched": False,
+                "error": "当前处于游离 HEAD，无法确定要跟随的分支。"}
+
+    ref = f"origin/{state['branch']}"
+    rc, out = _git(["fetch", "--prune", "origin", state["branch"]], root, timeout=timeout)
+    if rc != 0:
+        return {**state, "ok": False, "fetched": False, "ref": ref,
+                "error": "从远端拉取失败（下面是 git 的原话，未经改写）。",
+                "stderr": out}
+
+    remote_sha = _git(["rev-parse", ref], root, timeout=20)[1].strip()
+    changed, diff_err = _diff_head_to(root, ref)
+    _, counts = _git(["rev-list", "--left-right", "--count", f"HEAD...{ref}"],
+                     root, timeout=30)
+    ahead = behind = 0
+    parts = counts.split()
+    if len(parts) == 2:
+        try:
+            ahead, behind = int(parts[0]), int(parts[1])
+        except ValueError:
+            ahead = behind = 0
+
+    untracked = state["untracked"]
+    conflicts = sorted(set(state["dirty"]) & {c["path"] for c in changed})
+    if untracked:
+        blocked = (f"白名单内仍有 {len(untracked)} 个文件未纳入版本控制，"
+                   "远端不会有它们 —— 这些文件不会被更新。")
+    elif ahead > 0 and behind > 0:
+        blocked = (f"本地有 {ahead} 个未推送的提交、远端也有 {behind} 个新提交"
+                   "⇒ 两侧已分叉。覆盖会丢掉本地提交，请先处理本地提交。")
+    elif conflicts:
+        blocked = (f"白名单内有 {len(conflicts)} 个文件存在未提交改动，"
+                   "覆盖会丢弃这些改动。")
+    elif behind == 0:
+        blocked = "已是最新。"
+    else:
+        blocked = None
+
+    return {
+        **state,
+        "ok": True,
+        "fetched": True,
+        "ref": ref,
+        "remote_sha": remote_sha,
+        "remote_short": remote_sha[:7],
+        "remote_version": _version_from_changelog(root, ref),
+        "ahead": ahead,
+        "behind": behind,
+        "changed": changed,
+        "changed_count": len(changed),
+        "conflicts": conflicts,
+        "diff_error": diff_err,
+        "up_to_date": behind == 0,
+        "can_apply": bool(behind > 0 and not conflicts and not untracked),
+        "blocked_reason": blocked,
+    }
+
+
+def update_apply(root: Path | None = None, force: bool = False, ref: str = "",
+                 expected_sha: str = "", timeout: float = UPDATE_TIMEOUT) -> dict:
+    """执行更新：备份 → 按白名单 restore → 记录元数据（进程内互斥）。"""
+    root = root or update_root()
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "已有一次更新正在执行，请稍后再试。"}
+    try:
+        return _update_apply_locked(root, force, ref, expected_sha, timeout)
+    finally:
+        _UPDATE_LOCK.release()
+
+
+def _update_apply_locked(root: Path, force: bool, ref: str,
+                         expected_sha: str, timeout: float) -> dict:
+    state = update_status(root)
+    if not state["is_repo"]:
+        return {"ok": False, "error": f"程序目录不是 git 仓库：{state['root']}"}
+
+    target = ref or (f"origin/{state['branch']}" if state["branch"] else "")
+    if not target:
+        return {"ok": False, "error": "无法确定要跟进的远端分支。"}
+
+    # TOCTOU：检查与执行之间远端可能又前进了。提交号对不上就要求重新检查。
+    cur_sha = _git(["rev-parse", target], root, timeout=20)[1].strip()
+    if expected_sha and cur_sha and cur_sha != expected_sha:
+        return {"ok": False, "remote_sha": cur_sha, "error": (
+            f"远端提交已变化（检查时 {expected_sha[:7]}，现在 {cur_sha[:7]}），"
+            "请重新检查更新。")}
+
+    changed, diff_err = _diff_head_to(root, target)
+    if diff_err:
+        return {"ok": False, "error": "无法计算差异。", "stderr": diff_err}
+    if not changed:
+        return {"ok": True, "up_to_date": True, "ref": target, "written": [],
+                "removed": [], "backed_up": [], "backup": None,
+                "message": "已是最新，未改动任何文件。"}
+
+    conflicts = sorted(set(state["dirty"]) & {c["path"] for c in changed})
+    if conflicts and not force:
+        return {"ok": False, "conflicts": conflicts, "error": (
+            f"白名单内有 {len(conflicts)} 个文件存在未提交改动，覆盖会丢弃它们。"
+            "确认覆盖请以 force=true 重试（覆盖前会先备份）。")}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = root / UPDATE_BACKUP_DIR / stamp
+
+    written: list[str] = []
+    removed: list[str] = []
+    backed_up: list[str] = []
+    for item in changed:
+        rel, status = item["path"], item["status"]
+        cur = root / rel
+        if cur.is_file():                   # 覆盖前一律原样备份
+            dst = backup_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(cur), str(dst))
+            backed_up.append(rel)
+        if status == "D":
+            if cur.exists():
+                cur.unlink()
+                removed.append(rel)
+        else:
+            written.append(rel)
+
+    restore_failed = ""
+    if written:
+        rc, out = _git(["restore", f"--source={target}", "--worktree", "--", *written],
+                       root, timeout=timeout)
+        if rc != 0:
+            restore_failed = out
+
+    meta_file = root / UPDATE_META_NAME
+    meta: Any = {}
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError):
+            meta = {}
+    if isinstance(meta, dict):
+        meta["last_web_update"] = {
+            "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "ref": target,
+            "expected_sha": expected_sha,
+            "written": len(written),
+            "removed": len(removed),
+            "backup": str(backup_root) if backed_up else "",
+        }
+        try:
+            meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8", newline="\n")
+        except OSError as e:
+            logger.warning("写更新元数据失败：%s", e)
+
+    result = {
+        "ok": not restore_failed,
+        "up_to_date": False,
+        "ref": target,
+        "remote_sha": expected_sha,
+        "remote_short": expected_sha[:7],
+        "written": written,
+        "removed": removed,
+        "backed_up": backed_up,
+        "backup": str(backup_root) if backed_up else None,
+        "force_overrode": conflicts if (conflicts and force) else [],
+        "restart_required": any(p.endswith(".py") for p in written + removed),
+        "untracked_left": state["untracked"],
+    }
+    if restore_failed:
+        result["error"] = "git restore 失败，文件可能只更新了一部分。"
+        result["stderr"] = restore_failed
+    return result
+
+
+def update_restart() -> dict:
+    """拉起重启助手执行「停 → 起」；控制台随后自退。
+
+    时序是这个功能安全性的全部依据，顺序不能换：
+      助手若与控制台同处一棵进程树，launcher 的 ``taskkill /T`` 会把它一并带走
+      —— 结果是端口停了却没人重启。所以助手的第一个动作是 ``sleep``（等控制台
+      先死），控制台则在把 HTTP 响应写回浏览器之后自杀。
+
+    ``sys.executable`` 就是控制台自己的解释器（launcher 已用
+    ``serve_web.py --check`` 验证过依赖齐全），不必重新探测。
+    """
+    helper = restarter_path()
+    if not helper:
+        return {"ok": False, "error": (
+            f"未找到重启助手。请设置环境变量 {RESTARTER_ENV}，"
+            f"或把 launcher（{RESTARTER_NAME}）放在桌面。")}
+    root = update_root()
+    py = sys.executable
+    if not py or not Path(py).is_file():
+        return {"ok": False, "error": f"当前解释器不可用：{py!r}"}
+
+    UPDATE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = UPDATE_LOG_DIR / f"restart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    # 助手先睡再动手。用 -c 内联而非落临时脚本：不留残骸。
+    # 路径经 repr() 注入 ⇒ 引号与反斜杠由 Python 自己转义，不经任何 shell。
+    code = (f"import subprocess, sys, time; time.sleep({WEB_RESTART_DELAY!r}); "
+            f"subprocess.run([sys.executable, {helper!r}, 'restart'])")
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    try:
+        with open(log, "wb") as fh:
+            proc = subprocess.Popen([py, "-c", code], cwd=str(root), stdout=fh,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    creationflags=flags, close_fds=True)
+    except OSError as e:                                        # noqa: BLE001
+        return {"ok": False, "error": f"无法拉起重启助手：{type(e).__name__}: {e}"}
+
+    threading.Timer(WEB_RESTART_EXIT_DELAY, lambda: os._exit(0)).start()
+    return {"ok": True, "pid": proc.pid, "helper": helper, "log": str(log),
+            "delay": WEB_RESTART_DELAY, "exit_delay": WEB_RESTART_EXIT_DELAY}
+
+
+# ---------------------------------------------------------------------------
 # HTTP 处理器
 # ---------------------------------------------------------------------------
 def _err(status: int, message: str, **extra: Any) -> JSONResponse:
@@ -823,6 +1296,44 @@ class WebConsole:
         res["ok"] = not res["isError"]
         return JSONResponse(res)
 
+    # -------- 更新面 --------
+    async def update_get(self, request: Request) -> Response:
+        """检查更新。``?fetch=0`` 只回本地状态，不联网。"""
+        root = update_root()
+        raw = (request.query_params.get("fetch") or "1").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return JSONResponse({"ok": True, "checked": False, **update_status(root)})
+        try:
+            # git fetch 同步阻塞且可能跑几十秒 —— 必须挪出事件循环。
+            data = await anyio.to_thread.run_sync(update_check, root)
+        except Exception as e:                                    # noqa: BLE001
+            return _err(500, f"检查更新失败：{type(e).__name__}: {e}")
+        return JSONResponse(data)
+
+    async def update_post(self, request: Request) -> Response:
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        root = update_root()
+        force = bool(body.get("force"))
+        ref = str(body.get("ref") or "").strip()
+        expected_sha = str(body.get("expected_sha") or "").strip()
+        try:
+            data = await anyio.to_thread.run_sync(
+                lambda: update_apply(root, force, ref, expected_sha))
+        except Exception as e:                                    # noqa: BLE001
+            return _err(500, f"更新失败：{type(e).__name__}: {e}")
+        return JSONResponse(data, status_code=200 if data.get("ok") else 409)
+
+    async def restart(self, request: Request) -> Response:
+        """重启后端（MCP + Web）。控制台随后自退，由助手接手。"""
+        try:
+            data = await anyio.to_thread.run_sync(update_restart)
+        except Exception as e:                                    # noqa: BLE001
+            return _err(500, f"重启失败：{type(e).__name__}: {e}")
+        return JSONResponse(data, status_code=200 if data.get("ok") else 409)
+
     # -------- 静态页面 --------
     async def index(self, request: Request) -> Response:
         return FileResponse(self.cfg["static"] / "index.html",
@@ -869,6 +1380,10 @@ def create_app(cfg: dict | None = None) -> Starlette:
         Route("/api/config", console.config_post, methods=["POST"]),
         Route("/api/thresholds", console.thresholds_get, methods=["GET"]),
         Route("/api/thresholds", console.thresholds_post, methods=["POST"]),
+        # 更新面（2026-10-15）：白名单 = 后端运行时模块 + web/ 静态资源
+        Route("/api/update", console.update_get, methods=["GET"]),
+        Route("/api/update", console.update_post, methods=["POST"]),
+        Route("/api/update/restart", console.restart, methods=["POST"]),
         Mount("/assets", app=StaticFiles(directory=str(cfg["static"])), name="assets"),
         Route("/", console.index),
         Route("/{path:path}", console.index),      # 前端用 hash 路由，任何路径都回 index
@@ -893,4 +1408,7 @@ __all__ = [
     "render_toml", "thresholds_state", "write_thresholds",
     "mcp_health", "mcp_tools", "mcp_session_calls",
     "TOOL_GROUPS", "TOOL_GROUP_OTHER",
+    "UPDATE_PATHS", "UPDATE_BACKEND_FILES", "UPDATE_FRONTEND_DIR",
+    "update_root", "restarter_path", "update_status", "update_check",
+    "update_apply", "update_restart",
 ]

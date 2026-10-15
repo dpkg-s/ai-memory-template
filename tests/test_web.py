@@ -11,6 +11,8 @@
   E  写保护：AI_MEMORY_WEB_CONFIG_WRITE=0 ⇒ POST /api/thresholds 被拒（400）
   F  端到端（真起 serve_http + serve_web）：health / tools(24) / overview /
      thresholds(8 键) / index 回落 / assets 可达 / /api/call 真往返 / 阈值写读往返
+  H  更新面（2026-10-15）：白名单安全边界 / 行首状态位回归 / 三点 diff 语义 /
+     restarter 显式失败（H1~H5 静态，F11 走真服务）
 
 运行:
     python tests/test_web.py       # 退出码 0=全绿, 1=有失败
@@ -339,6 +341,71 @@ check("G5 每个分组都至少有 1 个工具（无空组）",
       _group_keys <= _used_keys, ", ".join(sorted(_group_keys - _used_keys)))
 
 
+# ---------------------------------------------------------------------------
+section("H 更新面（2026-10-15）")
+# H1/H2 钉的是**安全边界**：白名单决定「更新」能覆盖哪些文件。少了控制台后端或
+# 前端目录，功能就名不副实；混进 *.md / *.db，就会碰到 vault 数据。
+_wl = set(web_console.UPDATE_PATHS)
+check("H1 白名单覆盖控制台后端四件套 + 前端目录 + 核心模块",
+      {"web_console.py", "serve_web.py", "serve_http.py", "transport_http.py",
+       "server.py", "memory_config.py", web_console.UPDATE_FRONTEND_DIR} <= _wl,
+      f"缺={sorted({'web_console.py', 'serve_web.py'} - _wl)}")
+check("H2 白名单不含数据类文件（.md / .db / .sqlite）",
+      not any(str(p).endswith((".md", ".db", ".sqlite", ".sqlite3")) for p in _wl),
+      ", ".join(sorted(_wl)))
+
+
+def _mk_repo(path: Path, files: dict) -> None:
+    """造一个最小真仓库并提交一轮 —— H3/H4 要在真 git 输出上验证解析，而非打桩。"""
+    path.mkdir(parents=True, exist_ok=True)
+    for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"],
+                ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
+        subprocess.run(["git", *cmd], cwd=str(path), capture_output=True, timeout=30)
+    for name, text in files.items():
+        (path / name).write_text(text, encoding="utf-8", newline="\n")
+    subprocess.run(["git", "add", "."], cwd=str(path), capture_output=True, timeout=30)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=str(path),
+                   capture_output=True, timeout=30)
+
+
+# H3 回归保护：`_whitelist_dirty` 曾因 `_git` 整包 strip 吞掉**行首状态位**，
+#    把 `memory_config.py` 读成 `emory_config.py`（少一个字符）。这里刻意只改
+#    工作区、不 add，让 porcelain 首行是 ` M 路径`。
+_repo = _TMP / "h_repo"
+_mk_repo(_repo, {"first.py": "x = 1\n", "second.py": "y = 1\n"})
+(_repo / "first.py").write_text("x = 2\n", encoding="utf-8", newline="\n")
+_dirt = web_console._whitelist_dirty(_repo, ("first.py", "second.py"))
+check("H3 _whitelist_dirty 保留首行完整路径（行首状态位不被吞）",
+      _dirt == ["first.py"], f"得到 {_dirt!r}")
+
+# H4 三点语义：本地领先时 `HEAD..ref` 会把**本地已提交的新文件**列成待删除。
+#    造「本地新增 third.py 并提交、ref 指上一提交」的局面 —— 两点会报 D，
+#    三点（merge-base..ref）必须为空。
+(_repo / "third.py").write_text("z = 1\n", encoding="utf-8", newline="\n")
+subprocess.run(["git", "add", "."], cwd=str(_repo), capture_output=True, timeout=30)
+subprocess.run(["git", "commit", "-qm", "second"], cwd=str(_repo),
+               capture_output=True, timeout=30)
+_two_point = subprocess.run(["git", "diff", "--name-status", "HEAD..HEAD~1",
+                             "--", "third.py"], cwd=str(_repo),
+                            capture_output=True, timeout=30).stdout.decode()
+_three_point, _ = web_console._diff_head_to(_repo, "HEAD~1", ("third.py",))
+check("H4 _diff_head_to 用三点语义（本地新增不被误列成待删除）",
+      _three_point == [] and _two_point.strip().startswith("D"),
+      f"三点={_three_point!r} 两点={_two_point.strip()!r}")
+
+# H5 restarter 的配置失败必须显式：设了不存在的路径就返回空串，不静默回落桌面
+#    —— 否则「为什么不能重启」会变得不可复现。
+_keep_env = os.environ.get("AI_MEMORY_RESTARTER")
+os.environ["AI_MEMORY_RESTARTER"] = str(_TMP / "no-such-helper.py")
+_got_restarter = web_console.restarter_path()
+if _keep_env is None:
+    os.environ.pop("AI_MEMORY_RESTARTER", None)
+else:
+    os.environ["AI_MEMORY_RESTARTER"] = _keep_env
+check("H5 AI_MEMORY_RESTARTER 指向不存在文件时返回空串（不静默回落）",
+      _got_restarter == "", f"得到 {_got_restarter!r}")
+
+
 try:
     check("F0 MCP 端点起来", wait_port(mcp_port), "")
     check("F0 控制台起来", wait_port(web_port), "")
@@ -436,6 +503,17 @@ try:
                 or not str(v.get("desc") or "").strip()]
     check("F4b 每个阈值键都随接口下发 label/desc（界面据此渲染作用说明）",
           st == 200 and not _no_meta, f"缺文案的键={_no_meta}")
+
+    # F11 更新面端点（2026-10-15）。只读本地状态这条必须是**真不联网**：
+    #     `?fetch=0` 是打开配置页「关于」时的默认路径，它若能联网，就会在每次
+    #     进页面时静默跑一次可能耗时几十秒的 git fetch。
+    st, txt = _http("/api/update?fetch=0")
+    j = json.loads(txt) if st == 200 else {}
+    check("F11 GET /api/update?fetch=0 返回本地状态且 checked=false",
+          st == 200 and j.get("checked") is False and j.get("is_repo") is True
+          and bool(j.get("local_sha")) and isinstance(j.get("whitelist"), list)
+          and len(j.get("whitelist") or []) >= 10,
+          f"status={st} checked={j.get('checked')} is_repo={j.get('is_repo')}")
 
     st, txt = _http("/")
     check("F5 GET / 返回 index.html（含 #app）", st == 200 and 'id="app"' in txt,

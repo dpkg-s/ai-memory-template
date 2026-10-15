@@ -111,6 +111,21 @@ var S = reactive({
     dirty: false,
   },
   fns: { dirty: false, saved: null },
+  /* 更新面（2026-10-15，方案 A：配置 → 关于页内嵌）。
+     数据源 `GET /api/update`（`?fetch=0` 只看本地状态、不联网）。
+     🔴 白名单（哪些文件算「程序」）由**服务端** `web_console.UPDATE_PATHS` 决定，
+     前端不维护第二份清单 —— 否则每加一个运行时模块就要改两处，必然失配。
+     这里只存服务端给的结果，不做任何 git 语义推断。 */
+  update: {
+    loading: false,
+    applying: false,
+    restarting: false,
+    error: null,
+    data: null,          // update_status / update_check 的合并结果
+    result: null,        // 最近一次 apply 的返回值
+    reconnecting: false, // 重启后轮询 /api/health 期间为 true
+    seconds: 0,
+  },
   confirm: {
     open: false,
     title: "",

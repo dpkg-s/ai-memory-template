@@ -1,0 +1,638 @@
+/* ============================================================================
+ * 4-console.css —— 调试台专有
+ *
+ * 工具列表、参数表单、执行按钮行、终端区块与命令/输出/结果三段的骨架。
+ * 只服务 #/console 一页。
+ *
+ * ⚠️ 本文件由 style.css 按层拆出（2026-10-15）。引入顺序 = 层叠顺序，
+ *    index.html 必须按 1 → 8 依次 link，不可调换、不可按需懒加载。
+ * ========================================================================== */
+/* ---------- 12. 调试台 ---------- */
+/* 三栏 = 左「工具列表」· 中「参数 + 终端输出」· 右「日志检查器」。
+   骨架与概览页同款（§17c-2 / §17c-3）：stretch 等高 + 行高钉到视口 + 各栏内部滚动。
+   左右两栏**同宽**由同一个 `--con-rail` 变量保证 —— 两条独立的 minmax 轨道会按各自
+   内容 max-content 算出不同宽度，「等宽」只能靠单一声明，不能靠两处写同样的值。
+   窄屏由 899 断点整体转单列（不靠 auto-fit 挤）。 */
+.console-grid {
+  /* 左右栏宽随视口**连续**变化（不是媒体查询分档）：分档会出现「视口变宽、中栏反而
+     变窄」的非单调台阶（实测 1279 视口的中栏 715 > 1280 的 644）。21vw 下中栏宽 =
+     内容宽 − 2·rail − gap，其导数 1 − 2×0.21 = 0.58 > 0 ⇒ 视口越宽中栏越宽。 */
+  --con-rail: clamp(180px, 21vw, 268px);
+  display: grid;
+  grid-template-columns: var(--con-rail) minmax(0, 1fr) var(--con-rail);
+  gap: 14px;
+  /* stretch（不是 start）：三栏等高、各自内部滚动 —— 这是 IDE 面板的观感，也是
+     概览右栏的形态。左栏不再用 `.sticky-side`：position:sticky 与 stretch 互斥
+     （元素被拉满行高后不再有可粘的位移），改由本栏 flex 内滚承担同等职责。
+     ⚠️ `.sticky-side` 规则本身保留 —— 记忆库页右栏与 XCard 的 sticky prop 仍在用。 */
+  align-items: stretch;
+}
+
+/* 网格条目一律允许收缩，否则条目内部的长 nowrap 内容会把轨道撑破视口。 */
+.console-grid > * {
+  min-width: 0;
+}
+
+/* 三栏高度 = 视口 − 顶栏 − 面包屑 − 状态栏（口径同概览 §17c-2），三栏共用。
+   🔴 必须给**三栏**定高，而不是只给网格 `min-height`：网格行高按项目的 max-content
+   计算，左栏工具清单有 24 项（≈1200px）会把行高整个撑开 —— 实测 `gridBottom` 达
+   1854px，远超视口下应有的 882px（`overflow:auto` 只降低 min-content，降不了
+   max-content）。定高后行高随之确定，各栏内滚才成立，也顺带杜绝整页滚动条。 */
+.page:has(.console-grid) .console-grid {
+  --con-h: max(
+    0px,
+    calc(100vh - var(--topbar-h) - var(--crumbs-h) - var(--statusbar-h))
+  );
+}
+
+.page:has(.console-grid) .con-rail,
+.page:has(.console-grid) .con-main,
+.page:has(.console-grid) .con-side {
+  height: var(--con-h);
+}
+
+/* 三栏统一「面板」形态：头部固定、内容区内部滚动。 */
+.con-rail,
+.con-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 中栏 = **固定 5 : 5** 纵向两段（默认；主人 2026-10-14 先定 7 : 3，同日改回 5 : 5）：
+     第 1 段 = 「参数区」——选中工具时是参数卡（执行后追加失败卡/结果卡）；未选中时是空态卡；
+     第 2 段 = 终端输出卡。
+   比例**固定** ⇒ 选中工具前后、执行成功/失败前后都不跳动；第 1 段内部各卡再**平均分**该段。
+
+   🔴 用 grid 的 `fr` 而不是 flex 的 `flex: 5 1 0`：`fr` 的基准是
+   **剩余空间的确定份额**，与子项内容无关；`flex-basis: 0` 遇上内部 `min-height:auto`
+   仍会被内容顶开 —— 就是 §12 那句注释里「网格被 24 项工具撑到 1854px」的同一个坑。
+   `minmax(0, N fr)` 让两段都能被压到内容之下，配合卡内 `overflow:auto` 内滚；
+   若写成裸 `5fr 5fr`，内容的 min-content 会把后一档顶破。 */
+/* 中栏 = **内容驱动**的纵向 flex（2026-10-14 主人选定「方案 C · 全内容驱动」）：
+     · 参数段（`.con-stack`）按**内容高**（160px 保底），**无百分比上限**
+     · 终端卡也按**内容高**（96px 保底）—— **不吃剩余**，余量留在中栏底部
+     · 终端卡内的两个区块同样按**内容自适应**（`.term-sec { flex: 1 1 auto }`），不固定平分
+     · 两区块**全折** ⇒ 终端卡的内容高自然降为两行标题，无需额外规则
+     · **悬停只改外观**（描边色），尺寸纹丝不动（见 §19-⑨）
+   🔴 从固定 `fr` 改成 flex 的原因：主人要的三个行为（按内容高 / 全折收缩 / 悬停扩张）
+   本质都是「高度随状态变」，而 `grid-template-rows: minmax(0, Nfr)` 是**固定份额**，
+   表达不了「收缩」。flex 的 `flex-basis: auto`（内容）+ `flex-grow`（吃剩余）
+   才是这套语义的原生表达。 */
+.page:has(.console-grid) .con-main {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 参数段（`.con-stack` = 参数卡 / 失败卡的包裹层）：**按内容高**，上限就是内容高本身。
+   🔴 2026-10-14 主人两次澄清后定稿：
+     · 「自适应指的是按照工具大小进行最高多少的适应」
+     · 「参数卡按内容高来上限」
+   ⇒ 不要固定百分比（先前写的 50% / 执行后 30% 都已撤掉）。`flex-basis: auto` 让高度
+   贴着内容；内容真的超出可用空间时，由 `flex-shrink: 1` 压缩 + 卡内 `overflow: auto`
+   承接滚动 —— 这就是「内容高即上限，空间不足才压缩」。 */
+.page:has(.console-grid) .con-main > .con-stack {
+  display: grid;
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 14px;
+  flex: 0 1 auto;
+  /* 保底高度：终端卡内容极长时（结果体数千像素）参数段会被压缩，这里兜住下限，
+     保证「参数卡至少露出约 160px」而不是被挤成几像素。 */
+  min-height: 160px;
+  min-width: 0;
+}
+
+/* ---- 参数卡：「执行」按钮贴**卡片右下角**的三环链条（2026-10-15）----
+   主人指令：「执行的按钮放在他那个卡片消息的右下角」。
+
+   🔴🔴 三环**缺一不可**，必须一起写（本轮踩过的真坑：只写后两环 ⇒ 实测按钮吊在
+      卡片中上部、下方空 **183px**，主人反馈「你好像没改」）：
+        ① `.card` **本身**是 flex 列 —— 全局 `.card` 从来不是 flex 容器
+           （`display: block`，见 `3-components.css` 与 §19 铁律）⇒ 不补这一环，
+           下面 `.card-body { flex: 1 1 auto }` 完全空转；
+        ② `.card-body` 被拉到卡内余高（全局已有 `flex: 1 1 auto; min-height: 0`
+           在这一环才真正生效）⇒ body 有了余高；
+        ③ `.body` 为 flex 列 + `.run-bar { margin-top: auto }`（见 `8-responsive.css`
+           §19-③）⇒ auto 外边距吃掉余高，按钮沉到卡底。
+      诊断实测（1440×1000，`.con-stack` 全折吃满 5:5 = 358px）：
+        · 修前：`.card-body h=133`（内容高，没填满卡）/ 卡底−按钮底 = **183px** /
+                `run-bar marginTop = 0px`（auto 无处可分）
+        · 修后：`.card-body` 填满卡 / 卡底−按钮底 = **16~17px**（= 卡片下内边距）/ 
+                `run-bar marginTop` = 余高像素值
+
+   🔴 限定 `:first-child`：`.con-stack` 里可能同时挂**参数卡**与**失败卡**
+      （`.card + .card`），两张卡都变 flex 列会让失败横幅被拉伸填满整卡。
+   🔴 `.card-head` 显式 `flex: 0 0 auto`：它是卡内第一个 flex 项，不给约束就可能
+      被 `flex-shrink` 压缩（虽然卡有余高时不会，但参数超长把卡压到内容高以下时会）。
+   ✅ 间距等价、无需补偿：`.row2` 是 grid 且**无下边距**（`3-components.css`），
+      所以它与 `.run-bar` 之间原来只有 `.run-bar` 的 `margin-top: 14px` **这一份**
+      间距；改成 `padding-top: 14px` 后仍是这一份。flex 列下外边距虽不折叠，
+      但相邻的 `.md.mb` / `.row2` 各自下边距本就是唯一来源 ⇒ 卡内间距与改动前一致。 */
+.page:has(.console-grid) .con-main > .con-stack > .card:first-child {
+  display: flex;
+  flex-direction: column;
+}
+
+.page:has(.console-grid)
+  .con-main
+  > .con-stack
+  > .card:first-child
+  > .card-head {
+  flex: 0 0 auto;
+}
+
+.page:has(.console-grid)
+  .con-main
+  > .con-stack
+  > .card:first-child
+  > .card-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 终端卡：**吃剩余**（2026-10-14 方案 E 定稿，主人：「默认还是上下两个刚好把这个
+   区域给占满」）⇒ 与参数段一起**占满中栏**，默认不留白。
+   🔴 `flex-basis` 必须是 **0**：卡内结果体动辄数千像素，若取 `auto`，终端卡的
+   「理想高度」就等于那个巨值，参数段（`flex-shrink: 1`）会被挤到只剩几像素。 */
+.page:has(.console-grid) .con-main > .con-term {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 空态（中栏只有一个直接子卡）：也按内容高 —— 方案 D「都不吃满」。 */
+.page:has(.console-grid) .con-main > .card:only-child {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
+/* 中栏的卡一律填满自己那一段；超长内容在**卡内**滚，而不是顶破布局或推高整栏。
+   🔴 `margin-top: 0` 必须写：终端卡与失败卡都带 `.mt`（14px 上边距），
+   而 flex 的 `gap` **不吞外边距** —— 不归零就叠加成 28px。间距一律由 gap 独家承担。 */
+.page:has(.console-grid) .con-main .card {
+  height: auto;
+  margin-top: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* 终端块自身不再设 `max-height: 46vh`：那一档在 5/10 高度里必然溢出 ⇒ 会出现
+   「卡内滚 + 块内滚」两条滚动条。改由卡的 overflow 独家承担。 */
+.page:has(.console-grid) .con-main .term {
+  max-height: none;
+}
+
+.tool-search {
+  position: relative;
+}
+
+.tool-search .input {
+  padding-left: 34px;
+}
+
+.tool-search svg {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 15px;
+  height: 15px;
+  color: var(--text-faint);
+}
+
+/* 属性切片（2026-10-14）：按 MCP ToolAnnotations 把全部工具切成四类，数据源
+   是服务端注解而非前端分类表。窄栏（`--con-rail` 最窄 180px）下允许折行；每个
+   chip 自身可收缩且不设 nowrap ⇒ 不会顶破轨道（同 .tool-item .td 的收缩契约）。 */
+.attr-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.attr-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast),
+    border-color var(--t-fast);
+}
+
+.attr-chip:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.attr-chip.on {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.attr-chip b {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.72;
+}
+
+/* 分组折叠：三角用 border 画，避免字形差异造成基线不齐。 */
+.tool-group + .tool-group {
+  margin-top: 4px;
+}
+
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px 5px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--t-fast);
+}
+
+.tool-group-head:hover {
+  color: var(--text);
+}
+
+.tg-caret {
+  width: 0;
+  height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform var(--t-fast) var(--ease);
+}
+
+.tg-caret.open {
+  transform: rotate(90deg);
+}
+
+.tg-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.tool-list {
+  /* 面板内滚（替代原 `max-height: 62vh`）：高度交给左栏 flex 的剩余空间，
+     这样三栏才能真正等高、滚动条落在面板内部（同概览右栏的 `.ide-rows`）。 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+  /* 🔴 2026-10-15 主人报障「工具栏中的滚动条会影响工具的渲染」⇒ 槽位恒定预留。
+     根因：全局 `1-tokens.css` 显式设了 `::-webkit-scrollbar{width:10px}` ⇒ 滚动条是
+     **经典占位式**，而本容器 `overflow:auto` ⇒ 溢出时吃 10px、不溢出时（搜索过滤
+     命中变少 / 分组全折至不足一屏）这 10px 归还内容 ⇒ 工具项可用宽在 222↔232px
+     之间跳变，`.td` 描述的折行数随之变化（同一条工具 3 行 ↔ 2 行）。
+     `scrollbar-gutter: stable` 让槽位**无论是否溢出都预留** ⇒ 宽度锁定，渲染不再重排。
+     取舍：非溢出态右侧留 10px 空槽（换来「任何滚动条状态下工具项宽度恒定」）。
+     实测（1440×1000，rail 268）：无此属性 A 全量 tdW=222 / B 过滤 1 项 tdW=232（跳变 10）；
+     有此属性两态恒 222。判据见 `_v3_rail_sb_probe.py`（正向断言 + 反证对照组）。 */
+  scrollbar-gutter: stable;
+}
+
+/* C 伴生项（2026-10-15 主人选定「A + C 组合」）：把恒定的空槽从 10px 压到 8px。
+   ⚠️ **只作用于左栏工具列表**，不动 `1-tokens.css` 的全局滚动条声明
+   （全站滚动条是统一设计，概览右栏 / 日志检查器 / 中栏卡都在用）。
+
+   🔴🔴 关键坑（本轮实测踩到）：**只写 `.tool-list::-webkit-scrollbar{width:8px}` 完全无效**，
+   槽位仍是 10px。根因 = `1-tokens.css` 的 `* { scrollbar-width: thin; scrollbar-color: … }`
+   是**标准属性**，而规范规定：一旦设置标准属性，Chromium 就**忽略** legacy 的
+   `::-webkit-scrollbar` 全部规则（两套不可混用）。所以 10px 其实一直是
+   `scrollbar-width: thin` 的实现宽度，而非那条 webkit 声明。
+   ⇒ 修法：先把本元素的 `scrollbar-width` / `scrollbar-color` 复位为 `auto`
+   （等价于「回到默认」，webkit 规则随之重新生效），再给 webkit 宽度。
+   隔离实测：仅写 webkit 8px ⇒ 10px（无效）；复位后写 ⇒ **8px / `.td` 224px**（生效）。
+
+   🔴 thumb 的 `border-width` 必须同步 3px → 2px：可见 thumb 宽 = 槽宽 − 2×border
+   ⇒ 原 10−6=4px；若只收槽宽留 3px，8−6 只剩 2px，细得几乎点不中。
+   ⇒ 8px 槽 + 2px border = 4px 可见，观感与改动前一致，空槽少 2px。
+
+   `@supports selector(::-webkit-scrollbar)` 把这段限定给 Chromium：Firefox 不支持该
+   伪元素，会继续保持全局的 `scrollbar-width: thin`（其宽度由浏览器决定，无法也不需设像素）。 */
+@supports selector(::-webkit-scrollbar) {
+  .tool-list {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+
+  .tool-list::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .tool-list::-webkit-scrollbar-thumb {
+    border-width: 2px;
+  }
+}
+
+.tool-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition:
+    background var(--t-fast),
+    transform var(--t-fast) var(--ease);
+}
+
+.tool-item:hover {
+  background: var(--surface-3);
+}
+
+.tool-item.active {
+  background: var(--accent-soft);
+}
+
+.tool-item .tn {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* min-width:0 是**必须**的：.td 的 min-content = 整句描述宽度；列向 flex 的交叉轴
+   min 默认 auto ⇒ 不写 0 就压不下去，再经 1fr 轨道的 auto 最小尺寸把整张卡顶破视口
+   （320px 视口实测溢出 183px）。 */
+.tool-item .td {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  min-width: 0;
+  /* 2026-10-14 主人：「在工具列表把工具作用给写上」。
+     原先是 `nowrap + ellipsis` 单行 —— rail 最宽也才 268px（`.td` contentW 232px），
+     实测 **24 项里 19 项**被截（`memory_audit` scrollW 487 vs clientW 232，一半以上
+     看不见）⇒ 主人根本读不到「工具作用」。
+     改：折行显示，上限 **3 行**（今天最长的描述按 232px 宽只需 2.1 行 ⇒ 现有 24 项
+     全部完整可见；上限只用来防将来新增超长文案把列表撑爆）。
+     `overflow-wrap: anywhere` 防 `max_chars`、`frontmatter` 这类长英文串顶破窄栏。 */
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+
+  overflow: hidden;
+}
+
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.kv-row {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--border-soft);
+  font-size: 13px;
+}
+
+.kv-row:last-child {
+  border-bottom: 0;
+}
+
+.kv-k {
+  width: 158px;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.kv-v {
+  min-width: 0;
+  flex: 1;
+  word-break: break-word;
+}
+
+pre.code {
+  margin: 0;
+  padding: 14px;
+  border-radius: var(--r);
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  overflow: auto;
+  max-height: 56vh;
+  font-size: 12.6px;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+pre.code.plain {
+  white-space: pre-wrap;
+}
+
+/* JSON 树 */
+.json {
+  font-family: var(--mono);
+  font-size: 12.6px;
+  line-height: 1.68;
+}
+
+.json-row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  border-radius: 5px;
+  padding: 0 4px;
+}
+
+.json-row:hover {
+  background: var(--surface-3);
+}
+
+.json-toggle {
+  width: 14px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  color: var(--text-faint);
+  user-select: none;
+  text-align: center;
+}
+
+.json-key {
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.json-str {
+  color: var(--ok);
+  word-break: break-word;
+}
+
+.json-num {
+  color: var(--warn);
+}
+
+.json-bool {
+  color: var(--info);
+}
+
+.json-null {
+  color: var(--text-faint);
+}
+
+.json-children {
+  padding-left: 18px;
+  border-left: 1px dashed var(--border-soft);
+  margin-left: 6px;
+}
+
+/* Markdown 正文 */
+.md {
+  font-size: 14px;
+  line-height: 1.72;
+  word-wrap: break-word;
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 1.4em 0 0.55em;
+  line-height: 1.3;
+}
+
+.md h1 {
+  font-size: 1.5em;
+}
+
+.md h2 {
+  font-size: 1.28em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.md h3 {
+  font-size: 1.1em;
+}
+
+.md h4 {
+  font-size: 1em;
+}
+
+.md p {
+  margin: 0 0 0.85em;
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 0.85em;
+  padding-left: 1.5em;
+}
+
+.md li {
+  margin: 0.25em 0;
+}
+
+.md li::marker {
+  color: var(--text-faint);
+}
+
+.md blockquote {
+  margin: 0 0 0.9em;
+  padding: 0.5em 0.95em;
+  color: var(--text-dim);
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
+}
+
+.md code {
+  background: var(--surface-3);
+  padding: 0.14em 0.42em;
+  border-radius: 5px;
+  font-size: 0.87em;
+}
+
+.md pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r);
+  padding: 13px;
+  overflow: auto;
+  margin: 0 0 0.9em;
+}
+
+.md pre code {
+  background: none;
+  padding: 0;
+}
+
+.md table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0 0 0.9em;
+  font-size: 0.94em;
+  display: block;
+  overflow-x: auto;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 7px 11px;
+  text-align: left;
+}
+
+.md th {
+  background: var(--surface-3);
+  font-weight: 650;
+}
+
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1.4em 0;
+}
+
+.md img {
+  max-width: 100%;
+  border-radius: var(--r);
+}
+
+.md a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.wikilink {
+  color: var(--accent);
+  border-bottom: 1px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+  cursor: pointer;
+}

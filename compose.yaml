@@ -1,0 +1,34 @@
+# ai-memory（v3 阶段 1 · Streamable HTTP）本机测试用的 compose 定义
+#
+# 起：docker compose up -d --build
+# 连：http://127.0.0.1:8700/mcp
+# 停：docker compose down            （卷保留，数据不丢）
+
+services:
+  ai-memory:
+    image: ai-memory:2.6.0
+    build:
+      context: .
+    container_name: ai-memory
+    # hostname 会进入容器的 Host 白名单（见镜像内 AI_MEMORY_HTTP_ALLOWED_HOSTS）
+    hostname: ai-memory
+    restart: unless-stopped
+
+    # 只绑回环：宿主机所在局域网看不到这个端口（v3 红线之一 —— HTTP 端口不 publish 到宿主）
+    ports:
+      - "127.0.0.1:8700:8700"
+
+    environment:
+      AI_MEMORY_DIR: /vault
+      # 要从别的主机名/地址访问时必须显式追加，否则 Host 校验会拦截（有意的摩擦）。
+      # 例：AI_MEMORY_HTTP_ALLOWED_HOSTS="localhost:*,127.0.0.1:*,ai-memory:*,192.168.1.20:8700"
+      AI_MEMORY_HTTP_ALLOWED_HOSTS: "localhost:*,127.0.0.1:*,ai-memory:*"
+
+    volumes:
+      # 具名卷：数据在 Docker 管理的卷里，docker compose down 不会删掉它。
+      # 想直接指向一个已有记忆库目录，把下面两行换成 bind mount：
+      #   - /path/to/your/ai-memory:/vault      （Windows 形如 - D:/memory/ai-memory:/vault）
+      - vault:/vault
+
+volumes:
+  vault:

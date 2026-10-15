@@ -1,0 +1,344 @@
+/* ============================================================================
+ * 5-overlays.css —— 浮层与空态
+ *
+ * 标签页、空态与骨架屏、弹层/Toast/确认框、杂项。
+ *
+ * ⚠️ 本文件由 style.css 按层拆出（2026-10-15）。引入顺序 = 层叠顺序，
+ *    index.html 必须按 1 → 8 依次 link，不可调换、不可按需懒加载。
+ * ========================================================================== */
+/* ---------- 13. 标签页 ---------- */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--surface-3);
+  border-radius: var(--r);
+  overflow-x: auto;
+}
+
+.tab {
+  padding: 7px 14px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 570;
+  white-space: nowrap;
+  transition: all var(--t-fast) var(--ease);
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+
+/* ---------- 14. 空态 / 骨架 ---------- */
+.empty {
+  text-align: center;
+  padding: 46px 20px;
+  color: var(--text-faint);
+}
+
+.empty-ico {
+  width: 54px;
+  height: 54px;
+  margin: 0 auto 14px;
+  border-radius: var(--r-lg);
+  display: grid;
+  place-items: center;
+  background: var(--surface-3);
+  color: var(--text-faint);
+}
+
+.empty-ico svg {
+  width: 25px;
+  height: 25px;
+}
+
+.empty b {
+  display: block;
+  color: var(--text-dim);
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.skel {
+  background: var(--surface-3);
+  border-radius: var(--r-sm);
+  position: relative;
+  overflow: hidden;
+}
+
+.skel::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--text) 7%, transparent),
+    transparent
+  );
+  animation: shimmer 1.5s infinite;
+}
+
+.skel.line {
+  height: 13px;
+  margin-bottom: 9px;
+}
+
+.skel.line.w60 {
+  width: 60%;
+}
+
+.skel.line.w40 {
+  width: 40%;
+}
+
+.skel.line.w80 {
+  width: 80%;
+}
+
+.skel.block {
+  height: 84px;
+}
+
+/* ---------- 15. 弹层 / 提示 ---------- */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: var(--mask);
+  backdrop-filter: blur(4px);
+  /* 遮罩的淡入淡出交给 <transition name="modal">（§17c）。
+     animation 优先级高于 transition，留在这里会让离场过渡失效。 */
+}
+
+.modal {
+  width: 100%;
+  max-width: 520px;
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  /* 进出场交给 <transition name="modal">（§17c）。 */
+  transform-origin: 50% 12%;
+}
+
+.modal-head {
+  padding: 17px 20px 0;
+}
+
+.modal-head h3 {
+  font-size: 16.5px;
+  margin-bottom: 5px;
+}
+
+.modal-head p {
+  color: var(--text-dim);
+  font-size: 13px;
+  margin: 0;
+}
+
+.modal-body {
+  padding: 16px 20px;
+}
+
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  padding: 0 20px 18px;
+}
+
+.toast-wrap {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-width: min(370px, calc(100vw - 36px));
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-2);
+  font-size: 13px;
+  /* 进出场交给 <transition-group name="toast">（§17c）。
+     max-height 是离场「塌陷」用的：没有它，max-height 过渡无起点，
+     条目只会淡出、不腾位置，下面的 toast 会在它消失那一刻瞬跳。 */
+  max-height: 220px;
+}
+
+.toast.ok {
+  border-left-color: var(--ok);
+}
+
+.toast.err {
+  border-left-color: var(--err);
+}
+
+.toast.warn {
+  border-left-color: var(--warn);
+}
+
+.toast-title {
+  font-weight: 620;
+  margin-bottom: 2px;
+}
+
+.toast-body {
+  color: var(--text-dim);
+  font-size: 12.4px;
+  word-break: break-word;
+}
+
+.toast-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* ---------- 16. 杂项 ---------- */
+.mono {
+  font-family: var(--mono);
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+.small {
+  font-size: 12.2px;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.flex {
+  display: flex;
+}
+
+.between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.center {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wrap {
+  flex-wrap: wrap;
+}
+
+.mt {
+  margin-top: 14px;
+}
+
+.mt-sm {
+  margin-top: 8px;
+}
+
+.mb {
+  margin-bottom: 14px;
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.divider {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 16px 0;
+}
+
+.scroll-x {
+  overflow-x: auto;
+}
+
+/* ⚠️ 该规则**保留**：记忆库页右栏（`<x-card bare class="sticky-side">`）与 XCard 的
+   `sticky` prop 映射（app.js:1288）都在用它。调试台左栏自 2026-10-14 起改为
+   「等高 + 内滚」而不再用 sticky —— 因为 position:sticky 与 grid 的
+   `align-items: stretch` 互斥（元素被拉满行高后不再有可粘的位移）。 */
+.sticky-side {
+  position: sticky;
+  top: calc(var(--topbar-h) + 18px);
+}
+
+.banner {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: var(--r);
+  background: var(--warn-soft);
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+  font-size: 12.8px;
+  color: var(--text);
+  margin-bottom: 14px;
+}
+
+.banner.err {
+  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--err) 30%, transparent);
+}
+
+.banner.info {
+  background: var(--info-soft);
+  border-color: color-mix(in srgb, var(--info) 28%, transparent);
+}
+
+.banner.ok {
+  background: var(--ok-soft);
+  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
+}
+
+.banner svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.count-up {
+  font-variant-numeric: tabular-nums;
+}

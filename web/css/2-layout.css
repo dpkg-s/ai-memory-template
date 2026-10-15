@@ -1,0 +1,440 @@
+/* ============================================================================
+ * 2-layout.css —— 骨架布局
+ *
+ * 三栏外壳：侧栏 / 主区 / 底部状态栏、VS Code 骨架（活动栏、面包屑）、
+ * 连接状态药丸。决定了「页面由哪几块拼成」。
+ *
+ * ⚠️ 本文件由 style.css 按层拆出（2026-10-15）。引入顺序 = 层叠顺序，
+ *    index.html 必须按 1 → 8 依次 link，不可调换、不可按需懒加载。
+ * ========================================================================== */
+/* ---------- 3. 骨架布局 ---------- */
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: var(--sidebar-w);
+  z-index: var(--z-drawer);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 10px calc(16px + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  transition:
+    transform var(--t) var(--ease),
+    width var(--t) var(--ease);
+}
+
+/* 窄图标条：文字一律不显示，语义靠 :title 原生 tooltip + aria-label。
+   手机抽屉（≤899px）再 revert 回文字态。 */
+.brand-text,
+.nav-label,
+.nav-kbd,
+.nav-sec,
+.sidebar-foot {
+  display: none;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  padding: 4px 0 14px;
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  flex: 0 0 auto;
+  background: var(--accent);
+  display: grid;
+  place-items: center;
+  color: var(--accent-ink);
+}
+
+.brand-mark svg {
+  width: 20px;
+  height: 20px;
+}
+
+.brand-text {
+  min-width: 0;
+}
+
+.brand-name {
+  font-weight: 680;
+  font-size: 15px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+.brand-sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.nav-sec {
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 14px 10px 6px;
+  font-weight: 650;
+}
+
+.nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  padding: 11px 0;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  background: none;
+  width: 100%;
+  text-align: left;
+  transition:
+    background var(--t-fast),
+    color var(--t-fast),
+    border-color var(--t-fast),
+    transform var(--t-fast) var(--ease);
+}
+
+.nav-item:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.nav-item:hover .nav-icon {
+  transform: scale(1.06);
+}
+
+.nav-icon {
+  transition: transform var(--t-fast) var(--ease);
+}
+
+.nav-item:active {
+  transform: scale(0.985);
+}
+
+.nav-item.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+/* 导航指示器：一个滑块在条目之间插值移动（2026-10-15 C 档交互动效）。
+   ⚠️ 取代原「每个 active 条目各自 popIn 的 ::before」——那一版切换页面时旧条目瞬间
+   消失、新条目在别处弹出，读起来是「又亮了一个」而不是「移过去了」，是两段互不
+   相干的动画。
+   ⚠️ 必须在 .sidebar（position:fixed）内**绝对定位**，不能改用 fixed：窄屏时
+   .sidebar 是一个会 transform 的抽屉，fixed 定位的子元素不跟随父级 transform。
+   位置由 JS 写 --ind-y / --ind-h（两侧 getBoundingClientRect 求差），JS 未运行时
+   停在不显示态（opacity:0），不会留下错位的残留装饰。 */
+.nav-ind {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 3px;
+  height: var(--ind-h, 20px);
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(var(--ind-y, 0px));
+  transition:
+    transform var(--t) var(--ease-spring),
+    height var(--t) var(--ease),
+    opacity var(--t-fast) var(--ease);
+}
+
+.nav-ind.on {
+  opacity: 1;
+}
+
+.nav-icon {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 auto;
+}
+
+.nav-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-kbd {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+}
+
+.sidebar-foot {
+  margin-top: auto;
+  padding: 12px 10px 2px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.foot-line {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.foot-line b {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.shell-main {
+  flex: 1;
+  min-width: 0;
+  margin-left: var(--sidebar-w);
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-topbar);
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 22px;
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.icon-btn {
+  display: none;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  place-items: center;
+  color: var(--text-dim);
+  transition: all var(--t-fast);
+}
+
+.icon-btn:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.topbar-title {
+  font-weight: 650;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.topbar-sub {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.topbar-titles {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.topbar-titles .topbar-title,
+.topbar-titles .topbar-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.main {
+  /* 2026-10-13 两轮裁决：
+     ① 「不留 padding / margin，铺满」⇒ 去掉 1240px 宽度上限与四周留白；
+     ② 「主页面左边可以给个 padding 5-10」⇒ 仅**左侧**补 8px（区间中点），
+        免得内容紧贴 64px 侧栏；右侧仍贴视口，
+        所以「`.main` 右沿 == 视口右沿」与「无外留白」两条判据都保持不变。 */
+  flex: 1;
+  width: 100%;
+  padding-left: 8px;
+}
+
+/* ---------- 3b. 底部状态条（UXPilot 骨架：顶栏 + 底栏 双层状态） ---------- */
+/* sticky 贴底：内容不满一屏时靠 .main 的 flex:1 撑开自然落底，
+   内容超屏时滚动过程中保持可见。 */
+.statusbar {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-topbar);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--statusbar-h);
+  padding: 0 22px;
+  font-size: 11.5px;
+  line-height: 1;
+  color: var(--text-faint);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+.statusbar .sb-grp {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.statusbar b {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.statusbar .mono {
+  font-size: 11px;
+}
+
+.statusbar .spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ---------- 3c. VS Code 骨架（面包屑） ----------
+   2026-10-13：原「编辑器标签条 .tabsbar」与「底部面板 .panel」两条横带已整块摘除，
+   连带下线视图切换；VS Code 骨架只保留面包屑 + 状态条。
+   2026-10-15：活动栏**底簇 .nav-bot 取消**（「配置」并入顶簇，四项连续排布，
+   见 js/views/Root.js）—— 底部定位改由 .sidebar-foot 自身的 margin-top:auto
+   独占，骨架只剩面包屑。 */
+
+/* 顶栏应用名右侧的版本号，弱化处理。 */
+.tb-ver {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-faint);
+  margin-left: 7px;
+}
+
+/* --- 面包屑 = VS Code 的 breadcrumbs：`根 › 页`（视图段已下线） --- */
+.crumbs {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: calc(var(--z-topbar) - 1);
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  height: var(--crumbs-h);
+  padding: 0 20px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* 面包屑末段已是静态 <span>（视图切换下线后不再可点）。 */
+.crumb {
+  color: var(--text-faint);
+  padding: 2px 4px;
+  border-radius: var(--r-xs);
+}
+
+.crumb.last {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.crumbs .crumb-sep {
+  margin: 0 1px;
+}
+
+/* 2026-10-13：视图切换（.v-recent/.v-out/.v-log/.v-node）已随标签条一并下线，
+   各页固定为默认完整布局，不再有专注模式。 */
+/* 顶栏面包屑前缀 */
+.crumb-root {
+  color: var(--text-faint);
+  font-weight: 550;
+}
+
+.crumb-sep {
+  color: var(--text-faint);
+  font-weight: 400;
+  margin: 0 5px;
+}
+
+/* ---------- 4. 连接状态药丸 ---------- */
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease);
+  white-space: nowrap;
+}
+
+.conn:hover {
+  background: var(--surface-3);
+}
+
+.conn .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 0 var(--ok);
+  animation: pulse 2.4s var(--ease-in-out) infinite;
+}
+
+.dot.err {
+  background: var(--err);
+}
+
+.dot.idle {
+  background: var(--text-faint);
+}
+
+.conn.ok {
+  border-color: color-mix(in srgb, var(--ok) 38%, transparent);
+  color: var(--text);
+}
+
+.conn.err {
+  border-color: color-mix(in srgb, var(--err) 40%, transparent);
+  color: var(--text);
+}

@@ -1,0 +1,886 @@
+/* ============================================================================
+ * 7-views.css —— 视图专有面板
+ *
+ * 终端输出 / Log Inspector / NODE INFO、配置页分组导航、
+ * 概览页骨架（§17c 与 17c-2/17c-3 的铺满策略）。
+ *
+ * ⚠️ 本文件由 style.css 按层拆出（2026-10-15）。引入顺序 = 层叠顺序，
+ *    index.html 必须按 1 → 8 依次 link，不可调换、不可按需懒加载。
+ * ========================================================================== */
+/* ---------- 17b. 终端输出 / Log Inspector / NODE INFO / 配置分组导航 ----------
+   四块均为 UXPilot 骨架要素（评审 §4A 判定「可直接留用」）：
+     p1 的 TERMINAL OUTPUT 块 + 右侧 Log Inspector 栏
+     p3 的 NODE INFO 三栏
+     p4 的左侧 CONFIGURATION 分组导航
+   视觉语言沿用本项目：等宽字体承载 ID/命令/日志，配色仍为「曜石·霜白」。 */
+
+.term {
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r);
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 12.4px;
+  line-height: 1.75;
+  max-height: 46vh;
+  overflow: auto;
+}
+
+.term-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.term-dim {
+  color: var(--text-faint);
+}
+
+.term-ok {
+  color: var(--ok);
+}
+
+.term-err {
+  color: var(--err);
+}
+
+.term-prompt {
+  color: var(--accent);
+  margin-right: 7px;
+  font-weight: 700;
+}
+
+.term-cmd {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.term-out {
+  color: var(--text-dim);
+  padding-left: 15px;
+  border-left: 2px solid var(--border);
+  margin: 2px 0 8px;
+}
+
+/* 终端行内的**闪烁光标** `▍`（只在「执行中…」那一行出现）。
+   ⚠️ 折叠三角复用了同一个 class（见 §19-⑨ `.term-sec-toggle .term-caret`），但三角是
+   **静态三角形**、不该闪 ⇒ 这条闪烁规则必须**限定在 `.term-line` 内**，否则会误伤三角。
+   2026-10-14 主人：「小三角不要闪烁」——实测三角 computed `animation-name` 正是 `blink`。 */
+.term-line .term-caret {
+  color: var(--accent);
+  animation: blink 1.1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.log-search {
+  position: relative;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.log-search .input {
+  padding-left: 32px;
+  font-size: 12.5px;
+}
+
+.log-search svg {
+  position: absolute;
+  left: 22px;
+  top: calc(50% - 4px);
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--text-faint);
+}
+
+.log-list {
+  /* 同 `.tool-list`：改面板内滚，高度由右栏 flex 剩余空间决定。 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log-item {
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  background: var(--surface-2);
+}
+
+.log-item.ok {
+  border-left-color: var(--ok);
+}
+
+.log-item.err {
+  border-left-color: var(--err);
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.log-kind {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+}
+
+.log-item.err .log-kind {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 40%, transparent);
+}
+
+.log-time {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.log-tool {
+  font-size: 12px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.log-text {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-top: 3px;
+  display: -webkit-box;
+
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.log-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.ni-sec {
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  font-weight: 650;
+  margin: 14px 0 6px;
+}
+
+.ni-sec:first-child {
+  margin-top: 0;
+}
+
+.ni-kv .kv-k {
+  width: 76px;
+}
+
+.ni-kv .kv-row {
+  padding: 6px 0;
+  font-size: 12.5px;
+}
+
+.ni-links {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ni-link {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  transition: all var(--t-fast);
+}
+
+.ni-link:hover {
+  background: var(--surface-3);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.ni-link-t {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.tg-btn {
+  cursor: pointer;
+  font-family: inherit;
+  transition: all var(--t-fast);
+}
+
+.tg-btn:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(168px, 196px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.cfg-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  position: sticky;
+  top: calc(var(--topbar-h) + 18px);
+}
+
+.cfg-sec {
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-weight: 650;
+  padding: 0 10px 8px;
+}
+
+.cfg-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  border-radius: var(--r-sm);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  font-family: inherit;
+  transition: all var(--t-fast);
+}
+
+.cfg-item:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.cfg-item.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+.cfg-icon {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+.cfg-icon svg {
+  width: 17px;
+  height: 17px;
+}
+
+.cfg-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cfg-dot {
+  margin-left: auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: 0 0 auto;
+}
+
+.cfg-body {
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17c. 概览页骨架（对齐 UXPilot p1）
+ *      主区（热度分层 | 记忆类型） + 右侧窄栏（最近更新）
+ *      → 热门标签（**多排换行**，2026-10-14 起；此前为单行 + 横滚）
+ *      → 连接「页尾」（极简一条，不再占一整张卡）
+ * ------------------------------------------------------------------------- */
+
+/* 右栏宽度 = 日历宽度（2026-10-15 第五轮。主人原话：「最近更新的宽缩小成日历的」）
+ * 历史轨迹：0.32fr → 0.42fr（理由：让条目标题不被截断）→ 本次改 **固定上限 312px**。
+ * 为什么不再用 fr：
+ *   ① 上一轮把日历限宽 310px 居中后，396px 的卡片左右各余 43px 留白，日历像
+ *      「悬浮」在卡里（主人评「感觉不好看」）。把卡片收到 312px（− 2px 边框
+ *      = 310 内容宽）后日历**正好铺满**，留白归零；
+ *   ② 更要紧的是**宽高比**：日历铺满卡片后格子宽 = 卡片内容宽 ÷ 7，若右栏仍用
+ *      `fr` 就会随视口伸缩，39×34 的 1.15:1 立刻失守 ⇒ 必须定宽。
+ * 写成上限而非定值（`minmax(0, 312px)`）：窄视口下允许右栏继续缩，不挤压主区。
+ * ⚠️ 该轨道在窄视口必须整块塌成单列（见 §18 的 ≤899px），否则主区里
+ * `.grid.two` 的 320px 轨道下限会把页面撑出横向滚动。 */
+.grid.ov {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 312px);
+  /* stretch（不是 start）：面板区要跟着主区一起长满整行，折叠后那根 40px 竖条
+     也才能撑到行高 —— 这是 IDE 面板的观感。 */
+  align-items: stretch;
+}
+
+.ov-main,
+.ov-side {
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17c-2. 概览页「主内容铺满视口高度」（2026-10-14，已落地方案 C · 末卡吸底）
+ *   病征（CDP 实测 1440x900）：`.main` 已铺满（88→870），但 `.grid.ov` 只有内容
+ *   自然高 559px ⇒ 底部悬空 223px（28.5% 视口高）；右栏靠 align-items:stretch
+ *   只能跟着这 559px 走，整页看着「没画满」。
+ *   治法：网格最小高钉到「视口 − 顶栏 − 面包屑 − 状态栏」，主区改纵向 flex、
+ *   末张卡 margin-top:auto 吸底 ⇒ 右栏随之吃满，卡片本身保持自然高度。
+ *   ① `:has(.grid.ov)` 把作用域限定在概览页，记忆库/调试台/配置页零影响；
+ *   ② 用 min-height 而非 height：内容超长仍走页面滚动，不裁切；
+ *   ③ max(0px, …) 兜住极矮视口算出的负值（负 min-height 本就无效，这里显式化）。
+ *   复验：`_v3_ov_fill_probe.py`（判据 gapGrid2Sb ≤ 4px）。
+ * ------------------------------------------------------------------------- */
+.page:has(.grid.ov) .grid.ov {
+  min-height: max(
+    0px,
+    calc(100vh - var(--topbar-h) - var(--crumbs-h) - var(--statusbar-h))
+  );
+}
+
+.page:has(.grid.ov) .ov-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 末张卡与分布卡组之间留 **5px**（2026-10-14 主人指定）。
+   ⚠️ 原先写 `margin-top: auto`：§17c-3 让 `.grid.two { flex:1 1 auto }` 先吃掉全部
+   余量后，`auto` 外边距的可用空间归零 ⇒ 解析成 **0px**，两卡完全贴死（实测
+   `gapTwo2Tags = 0`，注释里写的「14 = .mt 边距」是错的）。改成显式值后无论
+   余量多少，间距恒为 5px。特异性 (0,4,0) > `.mt` (0,1,0)，稳定覆盖全局 14px。 */
+.page:has(.grid.ov) .ov-main > .ov-tags {
+  margin-top: 5px;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17c-3. 概览页「卡片直接铺满剩余空白」（2026-10-14 追加。主人原话：
+ *   「card 直接铺满剩下的空白」）
+ *   §17c-2 只做到「首尾贴边」——223px 空白被**集中到卡片组中段一处**；本次把这
+ *   段高度交给**分布图卡组**（`.grid.two`）吸收：
+ *     · 统计卡与热门标签卡保持自然高度（数字卡/横排 chips 变高没有意义）；
+ *     · 分布/图例卡是大面板，变高才是「面板该长的方向」。
+ *   卡内**不做铺开**（2026-10-14 修订）：分布条按**自然高度从上往下**堆叠，余量
+ *   作为卡片底部留白。原先那套「逐行等高」已被主人否掉，详见本节末段。
+ *   ⚠️ `.ov-tags` 的上边距由 §17c-2 单独给出（现为显式 **5px**）；分布卡组无余量
+ *   可分时也不会把标签卡挤到浮空。
+ *   复验：`_v3_ov_fill_probe.py` 的 `gapTwo2Tags`（2026-10-14 起应恒为 **5px**）。
+ * ------------------------------------------------------------------------- */
+.page:has(.grid.ov) .ov-main > .grid.two {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 🔴 根因修正（2026-10-14 实测）：全局 `.card { height: 100% }`（§10，给记忆库页
+   `.grid.lib` / `.column` 做等高用的）在 `.ov-main` 这个 flex column 里会被解释成
+   「占满父容器高」——于是 `.ov-tags` 的 base size 变成整个 782px，再被 shrink 到
+   465px，**抢走了本该给分布卡组的剩余高度**（实测：tags h=465、`.grid.two` 只长到
+   180）。这里在概览页作用域内显式还原自然高；分布卡的「填满网格行高」仍由全局
+   那 100% 提供（`.grid.two` 被拉伸 ⇒ 行高 stretch ⇒ `.card{height:100%}` 填满）。 */
+.page:has(.grid.ov) .ov-main > .card {
+  height: auto;
+}
+
+.page:has(.grid.ov) .grid.two > .card {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 🆕 2026-10-14 主人再改口：「grid two mt 里的 card 中的内容从上到下分布，不用沾满
+   平均」⇒ 撤掉此前「逐行等高」的铺开链（`.card-body` / `.tier-row` / `.tier-line`
+   三条 `flex: 1 1 auto`，逐级把余量传下去让每行平分）。
+   现状：卡片**本身**仍填满网格行高（全局 `.card { height:100% }` 未动，并排两卡
+   依然等高对齐），但卡内成员回到默认 `flex: 0 1 auto` ⇒ **按内容自然高度从上往下
+   堆**，剩余高度留成卡片底部空白。
+   取舍留档：被否掉的那版会让 3 行的「热度分层」卡每行撑到 ≈128px、8 行的「记忆
+   类型」卡每行 ≈50px —— 行高不再由内容决定，观感发空。 */
+.page:has(.grid.ov) .grid.two > .card > .card-body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17c-4. 统计卡「加载时保留骨架」（2026-10-14，主人原话：
+ *   「grid stats stagger 加载时保留骨架」）
+ *   配合 app.js 里 `.grid.stats` 的 `v-if="S.overview"` / `v-else` 分支：数据未到
+ *   时渲染 4 块 `.stat-skel`，取代原来「整块消失 ⇒ 下方内容上跳」以及链式请求期间
+ *   的「4 张 0 值假卡」。
+ *   ⚠️ 高度是**实测值**（不是推算）：`.card.stat` 在 ≥900px 为 123px（`.stat` 上下
+ *      padding 各 16px），在 ≤899px 为 111px（padding 各 13px）。卡片样式一变就会
+ *      与骨架失配 ⇒ 由 `_v3_stats_skel_probe.py` 在两档视口长期守护（骨架高必须
+ *      等于真实卡高，容器高差 ≤2px）。
+ * ------------------------------------------------------------------------- */
+.grid.stats > .stat-skel {
+  height: 123px;
+  border-radius: var(--r-lg);
+}
+
+@media (max-width: 899px) {
+  .grid.stats > .stat-skel {
+    height: 111px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 17d. 记忆库页「删页头 + 左右等宽 + 全高铺满」（2026-10-14，主人裁决方案 A）
+ *   三项诉求（主人原话）：
+ *     ①「page-head 可以删了」—— 与调试台同款处置：页头整块摘除，标题信息改由
+ *        左栏 card-head 承担。⚠️ 只删**记忆库页**那一处，配置页的 .page-head 保留。
+ *     ②「grid lib 中的 card and card sticky-side 宽度统一」—— 原为
+ *        `minmax(248px,0.86fr) … minmax(214px,252px)`：右栏被 252px 钉死、左栏却
+ *        随视口在 248~423px 间浮动 ⇒ 1440 下左右比 1.68:1、1100 下 1.15:1。
+ *        现两侧同用 clamp(248px, 20vw, 300px)（见 §5 的 .grid.lib 基础规则）。
+ *     ③「界面也是全高自动占满」—— 与概览页同源但**实现必须不同**：概览页网格上方
+ *        没有别的卡片，可直接给 `.grid.ov` 挂 min-height；记忆库网格上方还有搜索卡
+ *        （实测 ≈130px），若把「一屏剩余」直接给网格，整页会溢出搜索卡那么多。
+ *        ⇒ 改为**给 `.page` 定高**、网格 `flex:1` 吃掉剩余：搜索卡换高换矮都自适应。
+ *   为什么不用 min-height（概览页那套）：这里要的是「三栏永远等高、长内容各自内滚」，
+ *   而不是「至少一屏、超出就滚**页面**」。只有钉死行高（height）才能让 `.card` 的
+ *   `overflow:auto` 真正生效（内容撑不破行），正文很长时右侧 NODE INFO 也始终可见
+ *   —— 这正是原先 `position:sticky` 想达到的效果；sticky 与 stretch 互斥（被拉满
+ *   行高后没有可粘的位移），故一并放掉，`.sticky-side` 在本页作用域内降级为 static。
+ *   ⚠️ ≤899 单列必须放掉定高与均分行高（见文末媒体查询），否则三张卡各分 1/3 屏。
+ *   复验：`_v3_lib_probe.py --check`（九档视口：页头不存在 / 网格底贴状态栏 /
+ *        左右栏等宽 ±2px / 文档不被裁切）。
+ * ------------------------------------------------------------------------- */
+.page:has(.grid.lib) {
+  display: flex;
+  flex-direction: column;
+  height: max(
+    0px,
+    calc(100vh - var(--topbar-h) - var(--crumbs-h) - var(--statusbar-h))
+  );
+}
+
+.page:has(.grid.lib) .grid.lib {
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-auto-rows: minmax(0, 1fr);
+}
+
+/* 🔴 与 §17c-3 同源的坑：网格行被拉伸后，`.card` 的全局 `height:100%` 会被解析成
+   整行高 —— 此时若不给 `min-height: 0`，卡内长内容（如 313 条列表）会**反向把行
+   撑高**，定高当场失效。`min-height:auto` 是 grid/flex 项的默认值，必须显式归零。 */
+.page:has(.grid.lib) .grid.lib > .card {
+  height: auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.page:has(.grid.lib) .grid.lib .sticky-side {
+  position: static;
+}
+
+/* 2026-10-14 竖向 2 : 8 —— 搜索卡占 20%，三栏吃剩下 80%。
+   🔴 这一段同时**治根因**：搜索卡是 `.page` 的**直接子元素**，与 `.grid.lib` 平级。
+   上一轮只给 `.grid.lib > .card` 加了 `height:auto`，漏了它 ⇒ 它继续吃全局
+   `.card { height:100% }`，在定高的 `.page`（flex column）里被解析成「占满父容器」，
+   实测 1440×900 下撑到 **553px = 70.7%**，三栏只剩 215px（1920 下更离谱：720 / 228）。
+   教训：治「全局 height:100% 抢高度」时，**作用域要按 DOM 层级列全**
+   （`.page` 的直接子元素 ≠ `.grid.lib` 的子元素），不能只补刚改动的那一层。
+
+   `flex: 0 0 20%`   主轴（竖向）锁死 20%，flex-basis 显式给出 ⇒ height 不再参与解析。
+   `height: auto`    断掉全局 `height:100%`，双保险。
+   `min-height: 0`   不给的话 flex 项默认 `min-height:auto` 会被内容（158px）顶破 20%。
+   `overflow: auto`  硬比例也不裁内容 —— 矮视口下若内容超出 20%，内部滚动兜底。 */
+.page:has(.grid.lib) > .card {
+  flex: 0 0 20%;
+  height: auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17e. 面板区骨架（右栏）：终端口径内容行
+ *      ⚠️ 刻意**不引入新的视觉语言** —— 面板本体沿用既有的 `.card` / `.card-head`
+ *      （同一套 --surface / --border / --r-lg / h3 字号），这里只补「终端口径」的内容行
+ *      （等宽、单行省略、紧凑）。
+ *      2026-10-13：原有「① 折叠结构」已砍除 —— `.rail-chev` / `.grid.ov.rail-off` /
+ *      `.ide-panel.collapsed*` 全删，右栏改为**恒常显**。
+ *      主人的要求是「骨架靠 IDE，但色彩/风格/设计不靠」。
+ * ------------------------------------------------------------------------- */
+.ide-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ide-panel-head .spacer {
+  flex: 1;
+  min-width: 0;
+}
+
+.ide-panel-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+/* 终端口径内容行：等宽 + 单行省略 + 紧凑行距。 */
+.ide-rows {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+  /* 不设 max-height：B 方案把标签卡移进 .ov-main 后，右栏与主区整体等高，
+     让内容区吃满面板剩余高度、滚动条落在面板内部，更贴 IDE 的观感。 */
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.ide-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 14px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.ide-row:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.ide-row-t {
+  flex: 0 0 auto;
+  min-width: 50px;
+  color: var(--text-faint);
+}
+
+.ide-row-n {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 热门标签：**多排换行**（2026-10-14 主人：「tags-scroll 可以做成多排」）。
+   原为「一条」形态 —— `flex-wrap: nowrap` + `overflow-x: auto`，标签多时只能横向
+   拖动、看不全。改为 `wrap` 并撤掉横滚 ⇒ 标签全部可见，卡片高度由行数决定；
+   `.tags-actions` 仍钉在右侧（`.tags-row` 保持 nowrap，动作列不被挤走）。
+   ⚠️ `.tag` 保持 `flex: 0 0 auto`：chip 自身不伸缩，换行时不会压扁。 */
+.ov-tags .tags-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.ov-tags .tags-scroll {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-bottom: 0;
+}
+
+.ov-tags .tags-scroll .tag {
+  flex: 0 0 auto;
+}
+
+.ov-tags .tags-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* ---------------------------------------------------------------------------
+ * 17e-2. 概览右栏「最近更新」= 热力日历（2026-10-15，已落地方案 A · 右栏换芯）
+ *
+ *   主人要求（原话）：「概览的最近更新改成〔日历卡片〕这种类型的，但是**不需要
+ *   这么多东西**，然后表达那天的修改量**不使用球**，修改**当天日期的背景色**」。
+ *
+ *   ① **位置不动** —— 仍是 §17c 的右栏窄轨道（minmax(300px, 0.42fr)，1240 内容宽下
+ *      约 363px）。本卡只换卡内结构（竖列表 → 月历网格），面板骨架沿用 §17e 的
+ *      `.ide-panel` / `.ide-panel-body`，当日条目仍走 `.ide-rows` ⇒
+ *      页级铺满规则（§17c-2 / §17c-3）**零改动、零回归**。
+ *   ② **不用圆点** —— 修改量直接给当日格子**背景色**，四档 l1..l4。
+ *      ⚠️ 档位切点由 JS 的 `heatCuts` 按「窗口内活跃天的 p25 / p50 / p75」动态给出，
+ *      **不是**写死的绝对阈值：本库 120 天内 35 个活跃天的条数中位 5、p75 14、峰值 95，
+ *      绝对阈值（如 1 / 2 / 3~5 / ≥6）会把 15 天全压进最深档 —— 31 条与 6 条同色；
+ *      而按峰值取比例又反过来，离群点 95 让 32 天全落最浅档。四分位对离群稳健。
+ *      颜色只表达**相对热度**，绝对量由 `.cal-sum` 那行文字给。
+ *   ③ 四档一律用 `color-mix(--accent N%, transparent)` 兑透明，不写死色值 ——
+ *      `--accent` 由主题给（暗色近白 #dfe4e7、亮色近黑 #1b1f23），深浅两套自动成立。
+ *   ④ 状态优先级：热力（背景）< 今天（描边环）< 选中（实底反色）。
+ *   ⑤ 网格**恒 42 格（6 行）** —— 前后补格用相邻月日期灰显、不给热力、不可点。
+ *      这样切月时卡片高度不跳（若按实际周数生成 4/5/6 行，右侧面板会整块上下抖动）。
+ *   ⑥ **方化（2026-10-15 追加，已落地方案 C）** —— 主人原话：「概览的最近更新太宽了，
+ *      我想让他的日历变得方一点」。初版格子 46.7×27px ⇒ 宽高比 1.73:1，看着是横条。
+ *      A/B/C 三案线框比选：A 卡内拉满正方（47×47，卡片高 +120px，卡片失控）／
+ *      B 收窄右栏至 0.30fr（会退回标题截断的老问题，属页级回归）／
+ *      **C 限宽居中 + 轻度拉高**（胜出）：`.cal-week`/`.cal-grid`/`.cal-sum` 一律
+ *      `width:100% + max-width:310px + margin-inline:auto`，`.cal-cell` 高 27→34px
+ *      ⇒ 单格 **39×34（1.15:1）**、网格整体由 339px 收到 286px 内容宽、卡高 +42px。
+ *      右栏轨道与主区（§17c / §17c-2 / §17c-3）**零改动、零回归**。
+ *   ⑦ **条目区滚动（同批追加，主人原话：「下面的显示内容添加滚动条」）** ——
+ *      见 `.cal-rows` 处注释：`flex:1 1 0` + `max-height:300px` + `overflow-y:auto`。
+ *   ⑧ **卡片收窄到日历宽（2026-10-15 第五轮）** —— 主人原话：「最近更新的宽缩小成
+ *      日历的」。第四轮方化后卡片（0.42fr ≈ 396px）比日历（310px）宽出 86px，
+ *      两侧各余 43px 留白，观感「悬浮」；主人评「感觉不好看」。
+ *      改法**只动轨道**：§17c 的 `minmax(300px, 0.42fr)` → `minmax(0, 312px)`
+ *      （312 − 2px 边框 = 310 内容宽 = 日历宽）⇒ 日历铺满、留白归零，
+ *      且 `.cal-nav` 随之同宽，箭头与网格两端自动对齐（此前错位约 28px）。
+ *      连带两处对齐：`.cal-rows .ide-row` 的 `padding-inline` 由 14px 收到 12px
+ *      （与日历的 12px 口径统一）；条目标题前缀改用 `.ide-row-p` 淡化。
+ *      ⚠️ 右栏**必须定宽**：日历铺满后格子宽 = 卡片内容宽 ÷ 7，用 `fr` 会随视口
+ *      伸缩、39×34 的 1.15:1 立刻失守。
+ *   ⑨ **间距/圆角/字号精修（2026-10-15 第五轮同批）** —— 主人评「感觉不好看」的
+ *      症结其实是**色块连片**：`gap: 2px` 在原 39px 的格子上几乎不可见，整月热力
+ *      糊成一条条色带。三处联动：
+ *        · `gap: 2px → 5px`（网格与星期行同步，否则星期标题与列错位）
+ *        · `.cal-cell` 高 `34px → 36px`、`font-size: 11px → 12px`
+ *        · 圆角 `--r-xs`(5px) → `--r-sm`(8px)
+ *      ⇒ 单格 **36.6 × 36**（1.02:1，视觉严格正方），7 列彼此独立。
+ *      🔴 这三个值是**一组**：gap 变大会压缩列宽，高度必须同步减/加到与列宽相当，
+ *      否则「方」又失守。
+ * ------------------------------------------------------------------------- */
+.cal-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 0;
+}
+
+.cal-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.cal-step {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cal-step:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.cal-step:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.cal-week,
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 5px;
+  /* 方化（2026-10-15。第四轮定案 C，第五轮调右栏宽度 + 精修间距）：
+     网格限到 **310px**（含左右各 12px 内边距 ⇒ 内容 286px）。
+     **gap 2px → 5px** 是第五轮的关键一笔：2px 在原 39px 的格子上几乎不可见，
+     热力块糊成一条条色带（主人评「感觉不好看」的症结）；5px 之后 7 列各自独立，
+     单格约 **36.6 × 36**，配 `--r-sm` 圆角即 1.02:1 的正方块。
+       · 第四轮：右栏 0.42fr（≈396px）+ 限宽居中 ⇒ 左右各余 43px 留白，日历看着
+         「悬浮」；
+       · **第五轮**：右栏轨道收到 `minmax(0, 312px)`（− 2px 边框 = 310 内容宽），
+         日历**正好铺满**、留白归零；`.cal-nav` 同时回到同宽，箭头与网格两端
+         自动对齐（此前箭头贴卡片两端、与居中的网格错位约 28px）。
+       · `max-width` 在此**保留是有用的**：≤899px 塌单列时卡片变全宽，靠它兜住
+         上限，否则单格会被拉到 100px+ 宽、彻底变形。
+     ⚠️ `width:100%` 不可省：父级 `.ide-panel-body` 是 flex column、
+     align-items 默认 stretch，只写 max-width 时 auto 外边距的居中并不稳定。 */
+  width: 100%;
+  max-width: 310px;
+  margin-inline: auto;
+}
+
+.cal-week {
+  padding: 7px 12px 0;
+}
+
+.cal-week span {
+  text-align: center;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.cal-grid {
+  padding: 4px 12px 0;
+}
+
+.cal-cell {
+  min-width: 0;
+  /* 高度轨迹（2026-10-15）：27px → 34px（第四轮方化）→ **36px**（第五轮精修）。
+     与 5px 的 gap 配合后单格约 **36.6 × 36**（1.02:1，视觉正方），
+     6 行网格由 162px 增至 216px。 */
+  height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  /* 5px → 8px（--r-sm）：36px 的方块配 5px 圆角偏硬，8px 才有「卡片块」的观感。 */
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cal-cell:hover:not(.out):not(:disabled) {
+  border-color: var(--border);
+  color: var(--text);
+}
+
+/* 前后补格：相邻月的日期，灰显、不可点、不给热力 */
+.cal-cell.out {
+  opacity: 0.34;
+  cursor: default;
+}
+
+/* 修改量 = 背景色（无圆点） */
+.cal-cell.l1 {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--text);
+}
+
+.cal-cell.l2 {
+  background: color-mix(in srgb, var(--accent) 19%, transparent);
+  color: var(--text);
+}
+
+.cal-cell.l3 {
+  background: color-mix(in srgb, var(--accent) 33%, transparent);
+  color: var(--text);
+}
+
+.cal-cell.l4 {
+  background: color-mix(in srgb, var(--accent) 48%, transparent);
+  color: var(--text);
+}
+
+/* 今天：描边环；选中：实底反色（连 hover 一起压住，选中态永远最显眼） */
+.cal-cell.today {
+  border-color: color-mix(in srgb, var(--accent) 58%, transparent);
+}
+
+.cal-cell.on,
+.cal-cell.on:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* 月度一行摘要（限宽口径与上面的网格一致，保证左边缘对齐） */
+.cal-sum {
+  width: 100%;
+  max-width: 310px;
+  margin-inline: auto;
+  padding: 7px 12px 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* 选中日条目：沿用终端口径行（.ide-rows），只加一道分隔线。
+   滚动约束（2026-10-15，主人原话：「下面的显示内容添加滚动条」）：
+   ① `flex: 1 1 0`（basis **0**，非 auto）—— 让条目区只吃面板**剩余**空间，
+      不再按内容自然高参与分配，条目再多也撑不高本卡；
+   ② `max-height: 300px` 是必须的兜底：`.grid.ov` 用的是 **min-height**（§17c-2），
+      左主区内容一旦超过视口高就把整行撑高、右栏随之 stretch 变高，此时面板
+      「永远够高」⇒ 条目区永不溢出 ⇒ 滚动条落到了**整页**上。显式上限把溢出
+      收回到本区内部；约合 13 行终端口径条目；
+   ③ `min-height: 96px`（而非 0）—— 纯 0 会让 `min-height:0` 解掉最小内容高的同时，
+      在矮视口/单列模式下把条目区一路压成一条缝（实测 860x760 下仅剩 13px）；
+      96px 约合 4 行，再配合下面 `:has(.cal-grid)` 的面板兜底滚动。 */
+.cal-rows {
+  flex: 1 1 0;
+  min-height: 96px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-top: 6px;
+  border-top: 1px solid var(--border-soft);
+}
+
+/* 兜底滚动（2026-10-15）：单列模式（§18 ≤899px）下右栏摊成全宽、面板高度骤降，
+   `nav + week + grid(218px) + sum` 已吃掉约 291px —— 只剩十几像素给条目区，
+   12 条条目会被压成一条看不见的缝。`.ide-panel` 是 overflow:hidden，超出即**裁掉**。
+   两条约束配合：`.cal-rows` 的 `min-height:96px`（约 4 行）保住下限，本行再让
+   面板主体可滚，把溢出降级成「整块可滚」而不是「静默裁切」。
+   ⚠️ 用 `:has(.cal-grid)` 限定在概览页 —— `.ide-panel-body` 同时被
+   ConsolePage 的日志检查器复用，直接改通用类会波及调试台。
+   大屏下面板内容不溢出，此规则不触发，无副作用。 */
+.page:has(.cal-grid) .ide-panel-body {
+  overflow-y: auto;
+}
+
+/* 条目行左右内边距与日历色块区对齐（2026-10-15 第五轮）。
+   `.ide-row` 通用款是 14px，而 `.cal-week`/`.cal-grid`/`.cal-sum` 都是 12px ⇒
+   卡片收窄到 310 内容宽后，这 2px 的错位会肉眼可见（条目文字比日历左边缘缩进更多）。
+   只限定在 `.cal-rows` 内，`ConsolePage` 的日志检查器不受影响。 */
+.cal-rows .ide-row {
+  padding-inline: 12px;
+}
+
+/* 条目标题的前缀段（项目_ / 经验_ / 运维_…）——淡化显示。
+   一屏 12 条里同一前缀重复 8 次，全用主色会把视觉重心从「主干」拉走。 */
+.cal-rows .ide-row-p {
+  color: var(--text-faint);
+}

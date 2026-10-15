@@ -6,3 +6,16 @@
 *.sh text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
+
+# 2026-10-15 补：以下四类此前**漏配**，而 core.autocrlf=true 会把它们在工作区
+# 转成 CRLF。两个后果都不是"洁癖"问题：
+#   1. Web 前端（.js/.css/.html）—— 工作区原本是 LF，一旦经 git 检出即变 CRLF，
+#      与既存文件不一致 ⇒ 「从仓库更新前端」每次都会产生整文件 diff。
+#   2. Dockerfile / .dockerignore —— 带 CRLF 的 Dockerfile 会让 `docker build`
+#      解析失败（指令行尾多出 CR）。容器资产必须锁死 LF。
+*.js text eol=lf
+*.mjs text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

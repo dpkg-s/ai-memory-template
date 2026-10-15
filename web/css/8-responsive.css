@@ -1,0 +1,572 @@
+/* ============================================================================
+ * 8-responsive.css —— 三端适配与补丁区
+ *
+ * 媒体查询（桌面/平板/手机三态）以及历次针对性覆写。
+ * 🔴 补丁区必须留在最后：它们靠层叠顺序覆盖上面的规则，
+ *    挪到前面会静默失效。
+ *
+ * ⚠️ 本文件由 style.css 按层拆出（2026-10-15）。引入顺序 = 层叠顺序，
+ *    index.html 必须按 1 → 8 依次 link，不可调换、不可按需懒加载。
+ * ========================================================================== */
+/* ---------- 18. 三端适配 ---------- */
+/* 🔴 调试台左右栏宽**不再设媒体查询分档**（2026-10-14 CDP 实测判死）：
+   分档下「视口 1279 → 中栏 715」却「视口 1280 → 中栏 644」—— 视口变宽、中栏反而
+   变窄，是非单调台阶。根因是分档在断点处把 rail 从 268 跳到 232（−36，左右合计
+   −72px），而视口只差 1px，中栏净赚 71px。
+   改由 `.console-grid` 的 `--con-rail: clamp(180px, 21vw, 268px)` 表达：中栏宽
+   = 内容宽 − 2·rail − gap，斜率 1 − 2×0.21 = 0.58 > 0 ⇒ 随视口单调不减；两段在
+   1276px 处连续（21vw = 267.96 ≈ 268）。899 以下整体转单列（见下）。 */
+/* ≥1180px 与 900–1179px 现在**同为窄图标条**（形态统一，贴合 UXPilot 骨架），
+   2026-10-13：主内容区改为铺满，本断点的左右留白已删除。 */
+@media (max-width: 899px) {
+  :root {
+    --sidebar-w: 0px;
+    --topbar-h: 58px;
+  }
+
+  .sidebar {
+    width: 272px;
+    transform: translateX(-100%);
+    box-shadow: var(--shadow-3);
+    padding-top: calc(18px + env(safe-area-inset-top));
+  }
+
+  .sidebar.open {
+    transform: translateX(0);
+  }
+
+  .brand-text,
+  .nav-label,
+  .nav-kbd,
+  .nav-sec,
+  .sidebar-foot {
+    display: revert;
+  }
+
+  .brand {
+    justify-content: flex-start;
+    padding: 6px 8px 18px;
+  }
+
+  .nav-item {
+    justify-content: flex-start;
+    padding: 11px 12px;
+  }
+
+  .nav-item.active::before {
+    left: -14px;
+  }
+
+  .shell-main {
+    margin-left: 0;
+  }
+
+  .icon-btn {
+    display: grid;
+  }
+
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: calc(var(--z-drawer) - 1);
+    background: var(--mask);
+    animation: fadeIn var(--t-fast) var(--ease);
+  }
+
+  .topbar {
+    padding: 0 15px;
+  }
+
+  .statusbar {
+    padding: 0 15px;
+  }
+
+  .console-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .grid.lib {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 单列堆叠：放掉 §17d 的定高与均分行高 —— 否则三张卡各分 1/3 屏、整页只剩一屏，
+     而单列本来就该按内容自然堆叠、让页面自己滚。 */
+  .page:has(.grid.lib) {
+    height: auto;
+  }
+
+  /* 单列时放掉竖向 2:8 的硬比例 —— `.page` 高度已是 auto，百分比 flex-basis
+     无从解析，搜索卡回落到内容自然高、让页面自己滚（与上面「放掉定高」同源）。 */
+  .page:has(.grid.lib) > .card {
+    flex: 0 0 auto;
+  }
+
+  .page:has(.grid.lib) .grid.lib {
+    grid-auto-rows: auto;
+  }
+
+  /* 概览：窄屏塌成单列。放在这里（而不是 1179）是算出来的 ——
+     主区里 `.grid.two` 的轨道下限 320px，右栏下限 300px，加 14px gap = 634px；
+     900px 视口下内容宽约 800px 仍有余量，再窄就必须塌。 */
+  .grid.ov {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ide-rows {
+    max-height: none;
+  }
+
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 🔴 单列堆叠后三栏不再是「等高面板」：必须放掉 §12 的 `--con-h` 定高，否则
+     三个面板各自吃掉「一屏减顶栏」的高度 ⇒ 整页高 ≈3 屏。改由下面
+     `.tool-list/.log-list` 的 max-height 兜住长度。 */
+  .page:has(.console-grid) .con-rail,
+  .page:has(.console-grid) .con-main,
+  .page:has(.console-grid) .con-side {
+    height: auto;
+  }
+
+  /* 单列下 7:3 的 `fr` 没有确定高度可依（容器已是 auto）⇒ 改回自然堆叠，
+     否则 fr 会退化成按内容分配，比例失去意义还可能出现 0 高的一档。 */
+  .page:has(.console-grid) .con-main,
+  .page:has(.console-grid) .con-main > .con-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  /* 单列下容器高度是 auto ⇒ 百分比上限无从解析，放开（否则 `max-height: 30%`
+     会被当成 `none` 或 0，行为依浏览器而异）。悬停扩张同理失去意义，一并放掉。 */
+  .page:has(.console-grid) .con-main > .con-stack,
+  .page:has(.console-grid) .con-main:has(> .con-stack:hover) > .con-term,
+  .page:has(.console-grid) .con-main:has(> .con-term:hover) > .con-stack {
+    max-height: none;
+  }
+
+  .page:has(.console-grid) .con-main .term {
+    max-height: 240px;
+  }
+
+  /* 单列后左右两栏不再是「等高面板」，给它们一个高度上限，免得工具清单/日志
+     把整页撑得过长（三列时这个上限由 flex 剩余空间自动承担，无需 max-height）。 */
+  .tool-list,
+  .log-list {
+    max-height: 240px;
+  }
+
+  .toast-wrap {
+    left: 15px;
+    right: 15px;
+    bottom: calc(15px + env(safe-area-inset-bottom));
+    max-width: none;
+  }
+
+  .kv-k {
+    width: 104px;
+  }
+
+  .page-title {
+    font-size: 20px;
+  }
+}
+
+@media (max-width: 560px) {
+  .grid.stats {
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    gap: 11px;
+  }
+
+  /* 窄屏必须把 .two/.three 的 320/260px 轨道下限也放掉：视口 <344px 时内容盒已不足 320，
+     固定下限会让轨道比视口还宽 ⇒ 横向溢出（实测 320px 视口溢出 12px）。 */
+  .grid.two,
+  .grid.three {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 窄屏：标签区独占一行、动作按钮折到下方。4 个动作按钮本身就要 ~352px，而 320
+     视口内容盒只剩 ~296px ⇒ 不折必然横向溢出。
+     ⚠️ 关键不是写 wrap，而是**让容器宽度真的被约束**：flex 项默认 flex-basis:auto
+     取 max-content(352)，不 shrink 就永远不折（实测 320 溢出 57px / 360 溢出 17px）。
+     （2026-10-14 起标签区本身已改为多排换行，见上方 `.ov-tags .tags-scroll`。） */
+  .ov-tags .tags-row {
+    flex-wrap: wrap;
+  }
+
+  .ov-tags .tags-scroll {
+    flex-basis: 100%;
+  }
+
+  .ov-tags .tags-actions {
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .stat {
+    padding: 13px 13px;
+  }
+
+  .stat-value {
+    font-size: 24px;
+  }
+
+  .card-head,
+  .card-body {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .topbar-title {
+    font-size: 14px;
+  }
+
+  .topbar-sub {
+    display: none;
+  }
+
+  .hide-mobile {
+    display: none;
+  }
+
+  /* 顶栏在小屏必须「真能塞下」：标题已由页面内的大 H1 承担，这里让位给右侧控件，
+     否则主题切换会被挤出视口（body 的 overflow-x:hidden 只会把它裁掉）。 */
+  .topbar {
+    gap: 8px;
+    padding: 0 10px;
+  }
+
+  .topbar-titles {
+    display: none;
+  }
+
+  .conn {
+    padding: 6px 9px;
+  }
+
+  .tabs {
+    gap: 2px;
+  }
+
+  .tab {
+    padding: 4px 7px;
+  }
+}
+
+@media (min-width: 900px) {
+  .scrim {
+    display: none;
+  }
+}
+
+/* ---------- VS Code 骨架的响应式 ---------- */
+@media (max-width: 560px) {
+  /* 面包屑在手机上让位给内容（VS Code 本身也没有移动端形态）。 */
+  .crumbs {
+    display: none;
+  }
+}
+
+/* ======================================================================
+ * §19调试台 · 结果并入终端输出（2026-10-14，方案A）
+ *
+ * 需求（主人六条）：
+ *   ① 结果放到终端输出里② 终端输出的终端可以折叠③ center wrap mt 放到右边
+ *   ④ card-body 添加自适应⑤ 执行后布局变成 3:7⑥ 点击回 card-body 恢复自适应
+ *
+ * 本节只做「布局与配色」，交互状态（fold 三值枚举）在 app.js 的 S.console.fold。
+ * ========================================================================= */
+
+/* ---- ④ `.card-body` 自适应：全局改为「卡内可伸缩的 flex 子项」 ----
+   🔴 判据：`.card` 是 `display:flex; flex-direction:column`（见上），但此前
+   `.card-body` 没有 `flex` / `min-height` —— 它只按内容自然高。于是：
+     · 卡被 grid 的 stretch 拉高后，多余高度**全落在 body 外**（body 不填充）
+     · 想让 body 吃掉剩余高度就得显式 `flex:1`
+     · 而 flex 子项默认 `min-height:auto` 会被长内容顶开 ⇒ 必须显式 `min-height:0`
+   三条一起写才叫「自适应」：只写 `flex:1` 会退化成「按内容高、最多填满」。 */
+.card-body {
+  padding: 16px 18px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---- ③ 执行按钮行：钉在参数卡**右下角** ----
+   原为 `.center.wrap.mt`（居中），先改成语义类 `.run-bar` + 右对齐；2026-10-15 主人
+   追令「执行的按钮放在他那个卡片的右下角」⇒ 由「内容流末尾右对齐」升级为**贴卡下沿**。
+   🔴 `margin-top: auto` 吃掉参数卡 `.card-body` 的余高（该 body 已是 flex 列，
+      见 `4-console.css` §12 —— 这两条规则是**成对**的，缺一条都不生效）。
+      内容超出可用高时余高为 0，auto 退化为 0，间距由图下 `padding-top` 兜住。
+   🔴 用 `padding-top` 而不是留 `margin-top: 14px`：两者同为 `margin-top` 只能取一个值，
+      而 `padding-top: 14px` 正好复刻原来那 14px 呼吸位 —— 间距归属换了个属性，
+      视觉间距不变（参数少时按钮下沉到卡底，参数多时与今天一致）。
+   🔴 保留 `flex-wrap`：窄屏（中栏最窄 380px）下三个控件要能折行，否则横向溢出。 */
+.run-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+/* ---- ② 终端卡：两区块（命令与输出 / 结果）+ 折叠 ----
+   区块用 `.term-sec`；头部 `.term-sec-head` 是**真 button**（可聚焦、可回车触发），
+   不是 div —— 键盘用户折叠终端时不该被跳过。
+   `.term-caret` 复用调试台工具分组的三角语法（`.tg-caret.open`），保持全站一致。 */
+.con-term {
+  /* 卡体本身不滚：滚动责任下放给 `.term-wrap` 内的各区块，否则
+     「卡内滚 + 块内滚」会出现两条滚动条（同 §12 那条 max-height 的坑）。 */
+  overflow: hidden;
+}
+
+.page:has(.console-grid) .con-term {
+  overflow: hidden;
+  /* 🔴 §19 前提修正（2026-10-14 实测）：全局 `.card` **不是** flex 容器
+     （只有 `height:100%`，computed `display === 'block'`），而本节的三级伸缩链
+     `.card-body(flex:1) → .term-wrap(flex:1) → .term-sec(flex:1 1 0)` 全程依赖
+     父级是 flex ⇒ 三级同时空转：`.card-body` 卡在内容高（42px）、`.term-wrap`
+     只剩 gap（10px）、两个 `.term-sec` 被 `flex-basis:0` 压成 **0px**
+     ⇒ 结果体只剩 8px 的 padding（8737 字符被裁）。
+     这里给终端卡显式补上**两级** flex 列容器：`.con-term` 让 `.card-body` 吃到
+     卡片余高，`.card-body` 让 `.term-wrap` 再吃一层。只作用于本卡，不动全局
+     `.card` —— 其它页面仍依赖 `.card { height:100% }`，全局改会波及所有并排卡。 */
+  display: flex;
+  flex-direction: column;
+}
+
+.page:has(.console-grid) .con-term > .card-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.term-wrap {
+  display: flex;
+  flex-direction: column;
+  /* 两区块的贴合与间距（2026-10-14 主人两次反馈后定稿）：
+     先要「贴着不分开」（10px → 0），随后指出「区块头的间距」仍不对 ——
+     0 间距让两个区块头直接叠在一起，故给 **4px** 的呼吸位。 */
+  gap: 4px;
+  min-height: 0;
+  /* 吃掉 card-body 分配到的剩余高度：卡高由中栏那一段决定，body 再分给区块。 */
+  flex: 1 1 auto;
+}
+
+.term-sec {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* 区块高度**按内容自适应**，且**不再被撑高**（2026-10-14 主人截图报障：
+     「下面的收纳有问题」—— 折起结果后，3 行内容的日志区块被 `flex-grow` 撑到
+     整卡高，区块内部留出一大片空白）。
+       · `flex-basis: auto` ⇒ 基准是**内容高**
+       · `flex-grow: 0` ⇒ **不再平分余量**（余量留在终端卡底部）
+       · `flex-shrink: 1` ⇒ 两个区块内容都超长时才一起压缩，各自内滚 */
+  flex: 0 1 auto;
+  /* 🔴 **不能写 `min-height: 0`**（2026-10-14 主人截图「会重合」的真因）：那会允许
+     区块被压到 2px，而区块头（34~51px）是固定高度的子项 ⇒ **区块头溢出区块**、
+     与下一个区块头**垂直重叠**。实测 `headRects=[[364,398,34],[370,420,51]]`，
+     重叠 **28px**。
+     留 `auto` ⇒ 区块最小高度 = 自身内容高；由于内容区（`.term` / `.term-sec-body`）
+     自身可压到 0，这个「内容高」实际就等于**区块头高度** ⇒ 区块永不低于自己那一行
+     标题，也不再顶到下一块身上。 */
+  min-height: auto;
+}
+
+/* 🔴 展开态区块的**保底高度**（2026-10-14 主人：「结果展开时会抢占展开的命令和输出」）
+   —— 结果体动辄数千像素，`flex-shrink` 会把日志区一起按比例压缩：实测两区块同开时
+   日志区只剩 **8px**（内容 143px 全被裁掉）。
+   ⚠️ 下限必须设在**区块**（`.term-sec`）上而不是内容块上：内容块给了 `min-height`
+   也只会溢出被裁（父容器 `min-height: 0` 允许被压到 8px），实测无效。
+   用 `:has()` 只对**展开态**生效 —— 折叠时 `v-show` 会在内容块上写 inline
+   `display: none`，此时不匹配 ⇒ 折叠区块保持「只有一行标题」的紧凑高度。
+   130px = 区块头 34 + 内容保底 96（约 5 行日志）。 */
+.term-sec:has(> .term:not([style*="display: none"])),
+.term-sec:has(> .term-sec-body:not([style*="display: none"])) {
+  min-height: 130px;
+}
+
+/* ---- 方案 A（2026-10-14，主人选型）：区块头「拆行」----
+   🔴 起因：区块头原先是**真 button**，内部却嵌了 4 个 button（3 个视图 tab + 复制）
+   与 1 个 div —— HTML 不允许按钮嵌套（实测 `nestedBtn=4 / nestedDiv=1`），
+   键盘焦点顺序与无障碍语义已坏；模板里还多一个 `</button>`（Vue 容错掉了）。
+   现结构：
+     `.term-sec-head`    行容器（**div**，只管排列，自身不承担交互）
+       ├ `.term-sec-toggle`  **真 button** —— 唯一承担折叠，键盘可聚焦/回车
+       ├ `.tabs.term-tabs`   视图切换
+       └ 复制按钮
+   视觉完全不变：`padding` / 圆角 / hover 背景仍由**容器**承担；文字变色在 button 上，
+   并由 `.term-sec-head:hover .term-sec-toggle` 补回「悬停整行即变色」的原观感。 */
+.term-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 4px 2px;
+  border-radius: var(--r-sm, 6px);
+  /* 2026-10-14：折叠 handler 已上移到**整行**（原先只有内部按钮可点，点空白会冒泡到
+     `.term-wrap` 触发「恢复自适应」⇒ 体感是「点一个、两个同时展开」）⇒ 整行给手型。 */
+  cursor: pointer;
+  transition: background var(--t-fast);
+}
+
+.term-sec-head:hover {
+  background: var(--hover, rgba(127, 127, 127, 0.08));
+}
+
+.term-sec-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 0;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm, 6px);
+  cursor: pointer;
+  text-align: left;
+  transition: color var(--t-fast);
+}
+
+.term-sec-toggle:hover,
+.term-sec-head:hover .term-sec-toggle {
+  color: var(--text);
+}
+
+.term-sec-toggle .term-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  opacity: 0.55;
+  transition: transform var(--t-fast);
+  /* 静态三角形，不参与光标闪烁（语义同 `.tg-caret`）。全局 `.term-caret` 的 `blink`
+     已限定到 `.term-line`，这里再显式声明一次，防止将来被更宽的选择器误伤。 */
+  animation: none;
+}
+
+/* 展开态 = 三角朝下；折叠态 = 收回朝右（与工具分组 `.tg-caret` 同一套语义）。 */
+.term-sec-toggle .term-caret.open {
+  transform: rotate(90deg);
+}
+
+.term-sec-toggle > span:not(.term-caret) {
+  flex: 0 0 auto;
+}
+
+/* 头部右侧的 tabs / 复制按钮：贴着右边，且不吃掉标题的收缩能力。 */
+.term-tabs {
+  margin-left: auto;
+  flex: 0 0 auto;
+  /* 滑动指示条的定位基准（见 §17e） */
+  position: relative;
+}
+
+.term-tabs + .btn {
+  flex: 0 0 auto;
+}
+
+.term-sec-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-top: 8px;
+}
+
+/* 🔴 命令与输出块：`.term` 自带 `max-height:46vh`（全局 §12 之外的老规则），
+   在中栏那一格里必然溢出 ⇒ 双滚动条。这里放掉，由 `.term-sec-body` 独家承担。 */
+.page:has(.console-grid) .con-term .term {
+  max-height: none;
+}
+
+/* 结果区块的三种视图：结构化树可能很高，同样交给 `.term-sec-body` 内滚。 */
+.term-sec-body .md,
+.term-sec-body .code {
+  margin-top: 0;
+}
+
+/* ---- ⑤ 「执行后」不再需要任何布局规则（2026-10-14 主人定稿）----
+   ⚠️ 此处曾有一条 `max-height: 30%` 的「执行后参数段上限」规则（还配了两层
+   `:not()` 互斥），现已**整条撤除**：主人两次澄清后定稿为
+   「参数卡按内容高来上限」，任何固定百分比上限都与它矛盾。
+   中栏的高度分配现在完全由内容决定 —— 参数段贴着内容、终端卡吃剩余（见 §12）。
+   历史留档：那两层 `:not()` 是为了压过 `:has()` 参数带来的高 specificity
+   （执行后规则达 (0,7,0) vs 悬停规则 (0,6,0)），撤除规则后该问题自然消失；
+   但**悬停规则里的 `:not` 仍需保留**（见 §19-⑨）。 */
+
+/* ---- ⑥ 点卡体恢复自适应 ----
+   「恢复」= 折叠态清零 ⇒ `.folded` 类消失 ⇒ 上面那条 `:has()` 失配 ⇒ 落回 5:5。
+   这条不是独立样式，而是**判据链的末端**：折叠与比例共用一个状态源，
+   所以「点一下回自适应」不需要任何额外的 CSS。 */
+
+/* ---- ⑦ 左栏：`.card-body` 不得抢工具列表的高度（2026-10-14 追修，主人截图报障）----
+   §19 把**全局** `.card-body` 改成 `flex: 1 1 auto`，而 `.con-rail` 早在 §12 就是
+   `display: flex; flex-direction: column` —— 它是全站**唯一**「父级是 flex 的卡」
+   （四页扫描确认），于是这条全局规则在左栏**真的生效**：
+   `.card-body.tight`（内容 60px）与 `.tool-list`（同为 `flex: 1`）**平分余高**。
+     · 全组展开时列表内容溢出（scrollH 1576 > clientH 606）⇒ 剩余空间为负 ⇒ 安然无事
+     · 一旦折叠到只剩一组（主人截图的状态）⇒ 余高被 body 抢走：实测 `bodyH` 60 → **205**
+       ⇒ 搜索 / 属性条下方 145px 空白，工具列表被推到中段
+   修法：左栏 body 只占内容高，余高一律留给列表（内容不足时表现为**底部**留白）。 */
+.page:has(.console-grid) .con-rail > .card-body {
+  flex: 0 0 auto;
+}
+
+/* ---- ⑧【已废弃】卡头的折叠三角箭头（2026-10-14 主人：「终端输出旁边的那个小三角
+   可以不要」）----
+   对应的 `.term-fold-all` / `.term-fold-caret` 规则与模板节点**均已删除**。
+   折叠/展开现在统一走两个区块头（整行可点）；「恢复自适应」仍可点终端卡体空白处触发。 */
+/* 2026-10-14 曾短暂存在：`.term-fold-all`（替代「已折叠」pill 的箭头按钮）+ `.term-fold-caret` */
+
+/* ---- ⑨ 方案 E（2026-10-14 主人定稿）：**占满 + 联动** ----
+   主人原话：「默认还是上下两个刚好把这个区域给占满，然后上面那个因工具的最高高度而
+   改变，运行后收纳一点，下面展开，下面收纳上面展开，或者单击上面恢复工具最高高度」
+   ⇒ 四个状态，全部用 `:has()` 读 **DOM 事实**（不另开 JS 布局状态位）：
+
+     ① **默认**：参数段按内容高（= 主人口中的「工具的最高高度」）+ 终端卡吃剩余
+        ⇒ 两者**占满中栏**，不留白
+     ② **运行后「收纳一点」**：参数段上限 30%，把空间让给长大的终端卡
+     ③ **「下面收纳上面展开」**（两区块全折）：终端卡收缩为内容高，参数段**吃满**余量
+     ④ **「单击上面恢复工具最高高度」**：`.param-open` 类 ⇒ 参数段解除 30% 收纳、
+        回到内容高
+
+   🔴 `:not(.param-open)` 是必需的：④ 要能盖过 ②，而 ② 的 `:has()` 参数里有 3 个类
+   （`.con-stack > .card + .card`）⇒ specificity 达 (0,7,0)，高于 `.param-open` 那条
+   的 (0,5,0)。用 `:not()` 让 ② 在「已手动展开」时**不匹配**，比堆 specificity 稳。
+   🔴 同理 `:not(:has(.con-term .all-folded))` 让 ② 在 ③ 的场景下让位。
+   🔴 悬停**不再改任何尺寸**（主人「悬停放大太狠」）—— 只换描边色。 */
+.page:has(.console-grid)
+  .con-main:has(.con-stack > .card + .card, .con-term .folded):not(
+    :has(.con-term .all-folded)
+  ):not(.param-open)
+  > .con-stack {
+  max-height: 30%;
+}
+
+/* 「下面全收纳」时：两卡 **5 : 5 填满中栏**（2026-10-14 主人原话：
+   「下面全收纳的时候，卡片照样填满，类似于五五分。5:5」）
+   ⇒ 两段各 `flex: 1 1 0`（等分中栏）—— 不再让终端卡收缩到内容高（181px 会让中栏
+   底部空出几百像素），也不再给参数段设 `max-height`（那会「完全放大」或「放不满」）。 */
+.page:has(.console-grid) .con-main:has(.con-term .all-folded) > .con-term,
+.page:has(.console-grid) .con-main:has(.con-term .all-folded) > .con-stack {
+  flex: 1 1 0;
+  max-height: none;
+}
+
+.page:has(.console-grid) .con-main.param-open > .con-stack {
+  max-height: none;
+}
+
+.page:has(.console-grid) .con-main .card:hover {
+  border-color: var(--text-faint);
+}

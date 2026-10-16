@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""24 个 MCP 工具全量冒烟测试。
+"""25 个 MCP 工具全量冒烟测试。
 
 用途:
     确认 server.py 的**全部** MCP 工具都能被正常调用且不抛异常。与
     test_roundtrip.py 分工互补:
       - test_roundtrip.py 验证「语义正确性」(frontmatter 写读无损、反斜杠
         不雪崩、read 不污染 updated、SQLite 索引自愈等)
-      - 本脚本验证「覆盖面」(24 个工具一个不漏、全部可调用)
+      - 本脚本验证「覆盖面」(25 个工具一个不漏、全部可调用)
     两者结合才能支撑 server.py 的安全重构（P3 模块化即以此护航）。
 
     脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
@@ -117,6 +117,32 @@ call("memory_delete(trash)", server.memory_delete, "冒烟_关联笔记", expect
 call("memory_delete(purge)", server.memory_delete, "冒烟_主笔记", trash=False, purge=True, expect="")
 
 # =====================================================================
+# 配置面（2026-10-16）：阈值读写是 Web 控制台与 MCP 之间的**唯一**通道，
+# 冒烟必须真走一遍 get / set / 拒绝路径 —— 否则「工具注册了但一点就炸」不会被发现。
+section("配置面工具")
+call("memory_config(get)", server._memory_config_tool, expect="运行时阈值")
+call("memory_config(get json)", server._memory_config_tool, output_format="json",
+     expect='"keys"')
+call("memory_config(set 缺键被拒)", server._memory_config_tool, action="set", values={},
+     expect="缺少配置键")
+call("memory_config(set 非法键值)", server._memory_config_tool, action="set",
+     values={"lock_timeout": "abc"}, expect="错误")
+call("memory_config(action 非法)", server._memory_config_tool, action="nope", expect="错误")
+
+_cfg_values = dict(server.memory_config.DEFAULTS)
+call("memory_config(set 全量)", server._memory_config_tool, action="set",
+     values=_cfg_values, expect="已写入")
+check("memory_config(set) 真的落盘并生效",
+      (Path(_TMP) / "memory.toml").is_file()
+      and server.memory_config.get("lock_timeout") == _cfg_values["lock_timeout"])
+_cfg_values["lock_timeout"] = _cfg_values["lock_timeout"] + 1.0
+call("memory_config(set 改值)", server._memory_config_tool, action="set",
+     values=_cfg_values, expect="备份")
+check("memory_config(set) 二次写入留下备份（且不触碰 *.md）",
+      bool(list(Path(_TMP).glob("memory.toml.bak.*")))
+      and not list(Path(_TMP).glob("memory.toml.bak.*.md")))
+
+# =====================================================================
 section("MCP 工具注册完整性")
 import asyncio  # noqa: E402
 
@@ -128,6 +154,10 @@ EXPECTED_TOOLS = {
     "memory_graph", "memory_context", "memory_orphans", "memory_batch_tag",
     "memory_batch_tier",
     "memory_archive_old", "memory_smart_search", "memory_recent", "memory_stats",
+    # 2026-10-16：阈值配置面（memory.toml）纳入 MCP —— Web 控制台由此不再 import
+    # memory_config，两仓之间只剩「连接」。注册名 memory_config，Python 函数名
+    # 为 _memory_config_tool（避免遮蔽同名模块，见 server.py 该处注释）。
+    "memory_config",
 }
 # A1 (2026-09-17) 行为标注：MCP 规范里 destructiveHint / openWorldHint 默认都是
 # True，漏标会让客户端把普通 upsert 也当成需二次确认的破坏性操作，并误以为工具
@@ -150,7 +180,7 @@ EXPECTED_NONIDEM = {"memory_restore", "memory_restart"}
 try:
     tools = asyncio.run(server.mcp.list_tools())
     registered = {t.name for t in tools}
-    check("工具总数 = 24", len(registered) == 24, f"实际 {len(registered)}: {sorted(registered)}")
+    check("工具总数 = 25", len(registered) == 25, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
 

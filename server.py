@@ -4230,6 +4230,96 @@ def memory_stats() -> str:
 
 
 # =====================================================================
+# 配置面：运行时阈值（memory.toml）—— MCP 侧唯一通道 (2026-10-16)
+# =====================================================================
+# 为什么要单开一个工具
+#   阈值（B5）此前只有两条入口：手改 vault 根的 memory.toml，或设环境变量。Web 控制台
+#   为了能在界面上改它，曾经直接 `import memory_config` 并自己写盘 —— 那是一层跨仓、
+#   跨进程的耦合：控制台得自己知道 memory.toml 在哪、什么格式、怎么校验，而这三件事的
+#   唯一事实源是 memory_config。现在控制台改走本工具 ⇒「如何读写阈值」全局只有一份实现，
+#   两个仓之间只剩「连接」一种关系（不再有第二条 import 通道）。
+# 口径
+#   * get 默认 text（人读），Web 控制台传 json（机读，字段见 memory_config.state()）
+#   * set 是**整状态写**：必须提交全部 8 个键，缺键即拒（详见 memory_config.render_toml）
+#   * 只写 memory.toml 这一个文件，绝不触碰任何 *.md
+#
+# ⚠️ 注册名与函数名**刻意不同**：本文件顶部 `import memory_config` 绑定的正是同名模块，
+#    若把函数也叫 memory_config，模块级名字会被这次 def 直接**遮蔽**，本文件里 20 余处
+#    `memory_config.get(...)` / `.config_path()` 会全部抛 AttributeError（实测：
+#    memory_stats 当场挂掉）。所以函数名走私有前缀 `_memory_config_tool`，对外注册名由
+#    `@mcp.tool(name="memory_config")` 指定 —— 客户端看到的名字仍是最自然的那个。
+def _cfg_report(st: dict[str, Any], *, written: bool) -> str:
+    """把配置快照渲染成给人读的文本（与 memory_stats 的「配置」节同源同风格）。"""
+    lines: list[str] = ["## 运行时阈值（memory.toml）"]
+    if written:
+        lines.append(f"- 已写入: {st['config_path']}")
+        lines.append(f"- 备份: {st['backup'] or '（原文件不存在，无需备份）'}")
+    elif st["config_path"] is None:
+        lines.append("- 配置文件: 未注入 vault ⇒ 全部使用内置默认值")
+    elif st["file_exists"]:
+        lines.append(f"- 配置文件: {st['config_path']}")
+    else:
+        lines.append(f"- 配置文件: 不存在（{st['config_path']}）⇒ 全部使用内置默认值")
+    lines.append(f"- 可写: {'是' if st['writable'] else '否（未注入 vault）'}")
+    lines.append(f"- 生效延迟: ≤ {st['ttl']:g} 秒（无需重启服务）")
+    lines.append(f"- 配置错误: {st['last_error'] or '无'}")
+    lines.append(f"- 键（{len(st['keys'])}）:")
+    for k, info in st["keys"].items():
+        mark = "  ← 已覆写" if info["value"] != info["default"] else ""
+        lines.append(f"  - {info['label']} `{k}` = {info['value']}"
+                     f"（默认 {info['default']} · 来源 {info['source']}）{mark}")
+    return "\n".join(lines)
+
+
+@mcp.tool(name="memory_config", annotations=_WRITE)
+def _memory_config_tool(action: str = "get", values: dict[str, Any] | None = None,
+                        output_format: str | None = None) -> str:
+    """Read or update the runtime thresholds stored in `memory.toml` at the vault root.
+
+    这是阈值配置面**在 MCP 上的唯一通道**：任何客户端（含 Web 控制台）都经它读写，
+    因此谁都不必自己解析或改写 `memory.toml`。
+
+    - ``action="get"``（默认）：当前生效值、每键来源（env / file / default）、中文名与
+      作用说明、类型与默认值，外加配置文件路径、可写性与最近一次解析错误。
+    - ``action="set"``：**整状态写** —— ``values`` 必须提交全部 8 个键，缺键即拒
+      （漏提交的键被静默写回默认值是更难查的故障）。写前备份、写前自解析、
+      ``os.replace`` 原子替换，约 2 秒内生效且无需重启。
+
+    ⚠️ ``values`` 的类型标注是 ``dict[str, Any]`` 而**不是** ``dict[str, float]``：
+    后者会让 SDK 的入参校验把 ``body_truncate_chars`` 的 ``8000`` **强转成
+    ``8000.0``**，而该键的期望类型是 int ⇒ 一次正常的整状态写会被判成类型错误
+    （实测：Web 控制台「写→读往返」当场 400）。类型校验由 ``memory_config``
+    自己按 ``_SPEC`` 做，比 JSON Schema 的 number 更严（int/float 分开、拒 bool）。
+
+    output_format（C1）：`"text"`（默认，人读）或 `"json"`（机读）——
+    `{"vault","config_path","file_exists","writable","ttl","last_error","keys"}`，
+    set 时另附 `"backup"`。
+
+    **只写 `memory.toml` 这一个文件，绝不触碰任何 `*.md`。**
+    """
+    try:
+        fmt = _norm_output_format(output_format)
+    except ValueError as e:
+        return f"错误：{e}"
+
+    act = (action or "get").strip().lower()
+    if act not in ("get", "set"):
+        return f"错误：action 只能是 get / set，收到 {action!r}"
+
+    if act == "set":
+        if values is None:
+            return "错误：action=set 必须提供 values（整状态写，需包含全部阈值键）。"
+        try:
+            st = memory_config.write_values(values)
+        except Exception as e:                  # noqa: BLE001 - 阈值错误原样回给调用方
+            return f"错误：{e}"
+        return _json_out(st) if fmt == "json" else _cfg_report(st, written=True)
+
+    st = memory_config.state()
+    return _json_out(st) if fmt == "json" else _cfg_report(st, written=False)
+
+
+# =====================================================================
 # 热重启 (2026-09-17)
 # =====================================================================
 # 目标：改完本文件（或任一模块）后，**不重连客户端、不重启应用**即加载新代码。

@@ -1,9 +1,14 @@
-# 打 tag（v*）时自动发布 Release，并把 SHA256 校验和写进 Release 说明 + 作为附件上传。
+# 打 tag（v*）时自动发布 Release：先跑全量回归，再建 Release。
 #
-# 为什么放在这里而不是把 SHA256SUMS.txt 提交进仓库：
-#   提交进仓库的哈希清单一旦忘记更新就会静默过期 —— 用户按它核对却对不上，
-#   只会得出「文件被篡改」的错误结论。由 tag 触发即时生成，则永远与所发布的
-#   代码一致，不存在过期问题。
+# 标题约定：Release 标题 = 「tag — 一句话描述」（对齐 v2.0.0 的历史格式）。
+#   CI 取**带注释 tag 的 subject**（`git tag -a v2.7.0 -m "v2.7.0 — 描述"`）；
+#   轻量 tag（无注释）自动回退为 tag 名，行为与从前一致。
+#
+# ⚠️ 2026-10-16：SHA256 校验和**已弃用**，本工作流不再生成 SHA256SUMS.txt、
+#   不再写进 Release 说明、也不再作为附件上传（历史 Release 的附件与正文段已清理）。
+#   原因：清单 TARGETS 只覆盖 install.sh/ps1 与 7 个运行时模块中的 6 个
+#   （漏 memory_config.py），与实际安装集不一致；而安装/更新流程不做校验，
+#   继续维护这份清单的收益低于「清单与代码不同步」造成的误导风险。
 name: Release
 
 on:
@@ -16,12 +21,14 @@ permissions:
 
 jobs:
   release:
-    name: Publish release with checksums
+    name: Publish release
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,25 +44,11 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Generate SHA256SUMS
-        run: python scripts/make_checksums.py
-
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" --title "$TAG" --generate-notes
-          {
-            gh release view "$TAG" --json body -q .body
-            printf '\n\n## SHA256 校验和\n\n'
-            printf '下载 `install.sh` / `install.ps1` 前可先核对哈希：\n\n'
-            printf '```\n'
-            cat SHA256SUMS.txt
-            printf '```\n\n'
-            printf '校验方式：\n\n'
-            printf '```bash\nsha256sum install.sh          # macOS: shasum -a 256 install.sh\n```\n\n'
-            printf '```powershell\nGet-FileHash install.ps1 -Algorithm SHA256\n```\n'
-          } > release_body.md
-          gh release edit "$TAG" --notes-file release_body.md
-          gh release upload "$TAG" SHA256SUMS.txt --clobber
+          TITLE="$(git tag -l --format='%(contents:subject)' "$TAG")"
+          [ -n "$TITLE" ] || TITLE="$TAG"
+          gh release create "$TAG" --title "$TITLE" --generate-notes

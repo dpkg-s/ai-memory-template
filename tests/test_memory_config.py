@@ -453,6 +453,161 @@ check("T8g 取到的值与文件一致", mc.get("heat_hot_min") == 1.25
 put(None)
 
 # =====================================================================
+# T9 阈值文案（中文名 + 作用）—— 单一来源，缺一个即红
+# =====================================================================
+print("\n[T9] 每个阈值都必须带中文名与作用说明（Web 控制台直接渲染它，缺了就成一片空白）")
+
+check("T9a 8 个键**逐个**都有文案（missing_meta 为空）", mc.missing_meta() == [],
+      repr(mc.missing_meta()))
+check("T9b 文案表键集与默认值键集**完全相等**（多一个少一个都算漂移）",
+      set(mc.META) == set(mc.DEFAULTS),
+      f"多={sorted(set(mc.META) - set(mc.DEFAULTS))} "
+      f"少={sorted(set(mc.DEFAULTS) - set(mc.META))}")
+
+_bad_label = [k for k in mc.DEFAULTS if len(mc.meta(k)["label"].strip()) < 2]
+_bad_desc = [k for k in mc.DEFAULTS if len(mc.meta(k)["desc"].strip()) < 20]
+check("T9c 中文名非空且不像占位符（≥2 字）", not _bad_label, repr(_bad_label))
+check("T9d 作用说明**够具体**（≥20 字；写「见文档」这类空话必红）",
+      not _bad_desc, repr(_bad_desc))
+
+# 反证：meta() 必须返回**副本**。返回 META 内部对象的话，任何调用方（含前端请求
+# 处理路径）就地改写一下，全站文案就跟着错 —— 而且是那种"重启才好"的错。
+_probe = mc.meta("heat_hot_min")
+_probe["label"] = "被改坏了"
+_probe["desc"] = "被改坏了"
+check("T9e meta() 返回副本，调用方改写不污染全局 META",
+      mc.meta("heat_hot_min")["label"] != "被改坏了"
+      and mc.meta("heat_hot_min")["desc"] != "被改坏了",
+      repr(mc.meta("heat_hot_min")))
+
+try:
+    mc.meta("no_such_key")
+    _keyerr = False
+except KeyError:
+    _keyerr = True
+check("T9f 未知键报错（与 get() 同口径，防拼错键名后静默拿空文案）", _keyerr)
+
+# =====================================================================
+# T10 配置面出口：state() / render_toml() / write_values()（2026-10-16）
+#
+# 动因：Web 控制台此前**自己 import memory_config、自己拼 memory.toml、自己写盘**
+# ⇒ 「如何读写阈值」有两份实现，任一侧改动都可能让两边对不上。现在控制台只经 MCP
+# 工具 memory_config 读写，读侧落到 state()、写侧落到 render_toml()/write_values()，
+# 所以这两条路径的正确性就是「控制台能不能用」的同义词。
+# =====================================================================
+print("\n[T10] 配置面出口：快照 / 渲染 / 整状态写入")
+
+from pathlib import Path  # noqa: E402
+
+_ws = Path(tempfile.mkdtemp(prefix="cfg-write-"))
+_prev_vault = ROOT
+try:
+    mc.set_vault(_ws)
+    cfg_file = _ws / "memory.toml"
+
+    # ---- state() 形状
+    _st = mc.state()
+    check("T10a state 顶层字段齐备",
+          set(_st) == {"vault", "config_path", "file_exists", "writable",
+                       "ttl", "last_error", "keys"}, sorted(_st))
+    check("T10b state 键集 == DEFAULTS（不多不少）", set(_st["keys"]) == set(mc.DEFAULTS),
+          sorted(set(_st["keys"]) ^ set(mc.DEFAULTS)))
+    check("T10c 每键都带 value/default/type/source/env/label/desc",
+          all(set(v) == {"value", "default", "type", "source", "env", "label", "desc"}
+              for v in _st["keys"].values()),
+          repr(next(iter(_st["keys"].values()))))
+    check("T10d 无配置文件时 file_exists=False 且能写",
+          _st["file_exists"] is False and _st["writable"] is True)
+    check("T10e int 与 float 分得开",
+          _st["keys"]["body_truncate_chars"]["type"] == "int"
+          and _st["keys"]["lock_timeout"]["type"] == "float")
+    check("T10f 默认来源标 default", _st["keys"]["lock_timeout"]["source"] == "default")
+
+    # ---- source_of 三级
+    mc.write_values(dict(mc.DEFAULTS))
+    check("T10g 文件写入后来源变 file", mc.source_of("lock_timeout") == "file")
+    os.environ["AI_MEMORY_CFG_LOCK_TIMEOUT"] = "7.5"
+    check("T10h 环境变量优先级最高（来源 env）", mc.source_of("lock_timeout") == "env")
+    check("T10i env 值真的生效", mc.get("lock_timeout") == 7.5)
+    os.environ.pop("AI_MEMORY_CFG_LOCK_TIMEOUT")
+    check("T10j 摘掉 env 后回到 file", mc.source_of("lock_timeout") == "file")
+    try:
+        mc.source_of("no_such_key")
+        _kerr = False
+    except KeyError:
+        _kerr = True
+    check("T10k source_of 未知键报错", _kerr)
+
+    # ---- render_toml 守卫
+    try:
+        mc.render_toml({k: v for k, v in list(mc.DEFAULTS.items())[:-1]})
+        _miss = False
+    except ValueError:
+        _miss = True
+    check("T10l 缺键拒绝（整状态写：不补默认值）", _miss)
+    try:
+        mc.render_toml({**mc.DEFAULTS, "nope": 1})
+        _unk = False
+    except ValueError:
+        _unk = True
+    check("T10m 未知键拒绝", _unk)
+    try:
+        mc.render_toml({**mc.DEFAULTS, "body_truncate_chars": 8000.5})
+        _typ = False
+    except ValueError:
+        _typ = True
+    check("T10n 类型不符拒绝（int 键不接受 8000.5）", _typ)
+    _txt = mc.render_toml(dict(mc.DEFAULTS))
+    check("T10o 渲染结果 LF 行尾且含 [thresholds]", "[thresholds]" in _txt and "\r" not in _txt)
+    check("T10p 渲染结果可被自家解析器读回",
+          mc.parse_toml(_txt)["thresholds.lock_timeout"] == mc.DEFAULTS["lock_timeout"])
+
+    # ---- write_values 行为
+    _before = cfg_file.read_text(encoding="utf-8")
+    _r1 = mc.write_values({**mc.DEFAULTS, "heat_hot_min": 9.0})
+    check("T10q 写入后立即生效（不等 TTL）", mc.get("heat_hot_min") == 9.0)
+    check("T10r 首次覆盖前有原文件 ⇒ 产生备份", _r1["backup"] is not None)
+    check("T10s 备份名命中 vault 的 .gitignore（*.bak.*）",
+          Path(_r1["backup"]).match("*.bak.*"), Path(_r1["backup"]).name)
+    check("T10t 返回的是写入**后**的快照", _r1["keys"]["heat_hot_min"]["value"] == 9.0
+          and _r1["file_exists"] is True)
+    check("T10u 不留 .tmp 残骸", not list(_ws.glob("memory.toml.tmp*")))
+
+    # 被拒绝的写入**不得**碰盘 —— 这是「宁可拒绝、不要惊喜」的可证伪形式
+    _snap = cfg_file.read_text(encoding="utf-8")
+    try:
+        mc.write_values({k: v for k, v in list(mc.DEFAULTS.items())[:-1]})
+        _rej = False
+    except ValueError:
+        _rej = True
+    check("T10v 非法写入被拒且文件**逐字节未动**",
+          _rej and cfg_file.read_text(encoding="utf-8") == _snap)
+
+    # 备份滚动保留
+    for _i in range(4):
+        mc.write_values({**mc.DEFAULTS, "heat_hot_min": 1.0 + _i}, keep=2)
+    check("T10w keep 参数限制备份份数", len(list(_ws.glob("memory.toml.bak.*"))) <= 2,
+          repr(sorted(p.name for p in _ws.glob("memory.toml.bak.*"))))
+    check("T10x 不产生除 memory.toml / 备份之外的任何文件",
+          {p.name.split(".bak.")[0] for p in _ws.iterdir()} <= {"memory.toml"},
+          repr(sorted(p.name for p in _ws.iterdir())))
+
+    # 记忆库正文绝不被触碰
+    check("T10y 写入路径绝不创建/改动 *.md", not list(_ws.glob("*.md")))
+
+    # 未注入 vault ⇒ 明确报错，而不是写到一个猜出来的位置
+    mc.set_vault(None)
+    try:
+        mc.write_values(dict(mc.DEFAULTS))
+        _novault = False
+    except ValueError as e:
+        _novault = "无法定位 memory.toml" in str(e)
+    check("T10z 未注入 vault 时写入明确报错", _novault)
+finally:
+    mc.set_vault(_prev_vault)
+    shutil.rmtree(_ws, ignore_errors=True)
+
+# =====================================================================
 shutil.rmtree(_TMP, ignore_errors=True)
 
 print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")

@@ -401,7 +401,7 @@ async def _stdio_e2e() -> tuple[bool, str]:
                 await session.initialize()
                 tools = await session.list_tools()
                 n = len(tools.tools)
-                return n == 24, f"stdio 工具数={n}（期望 24）"
+                return n == 25, f"stdio 工具数={n}（期望 25）"
 
 
 try:

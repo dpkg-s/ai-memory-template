@@ -42,6 +42,23 @@ TTL 2 秒：TTL 内直接回内存缓存；过期则**重读文件内容**，内
 上次的旧值），并把错误记进 `last_error()`，由 `memory_stats` 的「配置」节对外暴露。
 ⇒ 写错配置 = 有可见提示 + 行为可预期，而不是一个查不出来的怪现象。
 
+## 配置面出口（`state()` / `write_values()`，2026-10-16）
+
+本模块同时是**配置面的唯一事实源**：`state()` 给出「当前生效值 + 每键来源 + 文案 +
+类型 + 默认值 + 配置文件路径 + 解析错误」的完整快照，`write_values()` 负责**整状态**
+写回 `memory.toml`（校验 → 写前自解析 → 备份 → 原子替换 → 失效缓存）。
+
+MCP 工具 `memory_config` 与 `memory_stats` 都从这里取数，**任何调用方都不得自己
+拼装阈值文案、自己解析 `memory.toml`、自己写盘**。这条纪律的直接动因是 Web 控制台
+（独立仓 `ai-memory-web`）曾经的跨仓 `import`：控制台与 MCP 服务端各持一份「如何读
+写 memory.toml」的知识，任何一侧改动都可能让两边对不上。现在控制台只经 MCP 工具
+读写，**不再 import 本模块** ⇒ 两个仓之间只剩「连接」一种关系。
+
+⚠️ 本模块仍是最底层（不 import 本仓任何其它模块），故 `write_values()` **不加写锁**：
+`os.replace()` 本身原子，且阈值写入是低频人工操作；为它引入 `locks` 会破坏分层铁律。
+备份文件写在配置文件**同目录**（vault 根），命名 `memory.toml.bak.<时间戳>` ——
+该形状命中记忆库自带 `.gitignore` 的 `*.bak.*`，不会污染版本库。
+
 ## 分层
 
 本模块**不 import 本仓任何其它模块**（最底层）；`locks` / `text_utils` / `yaml_io` 等
@@ -52,7 +69,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +103,51 @@ _SPEC: dict[str, type] = {
     "heat_demote_hot_max": float,
     "heat_hot_min": float,
     "heat_decay_lambda": float,
+}
+
+# 键 -> (中文名, 作用说明)。**文案只此一份**：Web 控制台 `/api/thresholds` 与
+# memory_stats 都从这里取，前端不硬编码任何阈值文案 —— 将来新增阈值时若漏写文案，
+# `tests/test_memory_config.py` 的一致性断言会直接拦下（而不是界面上留个空洞）。
+# 口径要求：写「改这个数会发生什么」，不写「这个数是什么」——后者默认值 pill 已经表达。
+META: dict[str, tuple[str, str]] = {
+    "dup_title_jaccard": (
+        "标题重复阈值",
+        "写入时把新标题与库内已有标题做 bigram Jaccard 比对；≥ 此值 ⇒ 返回"
+        "「疑似重复标题」提示（纯提示：不合并、不覆盖、不改数据）。",
+    ),
+    "dup_body_jaccard": (
+        "正文重复阈值",
+        "写入时把新正文与库内已有正文做 bigram Jaccard 比对；≥ 此值 ⇒ 返回"
+        "「疑似重复或冲突内容」提示（纯提示，同样不动数据）。",
+    ),
+    "body_truncate_chars": (
+        "正文截断预算",
+        "memory_read / memory_context 未显式传 max_chars 时，单条正文最多返回的"
+        "字符数（超出即截断）；memory_context 传 0 表示不限量。",
+    ),
+    "lock_timeout": (
+        "陈旧锁回收",
+        "写锁 .memory.lock 的存在时间超过此秒数即视为陈旧锁并强制回收，"
+        "避免进程异常退出后写入被永久卡住。",
+    ),
+    "heat_cold_max": (
+        "降冷阈值",
+        "热度低于此值、且当前分层不是 cold 的条目 ⇒ 判为应降为 cold"
+        "（memory_heat_suggest 只报告，apply 时才写盘）。",
+    ),
+    "heat_demote_hot_max": (
+        "hot 降级阈值",
+        "热度低于此值、且当前分层是 hot 的条目 ⇒ 判为应降为 warm。",
+    ),
+    "heat_hot_min": (
+        "升热阈值",
+        "热度高于此值、且当前分层不是 hot 的条目 ⇒ 判为应升为 hot。",
+    ),
+    "heat_decay_lambda": (
+        "热度衰减系数",
+        "热度 = 访问次数 ÷ (1 + λ × 距今天数)。λ 越大，历史访问衰减越快，"
+        "分层越依赖最近是否被读过。",
+    ),
 }
 
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -289,8 +353,175 @@ def all_values() -> dict[str, Any]:
     return {k: get(k) for k in DEFAULTS}
 
 
+def meta(key: str) -> dict[str, str]:
+    """取一个阈值的中文名与作用说明（未知键报错，与 get() 同口径）。
+
+    返回 ``{"label": 中文名, "desc": 作用}``。**刻意不抛文案缺失异常**：界面少一行
+    说明是小问题，为此让整个配置面板打不开是大问题 ⇒ 缺文案时回落空串。
+    """
+    if key not in _SPEC:
+        raise KeyError(f"未知配置键：{key}（合法键：{', '.join(sorted(_SPEC))}）")
+    label, desc = META.get(key, ("", ""))
+    return {"label": label, "desc": desc}
+
+
+def missing_meta() -> list[str]:
+    """有默认值却没有文案的键（供测试断言；正常恒为空列表）。"""
+    return sorted(set(DEFAULTS) - set(META))
+
+
+# ---------------------------------------------------------------- 配置面快照
+def source_of(key: str) -> str:
+    """一个阈值「当前生效值」的来源：``env`` / ``file`` / ``default``。
+
+    与 `get()` 的优先级链条**逐级对应**（环境变量 > 文件 > 默认），因此它回答的是
+    「我屏幕上看到的这个数，是谁给的」——配置页上「来源」那一列就靠它。
+    """
+    if key not in _SPEC:
+        raise KeyError(f"未知配置键：{key}（合法键：{', '.join(sorted(_SPEC))}）")
+    if os.environ.get(ENV_PREFIX + key.upper()) is not None:
+        return "env"
+    values = _file_values()
+    for candidate in (f"thresholds.{key}", key):
+        if candidate in values:
+            return "file"
+    return "default"
+
+
+def state() -> dict[str, Any]:
+    """配置面完整快照 —— MCP 工具 `memory_config` 的取数口。
+
+    返回 ``{vault, config_path, file_exists, writable, ttl, last_error, keys}``；
+    ``keys`` 为「键 -> {value, default, type, source, env, label, desc}」。
+
+    与 `memory_stats` 的「配置」节**同源**（都经 `get()` / `config_path()`），差别只在
+    呈现：那边是给人读的文本摘要，这里是给机器消费的完整字段。
+
+    ``last_error`` 在**取完所有值之后**才读：`get()` 命中合法环境变量时会清一次错误
+    记录，先读会把「文件解析失败」这类真实问题提前定格成过期信息。
+    """
+    path = config_path()
+    keys: dict[str, dict[str, Any]] = {}
+    for k, dflt in DEFAULTS.items():
+        info = meta(k)
+        keys[k] = {
+            "value": get(k),
+            "default": dflt,
+            "type": "int" if _SPEC[k] is int else "float",
+            "source": source_of(k),
+            "env": ENV_PREFIX + k.upper(),
+            "label": info["label"],
+            "desc": info["desc"],
+        }
+    return {
+        "vault": str(_vault_dir) if _vault_dir is not None else None,
+        "config_path": str(path) if path is not None else None,
+        "file_exists": bool(path is not None and path.is_file()),
+        "writable": path is not None,
+        "ttl": CACHE_TTL,
+        "last_error": _last_error,
+        "keys": keys,
+    }
+
+
+# ---------------------------------------------------------------- 整状态写入
+def _toml_scalar(key: str, value: Any) -> str:
+    """把一个阈值渲染成 TOML 标量文本；类型不符直接报错（不静默强转）。"""
+    want = _SPEC[key]
+    if isinstance(value, bool):
+        raise ValueError(f"配置 {key}：不接受布尔值")
+    if want is int:
+        if not isinstance(value, int):
+            raise ValueError(f"配置 {key}：期望整数，得到 {value!r}")
+        return str(value)
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"配置 {key}：期望数值，得到 {value!r}")
+    return repr(float(value))
+
+
+def render_toml(values: dict[str, Any]) -> str:
+    """把**一整套**阈值渲染成 `memory.toml` 文本（``[thresholds]`` 区，LF 行尾）。
+
+    **整状态语义**：键集必须与 `DEFAULTS` 完全相等 —— 多一个键（拼错）或**少一个键**
+    都直接拒绝，而不是补默认值后照写。理由是「漏提交的那个键」会被静默写回默认值，
+    使用者只会看到「我明明没改它，它自己变回去了」，与本模块「宁可拒绝、不要惊喜」
+    的既定口径相反。
+    """
+    if not isinstance(values, dict):
+        raise ValueError("values 必须是「键 -> 数值」的字典")
+    unknown = sorted(set(values) - set(DEFAULTS))
+    if unknown:
+        raise ValueError(f"未知配置键：{', '.join(unknown)}")
+    missing = sorted(set(DEFAULTS) - set(values))
+    if missing:
+        raise ValueError(
+            f"缺少配置键：{', '.join(missing)}（整状态写，必须提交全部 {len(DEFAULTS)} 个键）")
+
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    lines = [
+        "# ai-memory 运行时阈值（memory.toml）",
+        f"# 由 MCP 工具 memory_config 写入：{stamp}",
+        f"# 取值优先级：环境变量 {ENV_PREFIX}<KEY> > [thresholds] 区 > 顶层同名键 > 内置默认",
+        f"# 改动约 {CACHE_TTL:g} 秒内生效，无需重启服务。",
+        "",
+        "[thresholds]",
+    ]
+    for k in DEFAULTS:
+        lines.append(f"{k} = {_toml_scalar(k, values[k])}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _prune_backups(path: Path, keep: int) -> None:
+    """只保留最近 `keep` 份 `memory.toml.bak.*`，其余删除（失败只告警，不影响写入）。"""
+    if keep <= 0:
+        return
+    old = sorted(path.parent.glob(f"{CONFIG_NAME}.bak.*"))
+    for p in old[:-keep]:
+        try:
+            p.unlink()
+        except OSError as e:
+            logger.warning("旧配置备份清理失败：%s（%s）", p.name, e)
+
+
+def write_values(values: dict[str, Any], *, keep: int = 10) -> dict[str, Any]:
+    """整状态写入 vault 根的 `memory.toml`，返回写入后的 `state()` 快照（附 ``backup``）。
+
+    顺序刻意如此：**校验 → 渲染 → 写前自解析 → 备份 → 原子替换 → 失效缓存**。
+    「写前自解析」是渲染器的自检 —— 渲染出的文本若连自家解析器都读不过，就绝不该
+    落盘；这一步把「渲染器有 bug」变成写入失败，而不是一个坏配置文件。
+
+    **只写 `memory.toml` 这一个文件，绝不触碰任何 `*.md`。**
+    """
+    path = config_path()
+    if path is None:
+        raise ValueError("未注入 vault 位置 ⇒ 无法定位 memory.toml。请设置 AI_MEMORY_DIR。")
+    if not path.parent.is_dir():
+        raise ValueError(f"vault 目录不存在：{path.parent}")
+
+    text = render_toml(values)                      # 内含键集与类型校验
+    parse_toml(text)                                # 写前自解析（fail-fast）
+
+    backup: Path | None = None
+    if path.is_file():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"{CONFIG_NAME}.bak.{stamp}")
+        shutil.copyfile(str(path), str(backup))
+        _prune_backups(path, keep)
+
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(str(tmp), str(path))
+    reload()                                        # 立刻生效，不等 TTL
+
+    out = state()
+    out["backup"] = str(backup) if backup is not None else None
+    return out
+
+
 __all__ = [
-    "CONFIG_NAME", "ENV_PREFIX", "CACHE_TTL", "DEFAULTS",
+    "CONFIG_NAME", "ENV_PREFIX", "CACHE_TTL", "DEFAULTS", "META",
     "parse_toml", "set_vault", "config_path", "last_error", "reload",
-    "get", "all_values",
+    "get", "all_values", "meta", "missing_meta",
+    "source_of", "state", "render_toml", "write_values",
 ]

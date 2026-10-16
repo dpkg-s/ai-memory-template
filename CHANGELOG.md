@@ -5,6 +5,73 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.0] - 2026-10-16
+
+> **为什么是 major**：本版对**仓库结构**是破坏性变更 —— Web 控制台（前端 + 后端）整体迁往独立仓 `dpkg-s/ai-memory-web`，本仓改以 git submodule `web-console/` 引用。沿用 2.x 方式克隆/更新的人，会发现 `web/`、`serve_web.py`、`web_console.py`、`tests/test_web.py` 从本仓「凭空消失」（它们没被删除，只是搬了家）。
+>
+> **MCP 工具面只增不改**：新增第 **25** 个工具 `memory_config`（运行时阈值读写），其余 24 个的行为与 2.5.0 完全一致。`python server.py` 的 stdio 行为在「不碰新工具」时与 2.5.0 无差别。
+
+三件事，按依赖顺序列出：
+
+1. **传输层（v3「中心化 / 远程化」路线的阶段 1）** —— 服务端从「只有 stdio」扩展为「**可选** Streamable HTTP」：同一个 `server.py`、同一份记忆库，既能在本机走 stdio 给 WorkBuddy / Codex / Claude Desktop / Cursor 用，也能由 `serve_http.py` 起一个 HTTP 端点供局域网内多台机器共用。HTTP 装配全部收在两个新文件（`transport_http.py` / `serve_http.py`），主程序对**这一层**零改动 —— 这也是后续「中心化 DLC」分发的判据前提。
+2. **Web 控制台（v3.1）拆分为独立仓** —— 控制台（前端 + 后端）整体迁往 `dpkg-s/ai-memory-web`，本仓改以 submodule 引用。理由：控制台可以独立演进、独立发版，不必牵动 MCP 服务端的节奏。
+3. **配置面纳入 MCP：拆掉控制台的「第二条腿」** —— 控制台曾靠 `core_path.py` 上溯定位核心目录、注入 `sys.path`，再 `import memory_config` / `transport_http`；那是跨仓的第二条依赖腿，两侧各持一份「`memory.toml` 怎么读、怎么写、怎么校验」的知识。本版新增 MCP 工具 `memory_config`，把这件事收敛成一份实现，控制台**只经 MCP 读写** ⇒ 两个仓之间只剩「连接」一种关系。
+
+### Added
+
+- **`memory_config`（第 25 个 MCP 工具）** —— 运行时阈值（vault 根 `memory.toml`）在 MCP 上的**唯一通道**：
+  - `action="get"`（默认）：当前生效值、每键来源（`env` / `file` / `default`）、中文名与作用说明、类型与默认值，外加配置文件路径、可写性与最近一次解析错误。
+  - `action="set"`：**整状态写** —— 必须提交全部 8 个键，缺键即拒（漏提交的键被静默写回默认值，比报错更难查）。写前备份（同目录 `memory.toml.bak.<时间戳>`，保留最近 10 份）、写前自解析（fail-fast）、`os.replace` 原子替换。**只写 `memory.toml` 这一个文件，绝不触碰任何 `*.md`。**
+  - 注解 `_WRITE`（与既有 `memory_heat_suggest(apply=)` 同型：默认只报、可显式落盘）；归 Web 控制台的「库维护」分组。
+  - ⚠️ **注册名与 Python 函数名刻意不同**：函数叫 `_memory_config_tool`，对外注册名由 `@mcp.tool(name="memory_config")` 指定。若函数同名，模块级 `import memory_config` 会被这次 `def` **遮蔽**，本文件 20 余处 `memory_config.get(...)` / `.config_path()` 全部抛 `AttributeError`（实测：`memory_stats` 当场挂掉）。
+  - `values` 的类型标注为 `dict[str, Any]` 而**不是** `dict[str, float]`：后者会让 SDK 入参校验把 `body_truncate_chars` 的 `8000` 强转成 `8000.0`，而该键期望 int ⇒ 一次正常的整状态写被判成类型错误（端到端测试当场 400）。类型校验由 `memory_config` 按 `_SPEC` 做，比 JSON Schema 的 `number` 更严（int / float 分开、拒 bool）。
+- **`memory_config.py` 的配置面出口** —— `state()`（完整快照：值 / 来源 / 文案 / 类型 / 默认值 / 路径 / 错误）、`source_of(key)`、`render_toml(values)`（整状态渲染，缺键/多键/类型错一律拒）、`write_values(values, keep=10)`（校验 → 写前自解析 → 备份 → 原子替换 → 失效缓存）。`memory_stats` 的「配置」节与 MCP 工具同源，**调用方不得自己拼文案、自己解析、自己写盘**。`write_values()` **不加写锁**：`os.replace` 本身原子，且本模块是最底层（不 import `locks`，分层铁律）。
+- **`transport_http.py`** —— HTTP 传输层装配（只依赖 `mcp` + 标准库，零新增依赖）。把 `AI_MEMORY_TRANSPORT` 归一为 `stdio` / `streamable-http`，解析 host / port / path 与会话治理参数，并在危险组合上 **fail-fast**：
+  - **监听非回环地址（如 `0.0.0.0`）时必须显式提供 `AI_MEMORY_HTTP_ALLOWED_HOSTS`**，否则拒绝启动。依据是 mcp 1.30.0 实测：`host=0.0.0.0` 会让 SDK 的 `transport_security` 退化为「不校验」，而 DNS rebinding 防护**并不依赖公网暴露** —— 局域网下风险等级相同。
+  - **不提供关闭 DNS rebinding 防护的开关**（`AI_MEMORY_HTTP_DNS_REBINDING=0` 直接拒绝）：Host / Origin 校验是回环与局域网场景下唯一的浏览器侧防线；要放行更多主机名应写白名单，而不是关掉校验。
+  - **刻意不暴露 SDK 层 auth**。mcp 1.30.0 上实测：`auth` 一经开启，未认证请求返回 `401` + `WWW-Authenticate: Bearer … resource_metadata=…`，部分客户端会据此**强行走 OAuth 发现流程且不回落**；本仓没有授权服务器，只会卡死。鉴权因此留给外层（反向代理 / Tailscale / Cloudflare Access）。
+- **`serve_http.py`** —— HTTP 入口。未显式指定传输方式时按 `http` 起（脚本名即意图），并在远程模式下**默认禁用热重启**（`os.execv` 会断开全部在途 HTTP 会话；重启交给进程管理器即可，`AI_MEMORY_RESTART=1` 可强行恢复）。
+- **`tests/test_transport.py`（43 断言）** —— 模式归一 / 三条安全规则 / 替身 FastMCP 装配（含「stdio 分支零副作用」「刻意不设 auth」）/ **端到端**（真起 `serve_http.py`，客户端走 Streamable HTTP 完成 initialize·list_tools·write·read，并验证远程模式下 `memory_restart` 已自动禁用）/ **fail-fast 进程级验证**（非回环且无白名单 ⇒ 进程非零退出且提示明确）/ **零改动保证**（无 `AI_MEMORY_TRANSPORT` 时 `server.py` 仍是可用 stdio 服务且工具数正确）。
+- **`Dockerfile` / `.dockerignore` / `compose.yaml`（容器化，可选）** —— 让「目标机器上不装 Python 与 mcp」也能跑：镜像里只有运行时（Python + `mcp` + 本仓 `.py`），**记忆库一律从卷/绑定挂载进来**，因此升级只换镜像 tag、数据不动。要点：
+  - 以非 root（uid 10001）运行；健康检查**只探监听端口** —— MCP 端点是 POST + 会话语义，GET 不返回 2xx，拿它当探针会把「健康」误判成「故障」。
+  - 容器内必须监听 `0.0.0.0`（否则宿主机连不上），这正好触发上面第 2 条约束 ⇒ 镜像预置 `AI_MEMORY_HTTP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*,ai-memory:*`，要从别的主机名/地址访问**必须显式追加**，否则被 Host 校验拦下（有意的摩擦）。
+  - compose 把端口绑到 `127.0.0.1`（局域网看不到），数据用具名卷；要用已有记忆库目录则换成 bind mount。
+  - `.dockerignore` 把构建上下文收敛为 `*.py` + `requirements.txt`；`COPY *.py` 用通配而非逐项列举 —— 安装脚本里已有一份显式模块清单，不再复制第二份，新增模块（如本次的 `memory_config` 改动不新增文件）无需改 Dockerfile。
+- **`web-console/`（submodule 引用）** —— Web 控制台（前端 + 后端）的唯一事实源在独立仓 [`dpkg-s/ai-memory-web`](https://github.com/dpkg-s/ai-memory-web)。本版引用其 `v1.1.0`：同源后端代理 + token 鉴权 + 阈值走 MCP 工具 + 更新面（git 白名单拉取 + 差异预览 + 一键重启）。要点（详细设计见该仓 README）：
+  - **同源页面 + 后端代理**，而不是让浏览器直连 MCP：实测 `allowed_origins` 默认空 ⇒ 任何带 `Origin` 的请求一律 **403**；即便补白名单，MCP 端点也**不返回 CORS 头**且 `OPTIONS` 返 **405**。后端用 SDK 客户端连则不发送 `Origin` ⇒ 实测 `initialize` / 25 工具 / stats 全通，且 **MCP 端零配置改动**。（顺带印证健康检查口径：`GET /mcp` 无 `Accept` ⇒ **406**、带 SSE 无会话 ⇒ **400**，所以探针只探端口。）
+  - 鉴权：`/api/*` 走 token（`Authorization: Bearer` 或 `X-Auth-Token`），**静态资源不校验**（里面没有秘密）；**监听非回环地址必须设 `AI_MEMORY_WEB_TOKEN`**，否则拒绝启动。
+  - **控制台不 import 本仓任何模块**（含 `memory_config` / `transport_http`）——由该仓 `tests/test_web.py` 的 C 段机器守卫（`sys.modules` 里出现核心仓模块即红）。
+- **`tests/test_memory_config.py` 新增 T10（30 断言）** —— 配置面出口的可证伪判据：快照字段齐备、键集与 `DEFAULTS` 严格相等、`source_of` 三级来源（含 env 覆盖与摘除回退）、`render_toml` 的四类拒绝、**被拒写入必须逐字节不碰盘**、备份名命中 vault 自带 `.gitignore` 的 `*.bak.*`、`keep` 限制备份份数、不留 `.tmp` 残骸、写入路径不产生 `*.md`、未注入 vault 时明确报错。
+- **`tests/test_tools_smoke.py` 新增「配置面工具」段** —— `get`（text/json）/ 缺键拒绝 / 非法键值 / 非法 action / 全量写入落盘生效 / 二次写入留备份。
+
+### Changed
+
+- **`tests/test_import_layers.py`（35 → 47 → 47 断言）**：分层守卫第 9 组（I9）—— 装配/入口层（`serve_http` / `transport_http`）**不得被叶子或聚合器 import**（否则 `server` 会经由 HTTP 入口反向依赖，「主程序零改动」与「stdio 永远可用」两条前提同时失效），且它们对本地模块的依赖**只许**指向 `server`。附两条自检：**提取器自检**（I9c，本组第一版因模块清单未纳入装配层而**恒绿**）、**白名单不腐烂**（I9d）。本版随拆仓更新：原 `("web_console", "memory_config")` 白名单项移除 —— 该依赖边在控制台迁出后**已彻底不存在**（不是"搬走了"，是被本次第 3 件事消灭了）。
+- **`tests/test_tools_smoke.py`（33 → 41 断言）/ `tests/test_transport.py`（43 断言）**：工具总数 24 → **25**，`EXPECTED_TOOLS` 与 stdio 端到端计数同步。
+- **README**：新增「远程访问（可选 Streamable HTTP）」一节与 9 个 HTTP 环境变量；新增「用容器跑（可选）」小节与容器文件条目；新增「Web 控制台（v3.1，可选）」一节（指向独立仓）；工具速查 **24 → 25**；版本徽章与容器 tag 同步为 `3.0.0`；测试计数按实测重算。
+- **`.github/workflows/release.yml`**：Release 标题改为取**带注释 tag 的 subject**（`git tag -a v3.0.0 -m "v3.0.0 — …"` ⇒ 标题即那句话），轻量 tag 自动回退为 tag 名。Checkout 补 `fetch-depth: 0`（读 tag 注释需要）。
+
+### Removed
+
+- **`SHA256SUMS.txt` 的生成与分发（release.yml）**：清单只覆盖 `install.sh` / `install.ps1` 与 7 个运行时模块中的 6 个（**漏 `memory_config.py`**），与实际安装集不一致；而安装/更新流程并不做校验 ⇒ 继续维护它的收益低于「清单与代码不同步」造成的误导风险（用户按过期哈希核对，只会得出「文件被篡改」的错误结论）。今后 Release 只发布代码本身。
+- **本仓移除 Web 控制台相关文件**（迁往独立仓，submodule 引用）：`web/`（47 文件）、`serve_web.py`、`web_console.py`、`tests/test_web.py`。
+
+### Fixed
+
+- **窄屏（≤344px）概览页横向溢出 12px**（Web 控制台，随迁出）：`.grid.two` / `.grid.three` 的轨道下限是 `320px` / `260px`，`max-width:560px` 的分支只改了 `.grid.stats` ⇒ 视口小于该下限时轨道比内容盒还宽，直接顶破视口。现于窄屏分支把两者放成 `minmax(0, 1fr)`。
+- **手机宽度下「调试台」页横向溢出最多 183px**（Web 控制台，随迁出）：`.tool-item .td` 是 `white-space: nowrap` 却**没有 `min-width: 0`** ⇒ 其 min-content 等于整句描述宽度（实测 ~455px），列向 flex 的交叉轴最小值默认 `auto` 压不下去，再经 `1fr` 轨道的 `auto` 最小尺寸把整张卡撑破视口。现补 `min-width: 0`（省略号这才真正生效），并显式允许网格条目收缩（`.console-grid > * { min-width: 0 }`），`.console-grid` / `.grid.lib` 的单列分支改用 `minmax(0, 1fr)`。
+  - ⚠️ **这两处差点被漏掉也差点被改坏**：原先用 `chrome --headless --window-size=390,844 --screenshot` 取景，而 **Chrome 在 Windows 上会把窗口宽度钳到最小 500px**（实测 320/390 → **500**，1440 → 1424；三种 headless 模式一致，`--force-device-scale-factor` 也不改变布局宽度）。于是那张「390px 截图」其实是**500px 宽的布局被裁到 390**，看起来像「右侧溢出 / 卡片被切」——**纯取景假象**。若照此去改 CSS，反而会引入真回归。现改为把页面放进**同源 iframe**（iframe 的 CSS 宽度即布局视口，不经过 OS 窗口），截图后用 Pillow 裁到精确尺寸，并把「产出像素尺寸 == 请求尺寸」本身作为判据。同法实测 8 个视口 × 4 个页面 = **32 组零溢出**，统计卡列数随宽度单调不减（1→2→3→4）。
+
+### Tests
+
+- **本仓 26 套**（库存口径合计 **1092 断言**）：25 套实跑可汇总 = **1060 断言，1059 通过 / 1 报红**；余 1 套 `test_schema_diff`（32 断言）因本机沙箱拦截临时目录写入而**无法跑完**。
+  - 报红 1 项：`test_import_layers` 的 **I0a「模块清单与磁盘一致」** —— 本机仓库根有 37 个 `_v3_*` 探针脚本与 `ai_memory_gui.py` / `build_exe.py` 未登记（前者是 `.gitignore` 的本地调试产物，不属产品代码）。**与本次改动无关**（拆仓前后同样报红），属本机工作区卫生问题。
+  - `test_schema_diff` 的失败是沙箱对 `%TEMP%` 下 `*.md` 写入的拦截（`PermissionError`），**环境问题，与代码无关**。
+- 本版**新增/改动**的套件单跑结果：`tests/test_tools_smoke.py` **41/0**（+8：配置面段 8 项 + 工具数 24→25）、`tests/test_memory_config.py` **111/0**（+32：新增 T10 配置面出口）、`tests/test_transport.py` **43/0**（仅工具数计数 24→25）、`tests/test_import_layers.py` **42/1**（上述 I0a）。
+- 上版（2.5.0）基线为 25 套 / 1000 断言；本版套件与断言数增长主要来自配置面出口测试与拆仓后的分层/计费同步。
+- Web 控制台的测试随其迁往 `ai-memory-web`：**72 断言全绿**（含真起 `serve_http` + `serve_web` 的阈值写读往返、以及「不 import 核心仓模块」的机器守卫 C2）。
+- Web 控制台三端适配另有**独立量测探针**：32 组（视口 × 页面）横向溢出全 0，列数单调；渲染验证 30 项全绿（各页 DOM 真实内容 + 14 张精确尺寸截图）。
+
 ## [2.5.0] - 2026-10-12
 
 > 版本号说明：本版内容原计划随 `2.4.3` 发布，并入本版后改用 **minor** 号 —— 依赖下限从 `mcp>=1.27` 提到 `mcp>=1.30` 会**直接改变使用者的安装结果**（`mcp<1.30` 的环境将装不上），不属 patch 语义。
@@ -369,7 +436,8 @@
 - 跨平台安装脚本：Windows PowerShell + Linux/macOS bash
 - 零外部依赖：仅需 Python 3.10+ 与 `mcp` 包
 
-[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/dpkg-s/ai-memory-template/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.5.0...v3.0.0
 [2.5.0]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/dpkg-s/ai-memory-template/compare/v2.4.0...v2.4.1

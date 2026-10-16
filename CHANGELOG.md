@@ -49,7 +49,8 @@
 - **`tests/test_import_layers.py`（35 → 47 → 47 断言）**：分层守卫第 9 组（I9）—— 装配/入口层（`serve_http` / `transport_http`）**不得被叶子或聚合器 import**（否则 `server` 会经由 HTTP 入口反向依赖，「主程序零改动」与「stdio 永远可用」两条前提同时失效），且它们对本地模块的依赖**只许**指向 `server`。附两条自检：**提取器自检**（I9c，本组第一版因模块清单未纳入装配层而**恒绿**）、**白名单不腐烂**（I9d）。本版随拆仓更新：原 `("web_console", "memory_config")` 白名单项移除 —— 该依赖边在控制台迁出后**已彻底不存在**（不是"搬走了"，是被本次第 3 件事消灭了）。
 - **`tests/test_tools_smoke.py`（33 → 41 断言）/ `tests/test_transport.py`（43 断言）**：工具总数 24 → **25**，`EXPECTED_TOOLS` 与 stdio 端到端计数同步。
 - **README**：新增「远程访问（可选 Streamable HTTP）」一节与 9 个 HTTP 环境变量；新增「用容器跑（可选）」小节与容器文件条目；新增「Web 控制台（v3.1，可选）」一节（指向独立仓）；工具速查 **24 → 25**；版本徽章与容器 tag 同步为 `3.0.0`；测试计数按实测重算。
-- **`.github/workflows/release.yml`**：Release 标题改为取**带注释 tag 的 subject**（`git tag -a v3.0.0 -m "v3.0.0 — …"` ⇒ 标题即那句话），轻量 tag 自动回退为 tag 名。Checkout 补 `fetch-depth: 0`（读 tag 注释需要）。
+- **`.github/workflows/release.yml`**：Release 标题改为取**带注释 tag 的 subject**（`git tag -a v3.0.0 -m "v3.0.0 — …"` ⇒ 标题即那句话），轻量 tag 回落为 tag 名。Checkout 补 `fetch-depth: 0`（读 tag 注释需要）。
+  - ⚠️ **实况纠正（v3.0.0 发布当场踩到）**：只靠本地 `git tag -l --format='%(contents:subject)'` 不行 —— runner 上本地 tag 未必是带注释形态，该占位符会**静默退回被指向提交的主题**，于是 Release 标题变成 `docs: 更正 v3.0.0 的测试口径…` 而不是 tag 上写的那句话。现改为走 API：先看 `git/ref/tags/<tag>` 的 `object.type`，**确为 `tag`** 才读它的 `message` 首行，任何一步失败都回落为 tag 名（宁可为空，不可为错）。已核对本次 `object.type=tag`、标题取值正确，并手工订正了 v3.0.0 的 Release 标题。
 
 ### Removed
 

@@ -1,8 +1,16 @@
 # 打 tag（v*）时自动发布 Release：先跑全量回归，再建 Release。
 #
-# 标题约定：Release 标题 = 「tag — 一句话描述」（对齐 v2.0.0 的历史格式）。
-#   CI 取**带注释 tag 的 subject**（`git tag -a v2.7.0 -m "v2.7.0 — 描述"`）；
-#   轻量 tag（无注释）自动回退为 tag 名，行为与从前一致。
+# 标题约定：Release 标题 = 「tag — 一句话描述」（对齐 v2.0.0 的历史格式），
+#   取自**带注释 tag 的 subject**（`git tag -a v3.0.0 -m "v3.0.0 — 描述"`）；
+#   轻量 tag（无注释）回落为 tag 名。
+#
+# ⚠️ 2026-10-16 实况纠正：**不能只用本地的
+#   `git tag -l --format='%(contents:subject)' "$TAG"`**。runner 上本地 tag
+#   未必是带注释形态（或没取到 tag 对象），此占位符会**静默退回被指向提交的主题**
+#   —— v3.0.0 的 Release 标题因此一度变成 commit subject（"docs: 更正 v3.0.0 的
+#   测试口径…"），而不是 tag 上写的那句话。现改为走 API 取注释对象：先看
+#   `git/ref/tags/<tag>` 的 `object.type`，只有确为 `tag` 才去读它的 `message`；
+#   任何一步失败都老实回落为 tag 名（宁可为空，不可为错）。
 #
 # ⚠️ 2026-10-16：SHA256 校验和**已弃用**，本工作流不再生成 SHA256SUMS.txt、
 #   不再写进 Release 说明、也不再作为附件上传（历史 Release 的附件与正文段已清理）。
@@ -49,6 +57,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          TITLE="$(git tag -l --format='%(contents:subject)' "$TAG")"
-          [ -n "$TITLE" ] || TITLE="$TAG"
+          TITLE="$TAG"
+          OBJ="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                   --jq '.object.type + " " + .object.sha' 2>/dev/null || true)"
+          KIND="${OBJ%% *}"; SHA="${OBJ##* }"
+          if [ "$KIND" = "tag" ]; then
+            MSG="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$SHA" \
+                     --jq '.message' 2>/dev/null || true)"
+            SUBJ="$(printf '%s\n' "$MSG" | head -n1)"
+            if [ -n "$SUBJ" ]; then TITLE="$SUBJ"; fi
+          fi
+          echo "release title = $TITLE"
           gh release create "$TAG" --title "$TITLE" --generate-notes

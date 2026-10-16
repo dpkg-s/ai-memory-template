@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-2.5.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-1000%20assertions-brightgreen)](#测试与-ci)
+[![Tests](https://img.shields.io/badge/tests-1055%20assertions-brightgreen)](#测试与-ci)
 
 ---
 
@@ -68,13 +68,15 @@
 
 ### 跨平台 · 跨 AI 客户端
 
-MCP 是开放协议，服务端只提供 stdio 传输，因此可接入：
+MCP 是开放协议，服务端默认以 stdio 传输，因此可接入：
 
 - **WorkBuddy** — 国产 AI 助手
 - **Codex CLI** — OpenAI 终端 AI 助手
 - **Claude Desktop** — Anthropic 桌面客户端
 - **Cursor** — AI 代码编辑器
 - 任何支持 MCP stdio 的工具
+
+需要**远程 / 多机共用**同一个记忆库时，另有可选的 Streamable HTTP 入口（见 [远程访问（可选 Streamable HTTP）](#远程访问可选-streamable-http)）；想在浏览器里直接观察与调试记忆库，另有可选的 [Web 控制台（v3.1，可选）](#web-控制台v31可选)。两者都默认关闭，不影响上面任何一种用法。
 
 ### 写入即自动化
 
@@ -262,6 +264,85 @@ heat_hot_min = 3.0            # 升为 hot 的热度下限
 
 设计上刻意克制：纯标准库、全链路 `try/except`（观测绝不能成为主流程的新故障点）、**不加跨进程锁**（多进程 read-merge-write 同一 JSON 非原子，允许少量丢失 —— 指标看趋势，不需要精确到个位）。正常退出时自动落盘零头；被强杀则丢最后不足 50 次事件，这正是这层取舍的一部分。设 `AI_MEMORY_METRICS=0` 可完全关闭。
 
+### 远程访问（可选 Streamable HTTP）
+
+默认传输是 stdio（本机、每个客户端各起一个进程）。若要让**局域网内的多台机器 / 多个客户端共用同一个记忆库**，用可选入口 `serve_http.py` 把同一份服务暴露成 Streamable HTTP：
+
+```bash
+# 本机（仅回环可访问）
+python serve_http.py                                    # → http://127.0.0.1:8700/mcp
+
+# 局域网暴露：必须显式声明允许的 Host，否则拒绝启动
+AI_MEMORY_HTTP_HOST=0.0.0.0 \
+AI_MEMORY_HTTP_ALLOWED_HOSTS="192.168.1.10:8700,localhost:8700" \
+python serve_http.py
+```
+
+客户端侧把原本的 `command` + `args` 换成该 URL 即可（这类客户端用 streamable HTTP 型 MCP 服务）。
+
+**三条刻意的安全约束**（`transport_http.py`）：
+
+1. **不开 SDK 层鉴权**。一旦开启，未认证请求会返回 `401` + `WWW-Authenticate: Bearer … resource_metadata=…`，而部分客户端会据此**强行走 OAuth 发现流程且不回落** —— 我们没有授权服务器，只会卡死。**鉴权请做在外层**（反向代理 / Tailscale / Cloudflare Access 等）。
+2. **Host / Origin 校验绝不静默关闭**。监听非回环地址时必须显式给出 `AI_MEMORY_HTTP_ALLOWED_HOSTS`，否则**直接拒绝启动**；本模块也不提供关闭 DNS rebinding 防护的开关。理由是这类「监听地址一改、校验静默失效」的误配在网上极其常见。
+3. **远程模式自动禁用热重启**。`memory_restart` 走 `os.execv` 原地换进程，会断开全部在途 HTTP 会话 —— 远程场景下重启交给进程管理器更合适（确有需要时用 `AI_MEMORY_RESTART=1` 强行恢复）。
+
+> **主程序零改动**：HTTP 装配全部收在 `transport_http.py` / `serve_http.py` 两个文件里，`server.py` 一个字符都不动 —— `python server.py` 永远等于 stdio，两种入口互不影响，`tests/test_transport.py` 有专项断言钉住这一点。Web 控制台自 2026-10-16 起拆分为独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)，不在本仓的导入图内。
+
+### 用容器跑（可选）
+
+不想在目标机器上准备 Python 与 `mcp` 依赖时，可以直接跑容器。仓库自带 `Dockerfile` 与 `compose.yaml`，镜像里**只有运行时**（Python + `mcp` + 本仓 `.py`），记忆库一律从卷/绑定挂载进来，所以升级只换镜像 tag、数据不动。
+
+```bash
+# 构建（或 docker load 一个别人给的镜像 tar）
+docker build -t ai-memory:2.6.0 .
+
+# 方式一：具名卷（数据在 Docker 管理的卷里）
+docker run -d --name ai-memory -p 127.0.0.1:8700:8700 \
+    -v ai-memory-vault:/vault ai-memory:2.6.0
+
+# 方式二：直接挂已有的记忆库目录（注意容器会写索引与 .memory.lock）
+#   把下面的路径换成你自己的绝对路径（Windows 形如 D:/memory/ai-memory）
+docker run -d --name ai-memory -p 127.0.0.1:8700:8700 \
+    -v "/path/to/your/ai-memory:/vault" ai-memory:2.6.0
+
+# 或用 compose（在仓库根目录）
+docker compose up -d --build
+```
+
+容器内默认 `AI_MEMORY_DIR=/vault`、监听 `0.0.0.0:8700`。**注意容器必须监听 `0.0.0.0`**（否则宿主机连不上），这恰好触发上面第 2 条约束 ⇒ 镜像里预置了 `AI_MEMORY_HTTP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*,ai-memory:*`。要从别的主机名/地址访问，**必须显式追加**（例：`192.168.1.20:8700`），否则请求会被 Host 校验拦下 —— 这是有意的摩擦。
+
+容器以非 root（uid 10001）运行；健康检查只探监听端口（MCP 端点是 POST + 会话语义，GET 不返回 2xx，拿它当探针会把「健康」误判成「故障」）。
+
+### Web 控制台（v3.1，可选）
+
+想在浏览器里**看着**记忆库（而不是全靠 AI 转述），可以起一个可选的本地控制台。
+
+> 🔴 **2026-10-16 起，Web 控制台已拆分为独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)**（前端 + 后端一体），在本仓作为 submodule 挂在 `web-console/`。下面的命令都在该目录下执行：
+
+```bash
+git clone --recursive git@github.com:dpkg-s/ai-memory-template.git
+cd ai-memory-template/web-console
+
+python serve_web.py                 # → http://127.0.0.1:8811/
+python serve_web.py --with-mcp      # 顺带把 MCP 端点也作为子进程拉起来（单机试用最省事）
+python serve_web.py --check         # 只校验配置并打印摘要，不起服务（自检 / CI）
+
+# 暴露到局域网：必须设 token，否则拒绝启动
+AI_MEMORY_WEB_HOST=0.0.0.0 \
+AI_MEMORY_WEB_TOKEN="$(openssl rand -hex 16)" \
+python serve_web.py
+```
+
+控制台经 `core_path.py` **自动上溯**定位本仓的核心模块（`memory_config` / `transport_http`）——submodule 形态下零配置；若单独 clone 该仓，用 `AI_MEMORY_CORE_DIR` 指定本仓路径即可。核心模块的唯一事实源始终在本仓，控制台**不复制、不派生**。
+
+四个页面：**概览**（条目数 / 热度分层 / 类型分布 / 最近更新 / 热门标签）、**调试台**（列出全部 24 个工具、按 JSON Schema 生成参数表单、直接调用并查看原始返回，破坏性工具要求二次确认）、**记忆库**（关键词搜索 + 浏览 + Markdown 渲染）、**配置**（MCP 端点 / 运行时阈值 / FNS 同步 / 关于）。支持深浅主题、三端适配（手机 / 平板 / 桌面）与前端动画。
+
+**架构上只有一条要紧的事**：页面与 API **同源**，浏览器**不直连 MCP** —— 由后端用 SDK 客户端去连。依据是实测：MCP 端点的 `allowed_origins` 默认空 ⇒ 任何带 `Origin` 的请求一律 **403**；即便补上白名单，端点也**不返回 CORS 头**且 `OPTIONS` 返 **405**。后端连则不发送 `Origin` ⇒ **MCP 端零配置改动**。
+
+> **仍然零改动**：控制台是**独立进程**，不 import `server`，对记忆库的一切读写都走 MCP 协议 —— 天然满足 v3 的两条判死项（不直连 vault、不进程内直调）。`python server.py` 依旧逐字节等于 stdio。该分层断言现由独立仓的 `tests/test_web.py` 钉住（「导入控制台后 `sys.modules` 里没有 `server`」）。
+
+> 前端是 **Vue 3 + 本地 vendor**：**零 CDN、零构建、零 node**，随该仓一起分发。阈值写入是**整状态写**（须提交全部键），且**只写 vault 根的 `memory.toml`**，绝不触碰 `*.md`。
+
 ### 改完即生效（原地热重启）
 
 改了 `server.py` 或任一模块后，调用 `memory_restart` 即可让新代码生效，**不必重连客户端、不必重启应用**：进程映像被原地替换，stdin/stdout 保留，stdio 会话因此不断。
@@ -272,7 +353,7 @@ heat_hot_min = 3.0            # 升为 hot 的热度下限
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **1000 条断言的二十五层测试**：语义回归 29 + 全工具冒烟 32 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 36 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 49 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 82 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 79 + 索引命名与迁移 49 + JSON 输出 76 + 模块分层守卫 35
+- **1055 条断言的二十六层测试**：语义回归 29 + 全工具冒烟 32 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 36 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 49 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 82 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 79 + 索引命名与迁移 49 + JSON 输出 76 + 模块分层守卫 47 + HTTP 传输层 43
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py` / `memory_index.py` / `memory_config.py`，可观测层拆为 `metrics.py`；`tests/test_import_layers.py` 用手写 AST 守卫钉住分层（叶子模块不得反向依赖 `server.py`、本地模块之间不得成环），**不引入任何打包元数据**
 
@@ -288,7 +369,7 @@ v2.0.0 起，仓库自带测试与持续集成：
 
 > **注意版本上界**：依赖锁定在 `mcp<2`。mcp 2.x 已将 `FastMCP` 更名为 `MCPServer`（`mcp.server.fastmcp` 模块整个被删），装到 2.x 会直接 import 失败；若使用了 `memory_restart`，2.x 还移除了 `InitializationState`，其会话恢复补丁同样会失效。
 >
-> **版本下限 1.30**：`mcp.server.fastmcp` / `mcp.server.session.InitializationState` / `mcp.types.ToolAnnotations` 在 1.30.0 上均完好（实测 25 套 / 1000 断言全绿），并新增 `session_idle_timeout` / `max_sessions` 两个 HTTP 会话治理参数。注意 **1.x 线已进入维护模式**，上游此后仅收安全修复。
+> **版本下限 1.30**：`mcp.server.fastmcp` / `mcp.server.session.InitializationState` / `mcp.types.ToolAnnotations` 在 1.30.0 上均完好（实测 26 套 / 1055 断言），并新增 `session_idle_timeout` / `max_sessions` 两个 HTTP 会话治理参数。注意 **1.x 线已进入维护模式**，上游此后仅收安全修复。
 
 ### 方式一：交给 AI 助手自动部署（推荐）
 
@@ -535,6 +616,25 @@ python server.py
 | `AI_MEMORY_DIR_POLICY` | 写入端目录归类档位：`warn` / `auto` / `strict` / `off` | `warn` |
 | `AI_MEMORY_CFG_<KEY>` | 覆盖任一 `memory.toml` 阈值（如 `AI_MEMORY_CFG_LOCK_TIMEOUT=30`），优先级最高 | 不设置 |
 | `AI_MEMORY_FSYNC` | 写入后强制 `fsync`（掉电/强杀场景下的持久化保证；代价是写入变慢） | 关闭 |
+| `AI_MEMORY_TRANSPORT` | 传输方式：`stdio`（默认）/ `http` / `streamable-http` | `stdio` |
+| `AI_MEMORY_HTTP_HOST` | HTTP 监听地址（非回环须配 Host 白名单） | `127.0.0.1` |
+| `AI_MEMORY_HTTP_PORT` | HTTP 监听端口 | `8700` |
+| `AI_MEMORY_HTTP_PATH` | HTTP 端点路径 | `/mcp` |
+| `AI_MEMORY_HTTP_ALLOWED_HOSTS` | Host 白名单（逗号分隔）；**非回环监听必填** | 不设置 |
+| `AI_MEMORY_HTTP_ALLOWED_ORIGINS` | Origin 白名单（逗号分隔，浏览器场景） | 不设置 |
+| `AI_MEMORY_HTTP_STATELESS` | 无状态模式（多副本 / 无会话保持） | `0` |
+| `AI_MEMORY_HTTP_SESSION_IDLE_TIMEOUT` | HTTP 会话空闲超时（秒） | `1800` |
+| `AI_MEMORY_HTTP_MAX_SESSIONS` | HTTP 并发会话上限 | `10000` |
+| `AI_MEMORY_WEB_HOST` | 控制台监听地址（非回环须配 token） | `127.0.0.1` |
+| `AI_MEMORY_WEB_PORT` | 控制台监听端口 | `8811` |
+| `AI_MEMORY_WEB_MCP` | 上游 MCP 端点 URL | `http://127.0.0.1:8700/mcp` |
+| `AI_MEMORY_WEB_TOKEN` | 访问令牌（`/api/*` 校验）；**非回环监听必填** | 不设置 |
+| `AI_MEMORY_WEB_ALLOWED_HOSTS` | 控制台 Host 白名单（逗号分隔，启用 TrustedHost） | 不设置 |
+| `AI_MEMORY_WEB_CONFIG` | 控制台配置面存储（JSON，**在 vault 之外**） | `~/.ai-memory-web/config.json` |
+| `AI_MEMORY_WEB_CONFIG_WRITE` | 设 `0` 则阈值页转只读 | `1` |
+| `AI_MEMORY_WEB_STATIC` | 前端静态资源目录 | `<仓库>/web` |
+
+HTTP 相关变量的用途与安全约束见 [远程访问（可选 Streamable HTTP）](#远程访问可选-streamable-http)；控制台相关变量见 [Web 控制台（v3.1，可选）](#web-控制台v31可选)。
 
 指标与索引一样，是**运行时生成的缓存文件**（`memory_metrics_<哈希>.json`，位于 `server.py` 同目录，不入库、可随时删除）。想从哪里看服务健康状况，直接调用 `memory_stats` 或 `memory_audit` 即可。
 
@@ -683,8 +783,9 @@ clone 完即可使用，所有 AI 的记忆自动同步。
   ├─ Claude Desktop
   └─ Cursor / 任何支持 MCP stdio 的客户端
         │
-        ▼  MCP 协议 · stdio · JSON-RPC 2.0
+        ▼  MCP 协议 · stdio（默认）· JSON-RPC 2.0
   server.py —— 24 个 MCP 工具
+  ↑ 可选远程入口：serve_http.py → transport_http.py（同一份 server，不改主程序）
   ├─ 读写：write / read / delete / update_metadata / recent
   ├─ 查询：search / smart_search / list / graph / context / orphans / stats
   ├─ 维护：archive / archive_old / restore / batch_tag / batch_tier / heat_suggest / restart
@@ -711,7 +812,10 @@ ai-memory-template/
 ├── CHANGELOG.md             # 版本变更记录
 ├── LICENSE                  # MIT
 │
-├── server.py                # MCP 服务端：24 个工具注册 + 存储层 + 业务逻辑
+├── server.py                # MCP 服务端：24 个工具注册 + 存储层 + 业务逻辑（stdio 入口）
+├── serve_http.py            # 可选：Streamable HTTP 入口（主程序零改动的 HTTP 装配）
+├── transport_http.py        # HTTP 传输层：环境变量解析 + Host 校验 fail-fast（只依赖 mcp）
+├── web-console/             # 🔗 submodule → ai-memory-web：Web 控制台（前端 + 后端一体）
 ├── memory_index.py          # SQLite 元数据索引（标题 O(1) 定位，增量重解析）
 ├── memory_config.py         # 运行时阈值（vault 根 memory.toml + 环境变量 + 热重载）
 ├── metrics.py               # 运行时指标（检索/读写/锁/索引；仅标准库）
@@ -725,6 +829,9 @@ ai-memory-template/
 ├── requirements-dev.txt     # 开发依赖（pytest + ruff）
 ├── ruff.toml                # lint 配置
 ├── .gitattributes           # 强制 LF 换行，避免 CRLF 污染
+├── Dockerfile               # 容器镜像（只装运行时；记忆库从卷挂载）
+├── .dockerignore            # 构建上下文白名单（*.py + requirements.txt）
+├── compose.yaml             # 本机 compose（只绑回环，具名卷存数据）
 │
 ├── tests/
 │   ├── test_roundtrip.py         # 29 断言：语义回归
@@ -752,7 +859,8 @@ ai-memory-template/
 │   ├── test_memory_config.py     # 79 断言：阈值配置（默认值一致 / 子集拒绝 / 优先级 / 热重载 / 坏配置）
 │   ├── test_index_name.py        # 47 断言：索引文件名与迁移（可见名 / 反向迁移 / 人侧可点击 / 摘要行）
 │   ├── test_output_json.py       # 76 断言：JSON 输出（范围即契约 / text 逐字节不变 / 非法值报错）
-│   └── test_import_layers.py     # 35 断言：模块分层守卫（叶子不反向依赖 / 无环 / 白名单不腐烂）
+│   ├── test_import_layers.py     # 47 断言：模块分层守卫（叶子不反向依赖 / 无环 / 白名单不腐烂 / 装配层依赖方向）
+│   └── test_transport.py         # 43 断言：HTTP 传输层（模式归一 / 安全规则 / 装配 / 端到端 / 零改动保证）
 ├── scripts/
 │   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
 ├── .github/workflows/
@@ -778,7 +886,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 **25 套 / 998 条断言**。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 **26 套 / 1055 条断言**（另有 Web 控制台一套已随控制台迁至独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)）。
 
 **每条新判据都要先证明它「会红」**：新增断言时会把产品改回旧行为跑一遍，若断言不变红就说明它证明不了任何东西。本批的证伪结果：阈值配置 8/8、索引命名 **23/47**、多行标量转义 **6/8**、JSON 输出 7/7、模块分层 8/8 根针全部生效。
 
@@ -994,12 +1102,26 @@ ai-memory-template/
 - 截断语义：JSON 的 `body` 不含中文截断说明，改由 `truncated` / `total_chars` 承载
 - 中文不转义（`ensure_ascii=False`）
 
-### 模块分层守卫 —— `tests/test_import_layers.py`（35 断言）
+### 模块分层守卫 —— `tests/test_import_layers.py`（47 断言）
 
 - 叶子模块不得 import `server`（含函数体内延迟 import 与 `importlib` 动态拉起）
 - 本地模块之间**无环**；叶子之间的依赖只能在显式白名单内，且白名单**不得腐烂**
 - `server` 必须 import 全部叶子，且运行期**真的加载**（`sys.modules` + 绑定名双重佐证 —— `import memory_index as midx` 要按 `midx` 核）
 - 本地 import 必须都在模块顶层；新增模块必须登记进清单（否则从守卫视野里消失）
+- **装配/入口层**（`serve_http.py` / `transport_http.py`）依赖方向单向：叶子与聚合器**不得** import 它们，它们也只许 import `server`（装配层若确需直连叶子，必须在白名单里显式登记，且白名单会因陈旧条目被判红）—— 「主程序零改动」不被反向依赖破坏。原 `serve_web` / `web_console` 已随 Web 控制台迁至独立仓，不在本仓的导入图内
+
+### HTTP 传输层 —— `tests/test_transport.py`（43 断言）
+
+- **模式归一**：`stdio` 为默认；`http` / `streamable-http` 等多写法归一；非法值 fail-fast（绝不静默回退 stdio）
+- **安全规则**：非回环监听 + 无 Host 白名单 ⇒ 拒绝；关闭 DNS rebinding 防护 ⇒ 拒绝；回环默认与 SDK 语义一致
+- **装配（替身 FastMCP）**：stdio 分支调用 `mcp.run()` 且不触碰 settings；http 分支写对 `host/port/path/transport_security`，且**刻意不设 auth**
+- **端到端**：真起 `serve_http.py`，客户端走 Streamable HTTP 完成 `initialize` / `list_tools` / `write` / `read`，并验证远程模式下 `memory_restart` 已被自动禁用
+- **fail-fast 进程级**：非回环且无白名单时，进程必须非零退出并给出明确提示（而不是静默起一个不校验 Host 的服务）
+- **零改动保证**：不带 `AI_MEMORY_TRANSPORT` 时，`server.py` 仍是可用的 stdio 服务且工具数不变
+
+### Web 控制台 —— 已迁至独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)（2026-10-16）
+
+原 `tests/test_web.py` 随控制台一并迁出，现由该仓的 `tests/test_web.py` 承载（覆盖配置 fail-fast / 前端资源完整性 / 分层 / 鉴权 / 只读保护 / 端到端 / 工具分组 / 更新面）。本仓不再含控制台的任何代码与测试 —— 它与本仓的全部关系只有一条：`core_path.py` 在运行时定位本仓的核心模块目录（`memory_config` / `transport_http`）并注入 `sys.path`，**不复制、不派生**。
 
 所有脚本都会把 `AI_MEMORY_DIR` 指向临时目录，**绝不触碰真实记忆库**。
 
@@ -1012,7 +1134,7 @@ for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 
 CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
 
-> 这二十五层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
+> 这二十六层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
 
 ---
 

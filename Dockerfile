@@ -29,9 +29,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 新增模块无需改本文件（少一处会随重构腐烂的清单）。
 COPY *.py ./
 
-# 前端静态资源（Web 控制台，同源页面）。它不是「可选附件」：serve_web.py 启动时会校验
-# AI_MEMORY_WEB_STATIC/index.html 是否存在，缺了直接 fail-fast。只 `COPY *.py` 会漏掉它。
-COPY web/ ./web/
+# 2026-10-16：Web 控制台（serve_web.py / web_console.py + web/）已拆分为独立仓
+# ai-memory-web —— 本镜像只跑 MCP 服务端，故不再 COPY 前端静态资源。
+# 需要控制台时单独 clone 该仓，让它对着本镜像暴露的 8700 端点启动即可。
 
 # 非 root 运行。/vault 是记忆库卷的挂载点。
 # 不用 --system：系统账号 uid 上限是 999，配 10001 会发警告（虽不致命）。

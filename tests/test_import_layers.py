@@ -7,11 +7,15 @@
     为一条守卫引入打包元数据得不偿失。于是改成「手写 AST 守卫」：规则更少、
     更贴本仓，且**不引入任何依赖**。
 
-本仓的形状（2026-10-08 实测）:
+本仓的形状（2026-10-13 实测）:
     server.py            —— 唯一聚合器（MCP 工具入口，被 mcp 装饰器注册）
     locks / memory_config / memory_index / metrics / text_utils / yaml_io
                          —— 叶子模块，只被 server 组装，**绝不反向依赖 server**
-    边: server → 全部叶子；locks → memory_config；text_utils → memory_config
+    serve_http / transport_http
+                         —— 装配/入口层（v3 阶段 1）：**不被 server 依赖**，
+                            由入口反向 import server（见 I9）
+    边: server → 全部叶子；locks → memory_config；text_utils → memory_config；
+        serve_http → server, transport_http
 
 本脚本的断言口径（都可证伪）:
     I1  叶子模块**不得** import server（含函数体内延迟 import —— 那只是把环
@@ -25,8 +29,12 @@
     I6  本地 import 必须都在**模块顶层**：延迟 import 会掩盖环，也让「启动即
         加载」的保证失效（本仓靠启动期确定性来暴露问题）。
     I7  不得用 `importlib.import_module` / `__import__` **指向本地模块**绕过守卫。
-    I8  模块清单**与磁盘一致**：新增 .py 必须登记进 LEAF_MODULES 或 AGGREGATOR，
-        否则它会从守卫视野里消失（漏检比误报危险）。
+    I8  模块清单**与磁盘一致**：新增 .py 必须登记进 LEAF_MODULES / AGGREGATOR /
+        ASSEMBLY_MODULES，否则它会从守卫视野里消失（漏检比误报危险）。
+    I9  装配/入口层只能在「入口方向」被引导：叶子/聚合器**不得** import 装配层
+        （否则 server 会经由 HTTP 入口反向依赖，破坏「主程序零改动」与
+        「stdio 永远可用」两条前提）；装配层对本地模块的依赖**只许**指向 server，
+        直连叶子必须在 `ALLOWED_ENTRY_LEAF_EDGES` 白名单里（I9d 保证白名单不腐烂）。
 
 运行:
     python tests/test_import_layers.py       # 退出码 0=全绿, 1=有失败
@@ -48,12 +56,29 @@ ROOT = Path(__file__).resolve().parent.parent
 AGGREGATOR = "server"
 LEAF_MODULES = {"locks", "memory_config", "memory_index", "metrics",
                 "text_utils", "yaml_io"}
+# 装配/入口层（v3 阶段 1，2026-10-13）：**不被 server import**，而是反过来 import
+# server（serve_http = HTTP 入口）或只 import mcp（transport_http = 纯装配）。
+# 单列一类，是因为 I5a「server 必须 import 全部叶子」对它们不成立 —— 它们刻意
+# 不进入主程序的导入图，这样 server.py 才能保持零改动、`python server.py` 永远
+# 等于 stdio。改动它们不会波及任何 MCP 工具实现。
+#
+# 2026-10-16：Web 控制台（serve_web / web_console）已拆分为独立仓 ai-memory-web，
+# 不在本仓的任何导入图里，故从本集合移除。
+ASSEMBLY_MODULES = {"serve_http", "transport_http"}
 
 # 叶子之间被允许的（且仅有的）依赖边。加边必须在这里显式登记并写明理由 ——
 # 这条白名单是「架构没有被悄悄改写」的唯一证据。
 ALLOWED_LEAF_EDGES = {
     ("locks", "memory_config"): "锁的陈旧超时可配（B5）",
     ("text_utils", "memory_config"): "热度衰减系数可配（B5）",
+}
+
+# 装配层被允许直连**叶子**的边（默认禁止，见 I9b）。同样必须显式登记并写明理由，
+# 且登记了却未用到会被 I9d 判为陈旧 —— 白名单不允许随重构腐烂。
+ALLOWED_ENTRY_LEAF_EDGES = {
+    # 2026-10-16：原 ("web_console", "memory_config") 条目随 Web 控制台迁往独立仓
+    # ai-memory-web 而移除 —— 该依赖边依然存在（控制台确实复用 memory_config 的
+    # 默认值与 config_path），只是它已不属于本仓，本仓的白名单不再登记。
 }
 
 _passed: list[str] = []
@@ -94,7 +119,9 @@ def parse_all():
     for f in module_files():
         src = f.read_text(encoding="utf-8")
         tree = ast.parse(src, filename=str(f))
-        local = LEAF_MODULES | {AGGREGATOR}
+        # ⚠️ 必须把 ASSEMBLY_MODULES 也纳入：否则装配层的 import 边提取不到，
+        # 「叶子不得 import 装配层」会退化成**恒绿**的假判据（实测踩到）。
+        local = LEAF_MODULES | {AGGREGATOR} | ASSEMBLY_MODULES
 
         top_edges: set[str] = set()
         # `import memory_index as midx` 会把 **midx** 绑进 server 的命名空间，
@@ -146,7 +173,7 @@ EDGES = {(m, d) for m, v in INFO.items() for d in v["top_edges"]}
 # =====================================================================
 print("\n[I0] 口径自检")
 _磁盘 = {p.stem for p in module_files()}
-_预期 = LEAF_MODULES | {AGGREGATOR}
+_预期 = LEAF_MODULES | {AGGREGATOR} | ASSEMBLY_MODULES
 check("I0a 模块清单与磁盘一致（新增 .py 必须登记）", _磁盘 == _预期,
       f"多={sorted(_磁盘 - _预期)} 少={sorted(_预期 - _磁盘)}")
 check("I0b 图非空（提取器本身没坏）", len(EDGES) >= 8,
@@ -168,7 +195,7 @@ check("I1b 叶子模块里没有延迟/动态 import server 的手法",
 
 # =====================================================================
 print("\n[I2] 本地模块之间必须无环")
-_LOCAL = LEAF_MODULES | {AGGREGATOR}
+_LOCAL = LEAF_MODULES | {AGGREGATOR} | ASSEMBLY_MODULES
 _WHITE, _GREY, _BLACK = 0, 1, 2
 _state = dict.fromkeys(_LOCAL, _WHITE)
 _cycle: list[str] = []
@@ -248,6 +275,35 @@ print("\n[I7] 不得用动态 import 绕过守卫")
 for _m in sorted(_LOCAL):
     check(f"I7a {_m} 无指向本地模块的动态 import", not INFO[_m]["dyn"],
           str(INFO[_m]["dyn"]))
+
+# =====================================================================
+print("\n[I9] 装配/入口层的依赖方向")
+# ① 叶子/聚合器 → 装配层 的边必须为空。否则 server 会经由 HTTP 入口反向依赖，
+#    「主程序零改动」与「stdio 永远可用」两条前提同时失效（且很隐蔽）。
+_entry_inbound = {e for e in EDGES
+                  if e[1] in ASSEMBLY_MODULES and e[0] not in ASSEMBLY_MODULES}
+check("I9a 叶子/聚合器不得 import 装配层", not _entry_inbound,
+      str(sorted(_entry_inbound)))
+
+# ② 装配层对本地模块的依赖不得直连叶子（只许 server 与其它装配层）。直连叶子
+#    说明它在绕过 server 自己拼装功能 —— 那部分逻辑应下沉到叶子或进入 server。
+_entry_out = {e for e in EDGES if e[0] in ASSEMBLY_MODULES and e[1] in _LOCAL}
+_entry_leaf = {e for e in _entry_out if e[1] in LEAF_MODULES}
+_bad_entry_out = _entry_leaf - set(ALLOWED_ENTRY_LEAF_EDGES)
+check("I9b 装配层不得直连叶子模块（白名单外；只许 server / 其它装配层）",
+      not _bad_entry_out, str(sorted(_bad_entry_out)))
+# 白名单自检：登记了却没出现 ⇒ 要么模块名写错，要么那条依赖已消失。两者都该报警，
+# 否则白名单会随重构腐烂，悄悄把 I9b 放宽成恒绿。
+_stale = set(ALLOWED_ENTRY_LEAF_EDGES) - _entry_leaf
+check("I9d 装配→叶子白名单无陈旧项（登记的边确实存在）", not _stale,
+      f"陈旧={sorted(_stale)} 实际装配→叶子边={sorted(_entry_leaf)}")
+
+# ③ 提取器自检：I9a 依赖「装配层出现在 EDGES 里」。若提取器漏了它，I9a 会**恒绿**
+#    —— 假判据比误报危险，故显式证明提取器确实看得见装配层。
+check("I9c 提取器确实提取到装配层的边（否则 I9a 恒绿）",
+      any(e[0] in ASSEMBLY_MODULES for e in EDGES),
+      f"EDGES={sorted(EDGES)}")
+print(f"        （装配层出边：{sorted(_entry_out)}）")
 
 # =====================================================================
 print(f"\n==== 结果: {len(_passed)} passed / {len(_failed)} failed ====")

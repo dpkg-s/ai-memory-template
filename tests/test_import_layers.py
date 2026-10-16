@@ -30,7 +30,7 @@
         加载」的保证失效（本仓靠启动期确定性来暴露问题）。
     I7  不得用 `importlib.import_module` / `__import__` **指向本地模块**绕过守卫。
     I8  模块清单**与磁盘一致**：新增 .py 必须登记进 LEAF_MODULES / AGGREGATOR /
-        ASSEMBLY_MODULES，否则它会从守卫视野里消失（漏检比误报危险）。
+        ASSEMBLY_MODULES / TOOL_MODULES，否则它会从守卫视野里消失（漏检比误报危险）。
     I9  装配/入口层只能在「入口方向」被引导：叶子/聚合器**不得** import 装配层
         （否则 server 会经由 HTTP 入口反向依赖，破坏「主程序零改动」与
         「stdio 永远可用」两条前提）；装配层对本地模块的依赖**只许**指向 server，
@@ -65,6 +65,16 @@ LEAF_MODULES = {"locks", "memory_config", "memory_index", "metrics",
 # 2026-10-16：Web 控制台（serve_web / web_console）已拆分为独立仓 ai-memory-web，
 # 不在本仓的任何导入图里，故从本集合移除。
 ASSEMBLY_MODULES = {"serve_http", "transport_http"}
+
+# 自足工具/脚本（2026-10-16）：既不被 server import，也不 import 任何本地模块 ——
+# 因而既不是叶子、也不是聚合器、更不是装配层。单列一类只为满足 I8「磁盘上的 .py
+# 必须登记」：不登记它就会从守卫视野里消失（漏检比误报危险）。
+#
+# 2026-10-16：ai_memory_setup.py（面向用户的安装/更新器，仅用标准库、可 PyInstaller
+# 打包）随 Web 控制台拆仓一并提交进本仓，但清单未同步 ⇒ CI 四个 Python 版本同报
+# I0a「多=['ai_memory_setup']」。补登记即修。此类不参与 I2 无环、I5a 组装完整性、
+# I9 依赖方向三组检查（它没有任何本地边）。
+TOOL_MODULES = {"ai_memory_setup"}
 
 # 叶子之间被允许的（且仅有的）依赖边。加边必须在这里显式登记并写明理由 ——
 # 这条白名单是「架构没有被悄悄改写」的唯一证据。
@@ -173,7 +183,7 @@ EDGES = {(m, d) for m, v in INFO.items() for d in v["top_edges"]}
 # =====================================================================
 print("\n[I0] 口径自检")
 _磁盘 = {p.stem for p in module_files()}
-_预期 = LEAF_MODULES | {AGGREGATOR} | ASSEMBLY_MODULES
+_预期 = LEAF_MODULES | {AGGREGATOR} | ASSEMBLY_MODULES | TOOL_MODULES
 check("I0a 模块清单与磁盘一致（新增 .py 必须登记）", _磁盘 == _预期,
       f"多={sorted(_磁盘 - _预期)} 少={sorted(_预期 - _磁盘)}")
 check("I0b 图非空（提取器本身没坏）", len(EDGES) >= 8,

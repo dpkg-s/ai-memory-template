@@ -1106,7 +1106,7 @@ ai-memory-template/
 - 截断语义：JSON 的 `body` 不含中文截断说明，改由 `truncated` / `total_chars` 承载
 - 中文不转义（`ensure_ascii=False`）
 
-### 模块分层守卫 —— `tests/test_import_layers.py`（43 断言，I0a 因本机未登记探针脚本报红）
+### 模块分层守卫 —— `tests/test_import_layers.py`（43 断言）
 
 - 叶子模块不得 import `server`（含函数体内延迟 import 与 `importlib` 动态拉起）
 - 本地模块之间**无环**；叶子之间的依赖只能在显式白名单内，且白名单**不得腐烂**

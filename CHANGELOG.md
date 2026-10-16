@@ -64,12 +64,12 @@
 
 ### Tests
 
-- **本仓 26 套**（库存口径合计 **1092 断言**）：25 套实跑可汇总 = **1060 断言，1059 通过 / 1 报红**；余 1 套 `test_schema_diff`（32 断言）因本机沙箱拦截临时目录写入而**无法跑完**。
-  - 报红 1 项：`test_import_layers` 的 **I0a「模块清单与磁盘一致」** —— 本机仓库根有 37 个 `_v3_*` 探针脚本与 `ai_memory_gui.py` / `build_exe.py` 未登记（前者是 `.gitignore` 的本地调试产物，不属产品代码）。**与本次改动无关**（拆仓前后同样报红），属本机工作区卫生问题。
-  - `test_schema_diff` 的失败是沙箱对 `%TEMP%` 下 `*.md` 写入的拦截（`PermissionError`），**环境问题，与代码无关**。
-- 本版**新增/改动**的套件单跑结果：`tests/test_tools_smoke.py` **41/0**（+8：配置面段 8 项 + 工具数 24→25）、`tests/test_memory_config.py` **111/0**（+32：新增 T10 配置面出口）、`tests/test_transport.py` **43/0**（仅工具数计数 24→25）、`tests/test_import_layers.py` **42/1**（上述 I0a）。
-- 上版（2.5.0）基线为 25 套 / 1000 断言；本版套件与断言数增长主要来自配置面出口测试与拆仓后的分层/计费同步。
-- Web 控制台的测试随其迁往 `ai-memory-web`：**72 断言全绿**（含真起 `serve_http` + `serve_web` 的阈值写读往返、以及「不 import 核心仓模块」的机器守卫 C2）。
+- **本仓 26 套**（库存口径合计 **1092 断言**）。在**只含跟踪文件的干净检出**（等价 CI 的 checkout）上：**25 套全绿**，合计 **1060 断言**；唯一红灯是 `test_schema_diff`（32 断言）—— 本机安全策略拦截它往临时目录写入 `v2缺键.md`（`PermissionError`），CI 的 Ubuntu runner 无此策略。
+- 本版**新增/改动**的套件：`tests/test_tools_smoke.py` **41/0**（+8：新增「配置面工具」段 + 工具数 24→25）、`tests/test_memory_config.py` **111/0**（+32：新增 T10 配置面出口）、`tests/test_transport.py` **43/0**（仅工具数计数同步）、`tests/test_import_layers.py` **43/0**。
+- ⚠️ **本机工作区的额外红线不算数**：作者开发副本里 I0a 会额外报出 37 个 `_v3_*` 探针脚本与 `ai_memory_gui.py` / `build_exe.py`（前者命中 `.gitignore`、属一次性调试产物；后两者是尚未入库的本地脚本）。它们不在版本库里 ⇒ 不影响本版发布物，也不影响 CI。顺带记一次真实故障：899a776 把 `ai_memory_setup.py` 作为全新文件提交进本仓却漏同步模块清单，I0a 报 `多=['ai_memory_setup']`，CI 四个 Python 版本同时失败 37s；由 3e9dae9 新增 `TOOL_MODULES` 一类修复。
+- 上版（2.5.0）基线为 25 套 / 1000 断言。
+- Web 控制台的测试随其迁往 `ai-memory-web`：**72 断言全绿**（含真起 `serve_http` + `serve_web` 的阈值写读往返，以及「不 import 核心仓模块」的机器守卫 C2）。
+- 另在**真 vault**（`D://ai记忆`）上以 Streamable HTTP 起服务端、经 MCP 协议调用 `memory_config` 做只读核对：**11/0**（工具数 25 / 注解 / 真实配置文件路径 / 8 键 / 文案齐备 / text 与 json 两形态）。
 - Web 控制台三端适配另有**独立量测探针**：32 组（视口 × 页面）横向溢出全 0，列数单调；渲染验证 30 项全绿（各页 DOM 真实内容 + 14 张精确尺寸截图）。
 
 ## [2.5.0] - 2026-10-12

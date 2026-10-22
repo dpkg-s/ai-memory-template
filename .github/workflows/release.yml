@@ -30,6 +30,15 @@
 #   —— 两边用户拿到的是同一个安装器。该仓的 release.yml 从
 #   `releases/latest/download/ai-memory-setup.exe` 拉取本仓附件后转挂，因此
 #   **本仓必须先发布、web 仓后发布**，否则会拿到上一个版本的安装器。
+#
+# ⚠️ 2026-10-22 版本门禁：tag 名、`VERSION` 文件、CHANGELOG 首条三者必须一致，
+#   任一不符直接判红（在跑测试之前）。此前版本事实源有三处却无人核对 ——
+#   web 仓就出现过 `WEB_VERSION` 落后 tag 两个版本的漂移。`VERSION` 是本仓
+#   **唯一**的机器可读版本源，改版本时与 CHANGELOG 一起改，别只改 tag。
+#
+# ⚠️ 2026-10-22 校验和：每个二进制附件同附 `<文件名>.sha256`（`sha256sum` 格式，
+#   一行，只记裸文件名）。2026-10-16 弃用的是「多文件合并成 SHA256SUMS.txt」那种
+#   清单，理由是清单与安装集不同步；逐文件 .sha256 无此问题，也便于 `sha256sum -c`。
 name: Release
 
 on:
@@ -55,6 +64,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify version consistency
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          V="${TAG#v}"
+          if [ ! -f VERSION ]; then
+            echo "::error::缺少 VERSION 文件（应只有一行版本号，如 3.1.2）"
+            exit 1
+          fi
+          FILE_V="$(tr -d '[:space:]' < VERSION)"
+          TOP="$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | tr -dc '0-9.')"
+          echo "tag=$V  VERSION=$FILE_V  CHANGELOG=$TOP"
+          if [ "$FILE_V" != "$V" ]; then
+            echo "::error::VERSION($FILE_V) 与 tag($V) 不一致 —— 改版本时 VERSION 与 CHANGELOG 要一起改"
+            exit 1
+          fi
+          if [ "$TOP" != "$V" ]; then
+            echo "::error::CHANGELOG 首条 [$TOP] 与 tag($V) 不一致 —— 先在 CHANGELOG 顶部补一条 ## [$V] - 日期"
+            exit 1
+          fi
 
       - name: Run tests before publishing
         run: |
@@ -93,6 +123,8 @@ jobs:
       # 安装器只做「搬运」：把仓库里那份 dist/ai-memory-setup.exe 原样挂成附件，
       # 不在 CI 里重建（CI 构建的产物与该 tag 源码不是同一份事实源）。缺文件即红，
       # 避免出现「Release 建了但没安装器」这种静默残缺。
+      # 同附 `.sha256`：在 dist/ 内 cd 后计算，文件里只记裸文件名，
+      # 用户下载后 `sha256sum -c ai-memory-setup.exe.sha256` 可直接校验。
       - name: Attach installer exe
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,5 +135,7 @@ jobs:
             exit 1
           fi
           ls -l dist/ai-memory-setup.exe
-          gh release upload "$TAG" dist/ai-memory-setup.exe --clobber
+          ( cd dist && sha256sum ai-memory-setup.exe > ai-memory-setup.exe.sha256 )
+          cat dist/ai-memory-setup.exe.sha256
+          gh release upload "$TAG" dist/ai-memory-setup.exe dist/ai-memory-setup.exe.sha256 --clobber
           echo "attached: $(gh release view "$TAG" --json assets --jq '.assets[].name' | tr '\n' ' ')"

@@ -22,8 +22,8 @@
 #   曾经试过「release.yml 加 windows-latest job 构建 + gh release upload」，
 #   放弃的理由是附件与该 tag 的源码并非同一份事实源（exe 由本地 conda 环境打出），
 #   且离线/内网场景根本拿不到 Release 资产。现在改为：`dist/ai-memory-setup.exe`
-#   与 `dist/ai-memory-setup-cli.exe` 由 `.gitignore` 白名单放行、随提交入库。
-#   ⇒ 打 tag 前请先本地跑一遍 `python build_exe.py` 再提交，否则仓库里躺的是旧包。
+#   （**仅 GUI 版**，CLI 版不入库）由 `.gitignore` 白名单放行、随提交入库。
+#   ⇒ 打 tag 前请先本地跑一遍 `python build_exe.py gui` 再提交，否则仓库里躺的是旧包。
 name: Release
 
 on:

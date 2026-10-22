@@ -102,10 +102,12 @@
   - 新仓的构建上下文改为把本仓作为 submodule 挂进去的 `template/`，`COPY template/requirements.txt` 与 `COPY template/*.py` —— 依赖清单仍只有本仓这一份，不复制第二份。
   - 镜像**不检出** `web-console` 子模块：容器只跑 MCP 服务端，要控制台另起一个对着 8700 的连接即可。
 
-- **安装器 exe 随仓库分发**（原先的「Release 附件」方案已放弃）—— `dist/ai-memory-setup.exe`（GUI，12.42 MB）与 `dist/ai-memory-setup-cli.exe`（CLI，8.83 MB）纳入版本管理。
-  - `.gitignore` 用 `dist/*` + 两条 `!` 白名单放行。**必须写 `dist/*` 而不是 `dist/`** —— 目录整体被忽略后 git 根本不进目录，后面的白名单是无效规则（踩过）。
+- **安装器 exe 随仓库分发**（原先的「Release 附件」方案已放弃）—— `dist/ai-memory-setup.exe`（GUI 版，12.42 MB）纳入版本管理。
+  - **只发 GUI 版**：CLI 版 `ai-memory-setup-cli.exe` 是排障与脚本编排用的，双击安装的目标用户用不到，故不入库；需要时本地 `python build_exe.py cli` 即可。
+  - `.gitignore` 用 `dist/*` + 一条 `!` 白名单放行。**必须写 `dist/*` 而不是 `dist/`** —— 目录整体被忽略后 git 根本不进目录，后面的白名单是无效规则（踩过）。
+  - `.gitattributes` 显式 `*.exe binary`：一旦被当文本做换行转换，PyInstaller 包内是压缩段，任何字节改动都会让它启动即崩。
   - 放弃附件的理由：附件与该 tag 的源码不是同一份事实源（exe 由本地 conda 环境打出），且离线/内网场景拿不到 Release 资产。
-  - 代价是仓库体积：两个成品合计约 21.7 MB，每次重打包都新增一份 blob。**因此只在发版时提交 exe**，日常改动别捎上；打 tag 前先跑 `python build_exe.py`。
+  - 代价是仓库体积：每次重打包都新增一份约 12.4 MB 的 blob。**因此只在发版时提交 exe**，日常改动别捎上；打 tag 前先跑 `python build_exe.py gui`。
 
 ### Fixed
 

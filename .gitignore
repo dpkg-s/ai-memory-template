@@ -34,15 +34,16 @@ memory_metrics_*.json*
 #   dist/*                  —— PyInstaller 输出，但**两个 exe 例外，要入库**
 #
 # 2026-10-22 起安装器 exe 随仓库分发（此前放 Release 附件，但那份资产与 tag 源码
-# 不完全对应，且离线场景拿不到）。只放行两个成品 exe，其余照旧挡住：
+# 不完全对应，且离线场景拿不到）。**只发 GUI 版**，CLI 版留本地：
 #   - 这里必须写 `dist/*` 而不是 `dist/` —— 目录整体被忽略后 git 根本不会进目录，
 #     后面的 `!dist/xxx.exe` 白名单是**无效规则**（踩过）。
+#   - ai-memory-setup-cli.exe 不发：它是排障与脚本编排用的，目标用户（双击安装的人）
+#     用不到；少发 8.83 MB 也让仓库轻一截。需要时本地 `python build_exe.py cli` 即可。
 #   - dist/_old/ 里是历史构建残件，不进库。
 .ai-memory-install.json
 .ai-memory-backup/
 dist/*
 !dist/ai-memory-setup.exe
-!dist/ai-memory-setup-cli.exe
 build/
 *.spec
 

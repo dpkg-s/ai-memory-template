@@ -27,13 +27,22 @@ memory_metrics_*.json*
 # 仅当用户把 vault 直接放在仓库目录内时才会出现，属防御性忽略。
 .trash/
 
-# 安装/更新器（ai_memory_setup.py）在本机留下的状态与打包产物，均不入库：
+# 安装/更新器（ai_memory_setup.py）在本机留下的状态与打包产物：
 #   .ai-memory-install.json —— 本机已装版本与文件哈希，属设备本地状态
 #   .ai-memory-backup/      —— 覆盖前的自动备份
-#   dist/ build/ *.spec     —— PyInstaller 输出
+#   build/ *.spec           —— PyInstaller 中间产物与 spec
+#   dist/*                  —— PyInstaller 输出，但**两个 exe 例外，要入库**
+#
+# 2026-10-22 起安装器 exe 随仓库分发（此前放 Release 附件，但那份资产与 tag 源码
+# 不完全对应，且离线场景拿不到）。只放行两个成品 exe，其余照旧挡住：
+#   - 这里必须写 `dist/*` 而不是 `dist/` —— 目录整体被忽略后 git 根本不会进目录，
+#     后面的 `!dist/xxx.exe` 白名单是**无效规则**（踩过）。
+#   - dist/_old/ 里是历史构建残件，不进库。
 .ai-memory-install.json
 .ai-memory-backup/
-dist/
+dist/*
+!dist/ai-memory-setup.exe
+!dist/ai-memory-setup-cli.exe
 build/
 *.spec
 

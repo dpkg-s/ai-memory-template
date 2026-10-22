@@ -59,6 +59,18 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# Windows 控制台的默认代码页在**英文版系统上是 cp1252**，编不了本脚本里的中文日志
+# （GitHub Actions 的 windows-latest 正是这种情况）。不处理的话第一条 log 就抛
+# UnicodeEncodeError 把构建打断 —— 实测 Release 流水线报
+# 「'charmap' codec can't encode characters in position 4-11」。
+# 统一改 UTF-8，并对个别编不出的字符降级为替代符（宁可日志有瑕疵，不可中断构建）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - 老解释器/被重定向时无此方法，忽略即可
+        pass
+
+
 # --------------------------------------------------------------------------
 # 依赖树解析：找出 _tkinter.pyd 需要的、本环境内的 DLL
 # --------------------------------------------------------------------------

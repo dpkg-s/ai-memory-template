@@ -1,6 +1,4 @@
-# 打 tag（v*）时自动发布 Release：先跑全量回归 + 构建 Windows 安装器，再建 Release 并把
-# 安装器作为**附件**挂上去（exe 不入 git 历史 —— 12 MB 二进制进历史会让仓库永久变胖，
-# 每次重编都新增一份 blob；附件方式克隆开销为零，代价只是不在文件树里可见）。
+# 打 tag（v*）时自动发布 Release：先跑全量回归，再建 Release。
 #
 # 标题约定：Release 标题 = 「tag — 一句话描述」（对齐 v2.0.0 的历史格式），
 #   取自**带注释 tag 的 subject**（`git tag -a v3.0.0 -m "v3.0.0 — 描述"`）；
@@ -20,13 +18,12 @@
 #   （漏 memory_config.py），与实际安装集不一致；而安装/更新流程不做校验，
 #   继续维护这份清单的收益低于「清单与代码不同步」造成的误导风险。
 #
-# ⚠️ 2026-10-22：安装器 exe 改为 Release 附件。要点：
-#   1) **必须在 windows-latest 上构建** —— PyInstaller 不支持交叉编译，ubuntu runner
-#      产不出可用的 Windows exe。
-#   2) `build_exe.py` 会做 DLL 自检（tcl/tk/_tkinter.pyd），自检不过返回码 2 ⇒ job 失败
-#      ⇒ 整个发布中断。这是有意的：宁可发不出，也不发一个在干净机器上启动即崩的包。
-#   3) pyinstaller **不在 requirements-dev.txt 里**（本地构建才需要），此 job 单独装。
-#   4) 附件上传用 `--clobber`，允许对同一 tag 重跑工作流时覆盖旧附件。
+# ⚠️ 2026-10-22：**安装器 exe 不走 Release 附件，直接随仓库分发**。
+#   曾经试过「release.yml 加 windows-latest job 构建 + gh release upload」，
+#   放弃的理由是附件与该 tag 的源码并非同一份事实源（exe 由本地 conda 环境打出），
+#   且离线/内网场景根本拿不到 Release 资产。现在改为：`dist/ai-memory-setup.exe`
+#   与 `dist/ai-memory-setup-cli.exe` 由 `.gitignore` 白名单放行、随提交入库。
+#   ⇒ 打 tag 前请先本地跑一遍 `python build_exe.py` 再提交，否则仓库里躺的是旧包。
 name: Release
 
 on:
@@ -38,8 +35,8 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: Run regression tests
+  release:
+    name: Publish release
     runs-on: ubuntu-latest
 
     steps:
@@ -53,7 +50,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run tests
+      - name: Run tests before publishing
         run: |
           pip install -r requirements-dev.txt
           for f in tests/test_*.py; do
@@ -61,60 +58,15 @@ jobs:
             python "$f"
             echo "::endgroup::"
           done
+          # 管家自检是脚本式的（selftest_*.py），上面的遍历不覆盖，这里单列。
+          for f in tests/selftest_*.py; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"
+            python "$f"
+            echo "::endgroup::"
+          done
 
-  installer:
-    name: Build Windows installer
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install "pyinstaller>=6.0"
-
-      - name: Build installer (GUI + CLI)
-        run: python build_exe.py
-
-      - name: Show artifacts
-        run: Get-ChildItem dist -Filter *.exe | Format-Table Name, Length
-
-      - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installer
-          path: dist/*.exe
-          if-no-files-found: error
-          retention-days: 7
-
-  release:
-    name: Publish release
-    needs: [test, installer]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download installer artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-installer
-          path: dist
-
-      - name: Create release and attach installer
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -131,5 +83,3 @@ jobs:
           fi
           echo "release title = $TITLE"
           gh release create "$TAG" --title "$TITLE" --generate-notes
-          ls -lh dist
-          gh release upload "$TAG" dist/*.exe --clobber

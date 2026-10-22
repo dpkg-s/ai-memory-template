@@ -459,9 +459,11 @@ def case_web_install(tmp: Path) -> None:
     # --- 脚本正文 ---------------------------------------------------------
     cmd = S.web_script_text(tmp / "inst", tmp / "inst", kind="cmd", py="C:/py/python.exe")
     sh = S.web_script_text(tmp / "inst", tmp / "inst", kind="sh")
+    # 同上一条的坑：entry 是 Path，Windows 上 str() 带反斜杠、Linux 上是正斜杠。
+    # 断言统一归一到正斜杠再比，否则这条在 ubuntu runner 上必挂（实测 CI 四个
+    # Python 版本同报「cmd 指向 web-console 里的入口」失败）。
     check("cmd 指向 web-console 里的入口",
-          f"{S.WEB_DIRNAME}/{S.WEB_ENTRY}".replace("/", "\\") in cmd
-          or f"{S.WEB_DIRNAME}\\{S.WEB_ENTRY}" in cmd, cmd)
+          f"{S.WEB_DIRNAME}/{S.WEB_ENTRY}" in cmd.replace("\\", "/"), cmd)
     check("cmd 全用 CRLF",
           "\r\n" in cmd and "\n" not in cmd.replace("\r\n", ""), repr(cmd[:60]))
     check("cmd 先切 UTF-8 码页", "chcp 65001" in cmd, cmd)

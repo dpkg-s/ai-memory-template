@@ -322,24 +322,17 @@ set AI_MEMORY_HTTP_PORT=8800 && start-http.cmd
 
 ### 用容器跑（可选）
 
-不想在目标机器上准备 Python 与 `mcp` 依赖时，可以直接跑容器。仓库自带 `Dockerfile` 与 `compose.yaml`，镜像里**只有运行时**（Python + `mcp` + 本仓 `.py`），记忆库一律从卷/绑定挂载进来，所以升级只换镜像 tag、数据不动。
+容器化定义已拆到独立仓 **[dpkg-s/ai-memory-docker](https://github.com/dpkg-s/ai-memory-docker)** —— 本仓不再自带 `Dockerfile` / `compose.yaml`。
+
+划分理由：镜像里**只有运行时**（Python + `mcp` + 本仓 `.py`），记忆库一律从卷挂载，所以「换镜像 tag = 升级」；这套东西的变更节奏与本仓业务代码无关，混在一起会让每次业务提交都捎上一份容器配置的 diff。
 
 ```bash
-# 构建（或 docker load 一个别人给的镜像 tar）
-docker build -t ai-memory:3.0.0 .
-
-# 方式一：具名卷（数据在 Docker 管理的卷里）
-docker run -d --name ai-memory -p 127.0.0.1:8700:8700 \
-    -v ai-memory-vault:/vault ai-memory:3.0.0
-
-# 方式二：直接挂已有的记忆库目录（注意容器会写索引与 .memory.lock）
-#   把下面的路径换成你自己的绝对路径（Windows 形如 D:/memory/ai-memory）
-docker run -d --name ai-memory -p 127.0.0.1:8700:8700 \
-    -v "/path/to/your/ai-memory:/vault" ai-memory:3.0.0
-
-# 或用 compose（在仓库根目录）
-docker compose up -d --build
+git clone --recurse-submodules https://github.com/dpkg-s/ai-memory-docker.git
+cd ai-memory-docker
+docker compose up -d --build          # 端点 http://127.0.0.1:8700/mcp
 ```
+
+那个仓以 submodule 引用本仓，依赖链是 `ai-memory-docker → ai-memory-template → ai-memory-web`。镜像的行为约定（`/vault` 与 `/state` 双卷、非 root uid 10001、端口只绑回环、Host 白名单）详见该仓 README。
 
 容器内默认 `AI_MEMORY_DIR=/vault`、监听 `0.0.0.0:8700`。**注意容器必须监听 `0.0.0.0`**（否则宿主机连不上），这恰好触发上面第 2 条约束 ⇒ 镜像里预置了 `AI_MEMORY_HTTP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*,ai-memory:*`。要从别的主机名/地址访问，**必须显式追加**（例：`192.168.1.20:8700`），否则请求会被 Host 校验拦下 —— 这是有意的摩擦。
 
@@ -1013,9 +1006,8 @@ ai-memory-template/
 ├── requirements-dev.txt     # 开发依赖（pytest + ruff）
 ├── ruff.toml                # lint 配置
 ├── .gitattributes           # 强制 LF 换行，避免 CRLF 污染
-├── Dockerfile               # 容器镜像（只装运行时；记忆库从卷挂载）
-├── .dockerignore            # 构建上下文白名单（*.py + requirements.txt）
-├── compose.yaml             # 本机 compose（只绑回环，具名卷存数据）
+│                            # （容器化定义 Dockerfile / compose.yaml / .dockerignore
+│                            #   已拆到独立仓 dpkg-s/ai-memory-docker，本仓不再持有）
 │
 ├── tests/
 │   ├── test_roundtrip.py         # 29 断言：语义回归

@@ -5,6 +5,20 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 版本号规则（2026-10-22 定）
+
+自 v3.1.0 起只做**叠加**，不再有大版本跳变 —— major 位固定为 `3`：
+
+| 变更类型 | 增量 | 示例 |
+| --- | --- | --- |
+| 修 bug / 文档 / CI / 打包 | `+0.0.1` | `3.1.0 → 3.1.1` |
+| 加功能 | `+0.1` | `3.1.1 → 3.2.0` |
+| 破坏性变更 | 本轮不发生 | — |
+
+判断口径：**用户可见的新能力 = 加功能（+0.1）**；同一能力的修正、补齐、文档与
+流水线调整 = 修 bug（+0.0.1）。拿不准时按 +0.0.1 走 —— 少给一个 minor 没有代价，
+多给一个会让人误以为有迁移成本。
+
 ## [3.1.0] - 2026-10-22
 
 > 主题：把「一键安装器」升级成**记忆库管家** —— 同一份 `server.py` 现在有 21 个 AI 客户端可以接，而「接错库」「接不上」是真实的翻车点，因此新增 `vault`（记忆库目录管理）与 `link`（AI 工具连接）两个子命令，外加一个四分区交互菜单。
@@ -81,7 +95,17 @@
   - **高级选项常驻展开**（原为 `▸` 折叠）：剩余参数（跳过 pip / 镜像前缀）直接可见，镜像前缀的说明并入标签行，省掉一整行。
   - 第 ② 步补「为什么这样放」三条说明 —— 同父目录便于整体备份迁移、想分开放也没问题、已装实例会按原位识别。
 - 窗口默认尺寸 `780×700 → 800×860`（三步内容 + 常驻高级选项需要这个高度），`minsize` 同步提到 `760×720`。
-- **第 ③ 步的核验结论直接复用逻辑层的 `verify_state_line()`** —— 界面上说的和命令行里说的必须是同一句话，否则「日志说核验不通过、界面说一切正常」这种自相矛盾迟早会来一次。
+- **第 ③ 步的核验结论直接复用逻辑层的 `verify_state_line()`** —— 界面上说的和命令行里说的必须是同一句话，否则「日志说核验通过、界面说一切正常」这种自相矛盾迟早会来一次。
+
+- **容器化定义拆到独立仓 `dpkg-s/ai-memory-docker`** —— `Dockerfile`、`compose.yaml`、`.dockerignore` 三件套迁出。依赖链变为 `ai-memory-docker →(submodule) ai-memory-template →(submodule) ai-memory-web`。
+  - 拆的理由：镜像里只有运行时（Python + `mcp` + 本仓 `.py`），容器策略的变更节奏与业务代码无关，混在一起会让每次业务提交都捎上一份容器配置的 diff。
+  - 新仓的构建上下文改为把本仓作为 submodule 挂进去的 `template/`，`COPY template/requirements.txt` 与 `COPY template/*.py` —— 依赖清单仍只有本仓这一份，不复制第二份。
+  - 镜像**不检出** `web-console` 子模块：容器只跑 MCP 服务端，要控制台另起一个对着 8700 的连接即可。
+
+- **安装器 exe 随仓库分发**（原先的「Release 附件」方案已放弃）—— `dist/ai-memory-setup.exe`（GUI，12.42 MB）与 `dist/ai-memory-setup-cli.exe`（CLI，8.83 MB）纳入版本管理。
+  - `.gitignore` 用 `dist/*` + 两条 `!` 白名单放行。**必须写 `dist/*` 而不是 `dist/`** —— 目录整体被忽略后 git 根本不进目录，后面的白名单是无效规则（踩过）。
+  - 放弃附件的理由：附件与该 tag 的源码不是同一份事实源（exe 由本地 conda 环境打出），且离线/内网场景拿不到 Release 资产。
+  - 代价是仓库体积：两个成品合计约 21.7 MB，每次重打包都新增一份 blob。**因此只在发版时提交 exe**，日常改动别捎上；打 tag 前先跑 `python build_exe.py`。
 
 ### Fixed
 
@@ -100,6 +124,13 @@
   - 改为 `_fit_height()` 逐页测量：临时把每个步骤页单独 `grid()` 其余 `grid_remove()`，量完再还原 —— 被 `grid_remove()` 的页不参与布局，只量当前可见页会系统性低估窗口需求。
   - 另外把可选模块的说明压成一行并加 `wraplength=720`：Tk 的 `Label` **不会自动换行**，超宽部分直接被父容器裁掉，截图里最后一句话「本工具不装」就是凭空消失的。
   - 两个截图探针同步改用 `app.fit_height` —— 它们原先用 `G.WIN_H` 覆盖了几何尺寸，等于把自适应结果白算了。
+- **`build_exe.py` 在英文版 Windows 上必崩：`UnicodeEncodeError: 'charmap' codec`** —— 脚本用中文写日志，而控制台默认代码页在英文系统上是 cp1252，第一条 `log()` 就抛异常把构建打断（GitHub Actions 的 `windows-latest` 正是这种情况）。
+  - 修法：`sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")`。保留 `errors="replace"` 是为了极端情况下宁可日志有瑕疵，也不要中断构建。
+- **`selftest_setup.py` 在 Linux 上必挂：断言只认反斜杠** —— 「cmd 指向 web-console 里的入口」用 `web-console\serve_web.py` 去匹配，而 Linux 上 `Path` 拼出的是正斜杠。这条自检此前从没在 ubuntu runner 上跑过，纳入 CI 后四个 Python 版本同报失败。
+  - 修法：两侧统一归一到正斜杠再比 —— 与同文件里 `_web_rels()` 的处理口径一致，那个坑早踩过一次（rel 是 `Path`，`str()` 在 Windows 上带反斜杠）。
+- **`test_import_layers.py` 的 I0a 在本机恒红** —— 判据是「磁盘上的 `.py` 必须登记」，而开发机根目录常年躺着几十个 `_probe_*` / `_v3_*` 一次性探针（GUI 冒烟、虚拟时间逐帧截图取证），这些文件在 `.gitignore` 里明确声明不入库。一条「本机永远红、CI 永远绿」的判据等于没有判据。
+  - 修法：`module_files()` 与 `.gitignore` 口径对齐，排除 `_probe_*` / `_v3_*`；同时把 `ai_memory_gui` / `build_exe` / `setup_link` / `setup_vault` 四个真实模块补登记进 `TOOL_MODULES`。
+  - 本机复验：**43 passed / 0 failed**（此前 42/1）。
 
 ## [3.0.0] - 2026-10-16
 

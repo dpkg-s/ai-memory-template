@@ -18,12 +18,18 @@
 #   （漏 memory_config.py），与实际安装集不一致；而安装/更新流程不做校验，
 #   继续维护这份清单的收益低于「清单与代码不同步」造成的误导风险。
 #
-# ⚠️ 2026-10-22：**安装器 exe 不走 Release 附件，直接随仓库分发**。
+# ⚠️ 2026-10-22：**安装器 exe 既随仓库分发，也挂 Release 附件**。
 #   曾经试过「release.yml 加 windows-latest job 构建 + gh release upload」，
-#   放弃的理由是附件与该 tag 的源码并非同一份事实源（exe 由本地 conda 环境打出），
-#   且离线/内网场景根本拿不到 Release 资产。现在改为：`dist/ai-memory-setup.exe`
-#   （**仅 GUI 版**，CLI 版不入库）由 `.gitignore` 白名单放行、随提交入库。
-#   ⇒ 打 tag 前请先本地跑一遍 `python build_exe.py gui` 再提交，否则仓库里躺的是旧包。
+#   放弃的是**在 CI 里构建**这一步 —— exe 由本地 conda 环境打出，CI 构建的
+#   产物与该 tag 的源码不是同一份事实源。现在改为：`dist/ai-memory-setup.exe`
+#   （**仅 GUI 版**，CLI 版不入库）由 `.gitignore` 白名单放行、随提交入库；
+#   Release 只做**搬运**，把仓库里那份原样挂成附件（不重新构建）。
+#   ⇒ 打 tag 前请先本地跑一遍 `python build_exe.py gui` 再提交，否则挂上去的是旧包。
+#
+# ⚠️ 2026-10-22 追加约定：**web 仓（ai-memory-web）的 Release 也要带同一份 exe**
+#   —— 两边用户拿到的是同一个安装器。该仓的 release.yml 从
+#   `releases/latest/download/ai-memory-setup.exe` 拉取本仓附件后转挂，因此
+#   **本仓必须先发布、web 仓后发布**，否则会拿到上一个版本的安装器。
 name: Release
 
 on:
@@ -83,3 +89,19 @@ jobs:
           fi
           echo "release title = $TITLE"
           gh release create "$TAG" --title "$TITLE" --generate-notes
+
+      # 安装器只做「搬运」：把仓库里那份 dist/ai-memory-setup.exe 原样挂成附件，
+      # 不在 CI 里重建（CI 构建的产物与该 tag 源码不是同一份事实源）。缺文件即红，
+      # 避免出现「Release 建了但没安装器」这种静默残缺。
+      - name: Attach installer exe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ ! -f dist/ai-memory-setup.exe ]; then
+            echo "::error::dist/ai-memory-setup.exe 不在仓库里 —— 打 tag 前先本地跑 python build_exe.py gui 并提交"
+            exit 1
+          fi
+          ls -l dist/ai-memory-setup.exe
+          gh release upload "$TAG" dist/ai-memory-setup.exe --clobber
+          echo "attached: $(gh release view "$TAG" --json assets --jq '.assets[].name' | tr '\n' ' ')"

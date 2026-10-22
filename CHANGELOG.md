@@ -19,6 +19,20 @@
 流水线调整 = 修 bug（+0.0.1）。拿不准时按 +0.0.1 走 —— 少给一个 minor 没有代价，
 多给一个会让人误以为有迁移成本。
 
+## [3.1.2] - 2026-10-22
+
+> 主题：**Release 的安装器不再靠手工挂**。3.1.0 定的是「exe 随仓库分发、不挂附件」，实际操作下来每次发版都得手动 `gh release upload` 一次 —— 手工的环节下次一定会漏。这一版把「搬运」写进流水线，并顺手把 web 仓的附件也自动化。
+
+### Changed
+
+- **`release.yml` 新增「Attach installer exe」** —— Release 建好后把仓库里的 `dist/ai-memory-setup.exe` 原样挂成附件。**不在 CI 里构建**：exe 由本地 conda 环境打出，CI 构建的产物与该 tag 的源码不是同一份事实源；流水线只负责搬运。文件缺失直接判红，不出「Release 建了但没安装器」的静默残缺。
+- **`web-console` 子模块 → `v1.11.3`（`82ae4ab`）** —— 控制台仓的 `release.yml` 也加了两个附件步骤：源码包 `web-console-<tag>.tgz`，以及**从本仓 latest Release 搬过来的同一个 `ai-memory-setup.exe`**。
+
+### Note
+
+- **发布顺序从此固定为「本仓先、web 仓后」** —— web 仓的安装器是转挂本仓附件，反了顺序就会把上一版的安装器发出去。两边的 `release.yml` 头部注释都写明了这条。
+- 3.1.0 那条「安装器不走 Release 附件」的注释已作废重写：放弃的是**在 CI 里构建**，不是**挂附件**。
+
 ## [3.1.1] - 2026-10-22
 
 > 主题：**容器归属归位**。`web-console` 子模块把 `Dockerfile` / `docker-compose.yml` / `.dockerignore` 交还给 `ai-memory-docker`，模板仓只跟随指针前移，无源码变更。

@@ -76,6 +76,15 @@ ASSEMBLY_MODULES = {"serve_http", "transport_http"}
 # I9 依赖方向三组检查（它没有任何本地边）。
 TOOL_MODULES = {"ai_memory_setup"}
 
+# 2026-10-22：管家化改造带来的四个自足模块，同样既不被 server import、也不 import
+# 任何本地模块（gui 为了能被打包成单文件 exe，刻意只用标准库 + tkinter）：
+#   - ai_memory_gui    安装器图形版入口（PyInstaller 打包目标）
+#   - build_exe        打包脚本本身（一版两 exe，含 tcl/tk DLL 注入自检）
+#   - setup_link       AI 客户端连接（21 个客户端的扫描/判定/写入）
+#   - setup_vault      记忆库目录管理（扫描打分/选用/播种）
+# 它们此前未登记 ⇒ 干净检出与 CI 都会报 I0a「多=[...]」。
+TOOL_MODULES |= {"ai_memory_gui", "build_exe", "setup_link", "setup_vault"}
+
 # 叶子之间被允许的（且仅有的）依赖边。加边必须在这里显式登记并写明理由 ——
 # 这条白名单是「架构没有被悄悄改写」的唯一证据。
 ALLOWED_LEAF_EDGES = {
@@ -108,7 +117,17 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 # 解析
 # =====================================================================
 def module_files() -> list[Path]:
-    return sorted(ROOT.glob("*.py"))
+    """仓库根目录下的 .py —— **排除 .gitignore 已声明不入库的临时探针**。
+
+    口径必须与 `.gitignore` 一致：`_probe_*.py` / `_v3_*.py` 是一次性探针
+    （GUI 冒烟、截图取证、虚拟时间动画逐帧比对），只在开发机存在、从不入库。
+    此前一律计入「磁盘模块」，导致本机跑 I0a 恒红（实测多出 52 项），而干净
+    检出下是绿的 —— 一条本机永远红、CI 永远绿的判据等于没有判据。
+    """
+    return sorted(
+        p for p in ROOT.glob("*.py")
+        if not (p.name.startswith("_probe_") or p.name.startswith("_v3_"))
+    )
 
 
 def _import_targets(node: ast.Import | ast.ImportFrom) -> list[str]:

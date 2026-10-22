@@ -51,11 +51,15 @@ CREATE INDEX IF NOT EXISTS idx_entries_tier ON entries(tier);
 # ⚠️ permalink 的索引**刻意不写在这里**，见 _migrate 的说明。
 
 
-def db_path(server_dir: Path, memory_dir: Path) -> Path:
-    """Index db 放在 server.py 同目录(不污染记忆库), 文件名按 MEMORY_DIR 哈希隔离:
-    同一 server 服务多个库/测试临时库时互不干扰."""
+def db_path(state_dir: Path, memory_dir: Path) -> Path:
+    """Index db 放在调用方给的**状态目录**（不污染记忆库），文件名按 MEMORY_DIR
+    哈希隔离：同一 server 服务多个库/测试临时库时互不干扰。
+
+    状态目录由 server 决定（`AI_MEMORY_STATE_DIR`，默认与 server.py 同目录；
+    容器里指向独立卷 `/state`），本模块不感知部署形态。
+    """
     h = hashlib.sha1(str(memory_dir.resolve()).encode("utf-8")).hexdigest()[:8]
-    return server_dir / f"memory_index_{h}.db"
+    return state_dir / f"memory_index_{h}.db"
 
 
 def connect(db_file: Path) -> sqlite3.Connection:

@@ -20,6 +20,9 @@ services:
 
     environment:
       AI_MEMORY_DIR: /vault
+      # 索引 db + 指标 json 的落点。不设则回落到源码目录（即镜像层 /app），
+      # 容器一重建就没了 —— 索引能重建，指标趋势不能。
+      AI_MEMORY_STATE_DIR: /state
       # 要从别的主机名/地址访问时必须显式追加，否则 Host 校验会拦截（有意的摩擦）。
       # 例：AI_MEMORY_HTTP_ALLOWED_HOSTS="localhost:*,127.0.0.1:*,ai-memory:*,192.168.1.20:8700"
       AI_MEMORY_HTTP_ALLOWED_HOSTS: "localhost:*,127.0.0.1:*,ai-memory:*"
@@ -29,6 +32,8 @@ services:
       # 想直接指向一个已有记忆库目录，把下面两行换成 bind mount：
       #   - /path/to/your/ai-memory:/vault      （Windows 形如 - D:/memory/ai-memory:/vault）
       - vault:/vault
+      - state:/state
 
 volumes:
   vault:
+  state:

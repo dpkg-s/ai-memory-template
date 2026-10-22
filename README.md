@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-3.0.0-blue)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.x-green)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-1092%20assertions-brightgreen)](#测试与-ci)
+[![Tests](https://img.shields.io/badge/tests-1325%20assertions-brightgreen)](#测试与-ci)
 
 ---
 
@@ -76,7 +76,7 @@ MCP 是开放协议，服务端默认以 stdio 传输，因此可接入：
 - **Cursor** — AI 代码编辑器
 - 任何支持 MCP stdio 的工具
 
-需要**远程 / 多机共用**同一个记忆库时，另有可选的 Streamable HTTP 入口（见 [远程访问（可选 Streamable HTTP）](#远程访问可选-streamable-http)）；想在浏览器里直接观察与调试记忆库，另有可选的 [Web 控制台（v3.1，可选）](#web-控制台v31可选)。两者都默认关闭，不影响上面任何一种用法。
+需要**远程 / 多机共用**同一个记忆库时，另有可选的 Streamable HTTP 入口（见 [远程访问（可选 Streamable HTTP）](#远程访问可选-streamable-http)）；想在浏览器里直接观察与调试记忆库，另有可选的 [Web 控制台（v3.1，可选）](#web-控制台v31可选) —— 它可以在**安装引导的第 ③ 步一并装好**，不必自己去 clone 独立仓。两者都默认关闭，不影响上面任何一种用法。
 
 ### 写入即自动化
 
@@ -290,6 +290,36 @@ python serve_http.py
 
 > **主程序零改动**：HTTP 装配全部收在 `transport_http.py` / `serve_http.py` 两个文件里，`server.py` 一个字符都不动 —— `python server.py` 永远等于 stdio，两种入口互不影响，`tests/test_transport.py` 有专项断言钉住这一点。Web 控制台自 2026-10-16 起拆分为独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)，不在本仓的导入图内。
 
+#### 装的时候就连启动器一起装好
+
+只放两个 `.py` 是不完整的 —— 拿到手的人得自己找解释器、自己设 `AI_MEMORY_DIR`、自己想怎么起。安装器勾上「可选模块」时给的是**一套能直接跑的东西**：
+
+| 生成物 | 平台 | 内容要点 |
+|---|---|---|
+| `start-http.cmd` | Windows | CRLF 行尾；写死安装时那个 `python.exe` 的**绝对路径**；`%*` 透传参数 |
+| `start-http.sh` | Linux / macOS | LF 行尾；`exec python3 <正斜杠路径> "$@"`（不写死 Windows 解释器） |
+
+两个脚本**按当前安装位置生成**，所以搬到别的机器请重装、不要手改路径。它们还会自己 `export AI_MEMORY_DIR`，双击即用，无需先开终端设变量。
+
+**起不来时不会一闪而过**：双击 `.cmd` 时窗口会在进程退出的瞬间消失，所以非 0 退出会打印退出码、三条最可能的原因（缺 `mcp` 依赖 / 端口被占 / 监听非回环却没给白名单）以及可直接复制的补装命令，再 `pause` 住窗口。`.sh` 侧则在 `exec` 之前先探 `import mcp` —— 一旦 `exec` 就再无补救机会。`.cmd` 首行还带 `chcp 65001`：文件是 UTF-8 写的，中文 Windows 控制台默认 GBK，不切码页时 `echo` 出来的中文全是乱码。
+
+```bat
+:: 换个端口跑（脚本里留了 if not defined 的默认值，环境变量优先）
+set AI_MEMORY_HTTP_PORT=8800 && start-http.cmd
+```
+
+可调的就三个环境变量，都已在脚本里给了默认值：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AI_MEMORY_HTTP_HOST` | `127.0.0.1` | 改 `0.0.0.0` 才能局域网访问，**且必须同时配下面的白名单** |
+| `AI_MEMORY_HTTP_PORT` | `8700` | 端口被占就换一个 |
+| `AI_MEMORY_HTTP_ALLOWED_HOSTS` | （空） | 监听非回环地址时**必填**，否则拒绝启动 |
+
+安装记录里会多一个 `http` 块（`host` / `port` / `path` / 实际生成的脚本名单），`ai_memory_setup.py check` 和安装完成的提示里都会把上面这段打印出来。
+
+**幂等**：内容逐字节相同就不重写；被手改过的脚本**先备份到 `<安装目录>/.ai-memory-backup/<时间戳>/` 再覆盖**；`--dry-run` 一律不落盘。启动器不进 `files` 指纹（它们是生成物），所以完整性校验不会因为你改了端口就把安装判成「被篡改」。**未勾选该模块时，目录里上次留下的脚本不会被删，也不会被改** —— 安装器会明确提示这一点，而不是让人以为清干净了。
+
 ### 用容器跑（可选）
 
 不想在目标机器上准备 Python 与 `mcp` 依赖时，可以直接跑容器。仓库自带 `Dockerfile` 与 `compose.yaml`，镜像里**只有运行时**（Python + `mcp` + 本仓 `.py`），记忆库一律从卷/绑定挂载进来，所以升级只换镜像 tag、数据不动。
@@ -315,11 +345,15 @@ docker compose up -d --build
 
 容器以非 root（uid 10001）运行；健康检查只探监听端口（MCP 端点是 POST + 会话语义，GET 不返回 2xx，拿它当探针会把「健康」误判成「故障」）。
 
+索引 db 与指标 json 落在 `AI_MEMORY_STATE_DIR`，镜像里预置为 `/state`（独立卷）。**别让它落回 `/app`** —— 那是镜像层，容器一重建就归零：索引本身可自动重建，但指标里的累积趋势（检索零结果率、锁等待、索引重建次数）补不回来。裸跑时不设这个变量，仍与 `server.py` 同目录，行为不变。
+
 ### Web 控制台（v3.1，可选）
 
 想在浏览器里**看着**记忆库（而不是全靠 AI 转述），可以起一个可选的本地控制台。
 
-> 🔴 **2026-10-16 起，Web 控制台已拆分为独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)**（前端 + 后端一体），在本仓作为 submodule 挂在 `web-console/`。下面的命令都在该目录下执行：
+> 🔴 **2026-10-16 起，Web 控制台已拆分为独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)**（前端 + 后端一体），在本仓作为 submodule 挂在 `web-console/`。
+
+**想省事就直接让安装器装**：图形版第 ③ 步勾上，或命令行 `python ai_memory_setup.py install --with-web` —— 它会把整棵子树落到 `<程序目录>/web-console/` 并生成 `start-web.cmd` / `start-web.sh`，顺带把端口写进安装记录。下面是在源码目录里手工起服务的方式：
 
 ```bash
 git clone --recursive git@github.com:dpkg-s/ai-memory-template.git
@@ -337,6 +371,18 @@ python serve_web.py
 ```
 
 控制台**不 import 本仓的任何模块**（2026-10-16 收敛）：阈值读写走 MCP 工具 `memory_config`（本仓 `memory_config.py` 是唯一实现），MCP 端点默认地址是它自己的字面常量。曾经那条「`core_path.py` 上溯定位核心目录 + 注入 `sys.path` 再 import `memory_config` / `transport_http`」的路径已整体拆除。⇒ 本仓与控制台的关系只剩**一个 submodule 引用**，运行期只剩**一条 MCP 连接**。唯一例外：`serve_web.py --with-mcp`（让控制台替你把 MCP 端点作为子进程拉起）需要知道本仓目录，此时须显式给 `--core-dir` 或 `AI_MEMORY_CORE_DIR`。
+
+**首次打开会要凭证 —— 控制台不设默认口令。** 两种方式任选，也可以同时配：
+
+```bash
+# ① 访问令牌（最省事，适合脚本）：上面那种配法，登录框里粘 token
+# ② 账号密码（推荐给人用）：先生成哈希，再把两行一起写进环境
+python web-console/make_password.py
+#     AI_MEMORY_WEB_USER=admin
+#     AI_MEMORY_WEB_PASSWORD_HASH=scrypt:16384:8:1:<salt>:<hash>
+```
+
+两种都给时，登录框底部可以「改用访问令牌 / 改用账号密码」互相切换。**半配会被拒绝启动**（给了用户名却没给哈希），不会静默放行 —— 半配最容易让人误以为「门已经锁上了」。容器部署改完凭证必须**重建容器**：`docker restart` 不生效，`-e` 在创建那一刻就固化了。会话语义（默认 12 小时、HttpOnly Cookie、**改口令不会踢掉已登录会话**）详见控制台仓 README 的「鉴权与首次登录」一节。
 
 四个页面：**概览**（条目数 / 热度分层 / 类型分布 / 最近更新 / 热门标签）、**调试台**（列出全部 25 个工具、按 JSON Schema 生成参数表单、直接调用并查看原始返回，破坏性工具要求二次确认）、**记忆库**（关键词搜索 + 浏览 + Markdown 渲染）、**配置**（MCP 端点 / 运行时阈值 / FNS 同步 / 关于）。支持深浅主题、三端适配（手机 / 平板 / 桌面）与前端动画。
 
@@ -356,7 +402,7 @@ python serve_web.py
 
 v2.0.0 起，仓库自带测试与持续集成：
 
-- **1092 条断言的二十六层测试**：语义回归 29 + 全工具冒烟 41 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 36 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 49 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 82 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 111 + 索引命名与迁移 49 + JSON 输出 76 + 模块分层守卫 43 + HTTP 传输层 43
+- **1325 条断言的二十八层测试**：语义回归 29 + 全工具冒烟 41 + 记忆可信度 24 + 作用域与生命周期 70 + 跨进程并发 38 + 异常恢复 36 + 检索质量 12 + 索引链接可解析性 22 + 运行时可观测性 45 + 回收站闭环 34 + 冲突重复防护 15 + 热度自动升降级 29 + frontmatter 归一化 49 + 原地热重启 26 + 上下文组装 59 + 多级目录枚举 43 + 子目录写入 42 + 写入端归类策略 82 + 索引增量化 17 + permalink 稳定标识 25 + 结构对账 32 + 阈值配置 111 + 索引命名与迁移 49 + JSON 输出 76 + 模块分层守卫 43 + HTTP 传输层 43 + 管家自检 86 + 安装器自检 147
 - **GitHub Actions CI**：Python 3.10 / 3.11 / 3.12 / 3.13 矩阵跑测试 + ruff lint
 - **模块化结构**：无状态工具层拆为 `yaml_io.py` / `text_utils.py` / `locks.py` / `memory_index.py` / `memory_config.py`，可观测层拆为 `metrics.py`；`tests/test_import_layers.py` 用手写 AST 守卫钉住分层（叶子模块不得反向依赖 `server.py`、本地模块之间不得成环），**不引入任何打包元数据**
 
@@ -493,6 +539,133 @@ args = ["/path/to/ai-memory/server.py"]
 
 > 完整模板（含 `AI_MEMORY_DIR` 可选配置）见 [`setup/`](setup/) 目录。
 
+### 方式四：交给「记忆库管家」自动完成（推荐）
+
+上面两步（装程序、配客户端）可以交给 `ai_memory_setup.py` 一条命令做完。它不只安装，还管两件事：**记忆库目录**和**AI 工具连接**。
+
+```bash
+# 交互式管家菜单（四分区：安装 / 记忆库 / AI 连接 / 自检）
+python ai_memory_setup.py
+
+# 或者直接下子命令，适合脚本化 / 批量
+python ai_memory_setup.py install          # 装或更新
+python ai_memory_setup.py versions         # 核验已装版本 + 列出远端可选版本（只读）
+python ai_memory_setup.py check            # 环境自检
+python ai_memory_setup.py vault list       # 记忆库目录：扫描候选
+python ai_memory_setup.py link scan        # AI 工具连接：看状态
+python ai_memory_setup.py link apply       # 把扫描到的工具接上
+```
+
+> 也提供打包好的单文件 exe，无需预装 Python：
+> - `ai-memory-setup-cli.exe` —— **控制台版，包含上面的全部管家功能**（`vault` / `link` / 交互菜单）
+> - `ai-memory-setup.exe` —— 图形版，**三步引导式安装**（见下），逻辑仍走同一份 `ai_memory_setup.py`
+
+#### 图形版：五步引导
+
+图形版把「装在哪」「装什么」「接到哪」拆成一条引导链：
+
+| 步骤 | 你做的事 | 它会做的事 |
+|---|---|---|
+| ① 记忆库目录 | 从扫描结果里挑一个，或选空目录新建 | 把候选库按「像不像记忆库」排序列出 |
+| ② 程序本体 | 一般不用动 | 自动填成 `<库目录>/ai-memory`，随第 ① 步联动；想分开放就点「浏览…」，之后可用「恢复自动」回到派生值 |
+| ③ 附加组件 | **一个勾选框**：想多开入口就勾上（顺便定 Web 端口），不用就留空 | 一次装齐两样：HTTP 的两个 `.py` + `start-http` 脚本，加上 Web 的整棵 `web-console/` + `start-web` 脚本 |
+| ④ 确认安装 | 看一眼摘要，选安装源与版本，按「开始安装」 | 摘要列出库目录 / 程序本体 / **已装实例的核验结论** / 附加组件；版本下拉标出「最新 / 已装」；安装源、执行模式、高级选项都在这一步 |
+| ⑤ 接入 AI 工具 | 勾选要接的客户端，按「接入选中的」 | 安装成功后**自动跳到这一步并扫描本机**，列出 21 个客户端里哪些已装、哪些能自动写；写前备份、写后回读，失败即回滚 |
+
+**为什么 HTTP 与 Web 是同一个勾选框**：两者回答的是同一个问题 ——「要不要多开一个入口」，而且**天然互斥不了**：控制台是 MCP 的前端代理，读写全走 HTTP 端点，没有 HTTP 的 Web 就是个打得开、列表全空的壳。分成两个框，「勾了 Web 没勾 HTTP」这个**看起来装好了、实际读不到数据**的状态就会一直存在，只能靠警告文案去兜；合成一个勾选框，这个半残状态在界面上根本无法被表达出来。勾选框下面的两行说明仍然把两块内容分开讲 —— 一个开关，不等于一句话糊过去。
+
+**为什么装完要进第 ⑤ 步**：装好不等于能用。21 个客户端各有自己的配置文件位置和格式（JSON / TOML / 有的还要手工改结构），用户不可能自己去翻。这一步复用 `setup_link` 的扫描与写入 —— 与命令行的 `link scan` / `link apply` **是同一份代码**，所以「界面上接上的」和「命令行接上的」结果必然一致。默认只勾「能自动改且确实需要改」的，已连上的不动、需手工的只提示不硬写。
+
+第 ④ 步自上而下的区块顺序是：**安装源（含版本下拉）→ 执行模式 → 高级选项**（附加组件已整体上移到第 ③ 步，确认页不再重复出现同一个开关）。
+
+三点设计取舍：**高级选项常驻展开**（不再做成 `▸` 折叠，剩余参数一眼可见）；**取消「与程序安装目录相同」勾选框** —— 新旧模型里程序位置由库目录派生，那个开关已经没有意义；**窗口高度按内容实测**，不再写死 —— Windows DPI 125% 下同样的内容会多要约 60px，写死的高度必然把最后一个区块切掉。
+
+#### 第 ③ 步：附加组件装成什么样
+
+```bash
+python ai_memory_setup.py install --with-optional                 # 只装 HTTP 传输层
+python ai_memory_setup.py install --with-optional --with-web      # 传输层 + Web 控制台（图形版这一勾装的就是这套）
+python ai_memory_setup.py install --with-optional --with-web --web-port 8812   # 顺便换 Web 端口
+```
+
+图形版的第 ③ 步把上面第 2 条包成一个勾选框；命令行仍保留两个独立开关 —— CLI 的调用方往往是被脚本编排的，「只装 HTTP」在多机共用场景下确实有意义，限制它是没必要的。**只勾 `--with-web` 不带 `--with-optional` 时预览阶段会直接警告**（控制台能开、数据全空），而不是装上再说。
+
+| 组件 | 落点 | 内容 |
+|---|---|---|
+| HTTP 传输层 | `<程序目录>/` | `transport_http.py` / `serve_http.py` + `start-http.cmd` / `.sh` |
+| Web 控制台 | `<程序目录>/web-console/` | `serve_web.py` + `web_console.py` + 整个 `web/` 前端目录 + `requirements.txt`（约 55 个文件，**保持相对结构** —— 控制台按「与本文件同级的 `web/`」找静态资源，平铺就散架）+ `start-web.cmd` / `.sh` |
+
+`--web-port` 等价于设 `AI_MEMORY_WEB_PORT`（端口只有一个事实源，记录 / 脚本 / 提示文案全从 `_web_defaults()` 读）。安装记录新增 `web` 块：`host` / `port` / `token`（**只记有没有，不落值**）/ `mcp` / `dir` / `entry` / `files` / `start`。
+
+三条刻意的行为：
+
+- **源里没有控制台就如实说**。远端 zip 不含 `web-console/` 子模块是正常情况，此时报「安装源里没有 Web 控制台 —— 本次跳过」并给出补救办法，而不是假装装好了。
+- **不装 HTTP 就不装 Web 的沉默陷阱**。控制台是 MCP 的前端代理，读写全走 HTTP 端点；只装 Web 不装 HTTP 时，控制台能打开、列表却是空的。图形版用一个勾选框从根上消掉了这个组合，命令行则在预览阶段直接警告。
+- **不勾选时不动旧文件**。目录里已有 `start-web.cmd` / `start-http.cmd` 却本次没勾，只提示「未改动它们」——不做静默清理。
+
+`web-console/` 目录不参与完整性校验（不在 `files` 指纹里）：它是整棵子树、文件数多，且升级替换频繁，逐文件指纹只会制造噪音。
+
+#### 版本核验与版本选择
+
+「已装版本」在旧版是个**声称**：本工具在程序目录写 `.ai-memory-install.json` 记下版本号，之后就一直转述这个数字。但它可能过期（有人手工拷了新文件覆盖）、也可能整个文件就不在（用 `git clone` 或 `install.ps1` 装的）。**声称不等于事实**，所以有了核验：
+
+```bash
+python ai_memory_setup.py versions             # 核验 + 列出全部可选版本
+python ai_memory_setup.py versions --ref v2.5.0  # 顺便标出指定版本在列表里的位置
+python ai_memory_setup.py install --ref v2.5.0   # 装指定版本（回退也走这条路）
+```
+
+核验靠三条证据交叉：
+
+| 证据 | 说明 |
+|---|---|
+| `.ai-memory-install.json` 的 `installed_version` | 我们自己写的，可能过期 |
+| 目录里的 `CHANGELOG.md` | 随源码发下来的独立证据（安装器不装它，故只在源码目录就地安装时存在） |
+| 记录里各文件的 `sha256` | 能查出「文件被改过 / 被截断 / 莫名缺失」 |
+
+结论落在四态上：`未安装` / `有程序文件、无安装记录` / `记录与文件不一致` / `完好`，且版本号**必须带证据等级**一起报 —— 否则「v3.0.0」看起来像结论，实际只是一句转述。两者打架时**以 CHANGELOG 为准**：磁盘上的文件才是真跑起来的东西。
+
+两个刻意的保守：
+
+- 记录里没有文件指纹时**不报「完好」**，改报「完整性未核验」—— 没查过和查过是两件事。
+- **不**拿当前 `CORE_FILES` 去要求旧版本。否则「老版本少一个后来才拆出来的模块」会被误判成文件损坏，然后劝你去强制重装。
+
+版本列表走两条通道：GitHub API（`?per_page=100`）→ `git ls-remote --tags`（API 匿名限流 60 次/小时，这条不限）。都拿不到时返回空列表并提示 `--ref` 手填，**不当成「远端没有版本」**。回退会在执行前二次确认 —— 装低版本后若客户端用到新版才有的能力，报错看起来跟安装器毫无关系，事后极难归因。
+
+#### `vault` —— 记忆库目录管理
+
+本仓一个容易踩的坑：程序目录和记忆库目录**可以分开**，而 `server.py` 在拿不到 `AI_MEMORY_DIR` 时会回落到 `~/ai-memory`。如果你的记忆库在 `D:\ai记忆`，而 `~/ai-memory` 是个空目录，AI 就会连上一个空库，还一切「正常」。
+
+`vault` 解决这件事：
+
+```bash
+python ai_memory_setup.py vault list           # 扫描候选目录并按「像不像记忆库」打分
+python ai_memory_setup.py vault use D:\ai记忆   # 指定当前库（同时写给 .ai-memory-install.json）
+python ai_memory_setup.py vault init D:\new    # 从零建库（播种 template/ 与 rules/）
+python ai_memory_setup.py vault path           # 只打印当前生效路径
+```
+
+打分权重：`记忆索引.md` +40、md 条目数（上限 +60）、`.git` +10、索引库 +10、同目录有 `server.py` +15。候选来源按可信度排序：`AI_MEMORY_DIR` 环境变量 → 安装元数据 → 客户端配置里的引用 → 上次选择 → 默认路径。
+
+#### `link` —— 扫描并接入 AI 工具
+
+```bash
+python ai_memory_setup.py link clients          # 打印支持的 21 个客户端与三级路径可信度
+python ai_memory_setup.py link scan             # 逐个判定状态
+python ai_memory_setup.py link apply            # 真写配置（写前备份、写后回读，失败回滚）
+python ai_memory_setup.py link apply --dry-run  # 只预演：打印将改什么 + 手工片段
+python ai_memory_setup.py link apply --client codex,workbuddy   # 限定客户端
+```
+
+状态分七类：`已连接` / `待创建` / `未连接` / `需确认`（env 缺失但程序指向对）/ `待修正`（漂移）/ `需手工`（**确实要你动手、但本工具不能代写**）/ `未安装`。注意 `需手工` 只表示「我们写不了」，**已配好的照样报 `已连接`** —— 两者是两件事。写入要点：
+
+- **合并而非替换** —— 只增删 `ai-memory` 这一个条目，`description`、`type`、其它 `env` 键原样保留；Codex 的 `[mcp_servers.ai-memory.tools.*]` 子段也整段留住。
+- **写前备份、写后回读** —— 同目录 `.bak-<时间戳>`，`os.replace` 原子替换，回读解析失败即回滚。
+- **保留 CRLF** —— 按字节读再解码，不做通用换行转换，否则一次写入会把整个配置文件的行尾翻掉。
+- **路径分级** —— 已验证（本机实测）/ 可新建（文档稳定，可直接创建）/ 仅修改（路径随版本变，只在文件已存在时改，绝不新建）。文件是否存在本身就是这个猜测路径的校验器。
+
+> **Python 3.10 限制**：读 TOML（Codex 配置）依赖 `tomllib`（3.11+）。在 3.10 上 JSON 客户端不受影响，TOML 客户端会明确报错而不是静默改坏。建议用 3.11+。
+
 ### 验证是否正常
 
 在 AI 对话里说「把今天的工作记到记忆库里」，观察 AI 是否调用了 `memory_write`。也可以直接让 AI 执行：
@@ -615,6 +788,7 @@ python server.py
 | 变量 | 作用 | 默认 |
 |------|------|------|
 | `AI_MEMORY_DIR` | 记忆库（vault）目录 | `~/ai-memory` |
+| `AI_MEMORY_STATE_DIR` | 索引 db 与指标 json 的落点（容器镜像里指向独立卷 `/state`） | 与 `server.py` 同目录 |
 | `AI_MEMORY_METRICS` | 运行时指标；设 `0` 完全关闭 | 开启 |
 | `AI_MEMORY_SOURCE_CONTEXT` | 本条记忆的写入方上下文，写入 `source_context` 字段（如 `workbuddy` / `claude-desktop` / `codex`），便于日后分辨「谁写的」 | 不设置 |
 | `AI_MEMORY_DIR_POLICY` | 写入端目录归类档位：`warn` / `auto` / `strict` / `off` | `warn` |
@@ -829,6 +1003,12 @@ ai-memory-template/
 │
 ├── install.sh               # macOS / Linux 一键安装
 ├── install.ps1              # Windows 一键安装
+│
+├── ai_memory_setup.py       # 记忆库管家：安装 / 更新 / 版本核验 / 自检 + 四分区交互菜单（v1.4）
+├── setup_vault.py           # 记忆库目录管理：扫描候选 / 打分 / 指定当前 / 从零建库
+├── setup_link.py            # AI 工具连接：21 个客户端的发现 / 判定 / 写入 / 回滚
+├── ai_memory_gui.py         # 管家图形界面（Tkinter 五步引导：库目录 → 程序本体 → 附加组件 → 确认安装 → 接入 AI 工具；逻辑仍走 ai_memory_setup.py）
+├── build_exe.py             # 打包两个 exe（GUI / CLI），补 PyInstaller 漏收的 tcl/tk DLL
 ├── requirements.txt         # 运行时依赖（mcp）
 ├── requirements-dev.txt     # 开发依赖（pytest + ruff）
 ├── ruff.toml                # lint 配置
@@ -864,7 +1044,10 @@ ai-memory-template/
 │   ├── test_index_name.py        # 47 断言：索引文件名与迁移（可见名 / 反向迁移 / 人侧可点击 / 摘要行）
 │   ├── test_output_json.py       # 76 断言：JSON 输出（范围即契约 / text 逐字节不变 / 非法值报错）
 │   ├── test_import_layers.py     # 47 断言：模块分层守卫（叶子不反向依赖 / 无环 / 白名单不腐烂 / 装配层依赖方向）
-│   └── test_transport.py         # 43 断言：HTTP 传输层（模式归一 / 安全规则 / 装配 / 端到端 / 零改动保证）
+│   ├── test_transport.py         # 43 断言：HTTP 传输层（模式归一 / 安全规则 / 装配 / 端到端 / 零改动保证）
+│   ├── selftest_vault_link.py    # 86 断言：管家自检（TOML 段级写入 / 状态判定 / 路径分级 / 片段结构 / 菜单冒烟）
+│   └── selftest_setup.py         # 147 断言：安装器自检（版本核验 / 四态证据 / 远端降级 / HTTP 与 Web 随装）
+│
 ├── scripts/
 │   └── make_checksums.py    # 生成 SHA256SUMS.txt（打 tag 发布时由 release.yml 调用）
 ├── .github/workflows/
@@ -890,7 +1073,7 @@ ai-memory-template/
 
 ## 测试与 CI
 
-测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 **26 套 / 1092 条断言**（另有 Web 控制台一套已随控制台迁至独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)）。
+测试分四类：**正确性**（写读是否无损）、**覆盖面**（工具是否都能用）、**语义与质量**（字段标记是否可靠、检索是否退化）、**韧性**（并发、崩溃、损坏文件下是否还站得住）。共 **28 套 / 1325 条断言**（另有 Web 控制台一套已随控制台迁至独立仓 [ai-memory-web](https://github.com/dpkg-s/ai-memory-web)）。其中 26 套是 `tests/test_*.py` 的 pytest 风格回归；另 2 套是**脚本式**自检（退出码 0 = 全绿，CI 单独一步执行）：`tests/selftest_vault_link.py`（管家）与 `tests/selftest_setup.py`（安装器）—— 后者覆盖版本核验与 HTTP、Web 两套随装脚本，在 CI 无外网环境下靠打桩验证远端列举逻辑，不依赖真网络；前者在 Python 3.10 上会把依赖 `tomllib` 的解析级断言记为 `skip` 而非 `fail`。
 
 **每条新判据都要先证明它「会红」**：新增断言时会把产品改回旧行为跑一遍，若断言不变红就说明它证明不了任何东西。本批的证伪结果：阈值配置 8/8、索引命名 **23/47**、多行标量转义 **6/8**、JSON 输出 7/7、模块分层 8/8 根针全部生效。
 
@@ -1136,9 +1319,9 @@ pip install -r requirements-dev.txt
 for f in tests/test_*.py; do python "$f"; done   # 或逐个运行
 ```
 
-CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI**。
+CI（`.github/workflows/ci.yml`）在 push / PR 时自动遍历 `tests/test_*.py`，再单独跑一遍 `tests/selftest_*.py`（Python 3.10 / 3.11 / 3.12 / 3.13 矩阵）+ ruff lint。**新增测试无需改 CI** —— 两类文件都按通配匹配，加文件即自动纳入。
 
-> 这二十六层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
+> 这二十七层测试是 `server.py` 能够安全模块化重构、并持续演进存储格式的前提 —— 先有测试护航，再动结构。并发与恢复测试上线后立刻暴露了 3 个真实并发缺陷（读路径写盘未持锁、Windows 下 `os.replace` 被读占用、把锁竞争误判为索引损坏），检索质量测试也暴露了 `memory_smart_search` 的过度召回 —— 这正是它们存在的意义。frontmatter 归一化测试则来自一次全库体检：8 篇笔记被同一处写入缺陷写坏，**先复现、再修生成器、最后回填数据**，而不是逐篇手改。
 
 ---
 

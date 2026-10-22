@@ -50,11 +50,23 @@ build/
 #              隐私红线不交给通配规则兜底。
 #   _*.png  —— 调试截图（headless Chrome 取证用），体积大、无长期价值。
 #   _v3_*   —— 一次性探针脚本（.py / .mjs），用完即弃，不属产品代码。
+#   _probe_* —— 同类的临时探针（GUI 冒烟、截图取证等）。GUI 冒烟需要真实显示，
+#              CI 无头跑不了，故只作本地回归用，不入库。
 #   *.prebak.* —— 前端迭代前的手工备份（app.js.prebak.* 等）。与已挡的
 #              *.syncbak.*（跨仓同步备份）合起来覆盖两类备份命名。
+#   _pkg/   —— 控制台发布件的本地暂存（web-console-*.tgz 与 RELEASE_*.md，约 2.4 MB）。
+#              真正的发布走 ai-memory-web 仓的 Release，这里只是打包时的中转站。
+#   _shots/ —— GUI 五步页面的取证截图（console/library/overview/settings.png）。
+#   _probe_*.html —— 探针渲染出的临时页面。
+#   _tmp_*.json   —— 探针导出的临时数据（如 _tmp_overview.json）。
 # ---------------------------------------------------------------------------
 _bak_*
 _*.png
 _v3_*.py
 _v3_*.mjs
+_probe_*.py
+_probe_*.html
+_tmp_*.json
+_pkg/
+_shots/
 *.prebak.*

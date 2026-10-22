@@ -34,13 +34,14 @@ __all__ = ["Metrics", "FLUSH_EVERY", "path_for"]
 FLUSH_EVERY = 50
 
 
-def path_for(server_dir: Path, memory_dir: Path) -> Path:
-    """指标文件路径：与索引 db 同目录，文件名按 MEMORY_DIR 哈希隔离。
+def path_for(state_dir: Path, memory_dir: Path) -> Path:
+    """指标文件路径：与索引 db 同目录（由调用方给的状态目录），文件名按
+    MEMORY_DIR 哈希隔离。
 
     同一 server 服务多个库（或多份测试临时库）时互不干扰。
     """
     h = hashlib.sha1(str(memory_dir.resolve()).encode("utf-8")).hexdigest()[:8]
-    return server_dir / f"memory_metrics_{h}.json"
+    return state_dir / f"memory_metrics_{h}.json"
 
 
 class Metrics:

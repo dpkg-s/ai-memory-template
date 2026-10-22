@@ -92,7 +92,45 @@ MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 # 因此配置文件的位置只能由这里喂给它。必须在任何阈值读取之前调用。
 memory_config.set_vault(MEMORY_DIR)
 _SERVER_DIR = Path(__file__).resolve().parent
-_IDX_FILE = midx.db_path(_SERVER_DIR, MEMORY_DIR)
+
+
+def _resolve_state_dir() -> Path:
+    """运行时状态目录（索引 db + 指标 json）的落点。
+
+    默认与 server.py 同目录 —— 裸跑（源码 / npx）行为与 v3.0 完全一致。
+    容器里 `/app` 是**镜像层**，容器一重建这两样都会没：
+    - 索引 db 是**纯派生缓存**（`access_count` 的真身写在 frontmatter 里，随 vault
+      走，不在库里），丢了只是下次首访多花一次全量扫描 —— 不是数据丢失。
+    - 指标 json 是**累积量**（检索零结果率、锁等待、索引重建次数），丢了补不回来。
+    所以独立卷的正当理由只有一个字：**指标趋势要跨重建累积**，顺带省掉每次重建
+    后的那次全量扫描。容器由 `AI_MEMORY_STATE_DIR=/state` 指向该卷。
+
+    目录不可用**不阻塞启动**：索引定位为「可再生缓存」，指标定位为「允许少量
+    丢失的观测数据」，两者都不该成为新的启动故障点 —— 告警 + 回落源码目录即可。
+    """
+    raw = (os.environ.get("AI_MEMORY_STATE_DIR") or "").strip()
+    if not raw:
+        return _SERVER_DIR
+    p = Path(raw).expanduser()
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        # 只 mkdir 不够：卷挂载点存在但属主不对时 mkdir 也会成功，直到写 sqlite
+        # 才失败 —— 而那条失败路径是「静默回落全库扫描」，比直接报错难查得多。
+        # 这里先探一次写，把问题挤到启动日志里。
+        probe = p / f".write-probe-{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        logger.warning(
+            "AI_MEMORY_STATE_DIR=%s 不可用（%s），回落 %s：索引与指标会随容器重建丢失",
+            raw, e, _SERVER_DIR,
+        )
+        return _SERVER_DIR
+    return p
+
+
+_STATE_DIR = _resolve_state_dir()
+_IDX_FILE = midx.db_path(_STATE_DIR, MEMORY_DIR)
 _IDX_NEEDS_REBUILD = True
 
 # ---- 运行时指标 (2026-09-10, 《改进建议》P1 Observability) -----------
@@ -100,8 +138,10 @@ _IDX_NEEDS_REBUILD = True
 # 可设 AI_MEMORY_METRICS=0 关闭。落盘位置与索引 db 同目录、按 MEMORY_DIR 哈希隔离。
 _METRICS_ENABLED = os.environ.get("AI_MEMORY_METRICS", "1") not in ("0", "false", "False")
 _METRICS = metrics.Metrics(
-    metrics.path_for(_SERVER_DIR, MEMORY_DIR) if _METRICS_ENABLED else None
+    metrics.path_for(_STATE_DIR, MEMORY_DIR) if _METRICS_ENABLED else None
 )
+# 状态目录要一眼可见：索引/指标「到底落在哪」是排查「重建即丢」类问题的第一问。
+logger.info("state dir: %s（索引 %s）", _STATE_DIR, _IDX_FILE.name)
 # 正常退出时把内存里的零头也落盘（否则最后不足 FLUSH_EVERY 条事件会随进程消失）。
 # 被强杀时自然拿不到，这正是「指标允许少量丢失」的取舍——不值得为它引入信号处理。
 atexit.register(_METRICS.flush)
@@ -2795,7 +2835,7 @@ def memory_doctor(limit: int = 20) -> str:
     """
     if not _IDX_FILE.exists():
         return ("# 索引一致性自检\n\n"
-                f"索引文件尚未建立：{_IDX_FILE.name}\n"
+                f"索引文件尚未建立：{_IDX_FILE}\n"
                 "> 首次写入或重启服务后会自动建立。")
 
     conn = None
@@ -2850,6 +2890,9 @@ def memory_doctor(limit: int = 20) -> str:
     clean = not (stale or unindexed or title_drift or stat_drift or unreadable)
 
     out = ["# 索引一致性自检", "",
+           # 绝对路径而非仅文件名：容器里「索引落在镜像层还是卷」是排查
+           # 「重建即丢」的第一问，只给 name 等于让人再去 exec 里找。
+           f"- 索引位置: {_IDX_FILE}",
            f"- 索引行数: {len(idx)}",
            f"- 磁盘文件: {len(disk)}（根目录 {n_root}，分类目录 {n_cat}，.archive {n_arch}）",
            f"- 结论: {'索引与磁盘一致' if clean else '发现差异，索引当前不可完全信任'}",

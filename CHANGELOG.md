@@ -19,6 +19,20 @@
 流水线调整 = 修 bug（+0.0.1）。拿不准时按 +0.0.1 走 —— 少给一个 minor 没有代价，
 多给一个会让人误以为有迁移成本。
 
+## [3.1.1] - 2026-10-22
+
+> 主题：**容器归属归位**。`web-console` 子模块把 `Dockerfile` / `docker-compose.yml` / `.dockerignore` 交还给 `ai-memory-docker`，模板仓只跟随指针前移，无源码变更。
+
+### Changed
+
+- **`web-console` 子模块 → `v1.11.2`（`67ed8fe`）** —— 控制台仓删除容器定义，README 改为列「对镜像的运行时契约」并指向 [`dpkg-s/ai-memory-docker`](https://github.com/dpkg-s/ai-memory-docker)；`serve_web.py` / `web_console.py` / `web/` 一行未改。
+- **容器构建入口统一为 docker 仓的 `Dockerfile.web`** —— 其构建上下文是本仓的 `template/web-console/`，因此本仓仍是镜像唯一的源码来源，只是不再持有构建脚本。
+
+### Note
+
+- 本仓 `.gitattributes` 早已在 3.1.0 拆仓时移除 `Dockerfile` / `.dockerignore` 的 eol 规则，故本次无 gitattributes 变更。
+- 装 exe、跑 `setup_*.py`、`server.py` 的行为不受影响；`dist/ai-memory-setup.exe` 仍随本仓 Release 分发。
+
 ## [3.1.0] - 2026-10-22
 
 > 主题：把「一键安装器」升级成**记忆库管家** —— 同一份 `server.py` 现在有 21 个 AI 客户端可以接，而「接错库」「接不上」是真实的翻车点，因此新增 `vault`（记忆库目录管理）与 `link`（AI 工具连接）两个子命令，外加一个四分区交互菜单。

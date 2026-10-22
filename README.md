@@ -74,38 +74,23 @@ Windows 图形化安装：从 [最新 Release](https://github.com/dpkg-s/ai-memo
 
 ## 三个仓的关系
 
-本产品拆成三仓，各自独立发版。你当前在 **ai-memory-template**。
+本产品拆成三仓，各自独立发布 —— **按你要做的事选一个，不必都装**。
 
-| 仓 | 职责 | 何时来这个仓 |
+| 仓 | 职责 | 适用场景 |
 | --- | --- | --- |
-| **ai-memory-template**（本仓） | MCP 服务端本体、安装器、`VERSION` | 装服务端、调配置、查工具文档 |
+| **ai-memory-template**（本仓） | MCP 服务端本体、安装器 | 装服务端、调配置、查工具文档 |
 | [ai-memory-web](https://github.com/dpkg-s/ai-memory-web) | Web 控制台（前端 + Starlette 后端） | 想在浏览器里看记忆库 |
 | [ai-memory-docker](https://github.com/dpkg-s/ai-memory-docker) | 两个镜像与一栈式编排 | 想一条 `docker compose up` 跑全套 |
 
-```
-ai-memory-docker
-  └── template/ (submodule) ── dpkg-s/ai-memory-template   ← 本仓
-        └── web-console/ (submodule) ── dpkg-s/ai-memory-web
-```
-
 ## 版本对照
 
-三仓版本号**不同轨**，靠下表对照，不靠数字大小推断兼容性。
+三仓版本号**不同轨**，各自按自己的节奏升，不要靠数字大小推断兼容性。
 
-| 组件 | 当前版本 | 兼容说明 |
+| 组件 | 当前版本 | 说明 |
 | --- | --- | --- |
-| ai-memory-template | **3.1.2** | 只依赖 MCP 协议；任意 web 1.x / docker 1.x 均可连 |
-| ai-memory-web | **1.11.3** | 需 MCP 端点可达；不 import 核心仓任何模块 |
-| ai-memory-docker | **1.1.1** | `template` 与 `web-console` 指针各随上游 tag |
-
-版本号规则（三仓一致）：major 位不动，**只叠加** —— 修 bug / 文档 / CI 记 `+0.0.1`，用户可见的新能力记 `+0.1`。
-判断口径与语义化版本的差异见 [CHANGELOG.md](CHANGELOG.md) 顶部「版本号规则」。
-
-发版顺序是硬约束：**本仓先 → ai-memory-web 后 → ai-memory-docker 跟随**，因为 web 的 Release 要从本仓
-latest 转挂同一个安装器 exe。
-
-> 历史版本 `2.1.0` 与 `1.0.0` / `1.1.0` **未单独发布**，只在 [CHANGELOG.md](CHANGELOG.md) 里留档。
-> 不补发：GitHub 不允许修改 `published_at`，补发旧版会让 Releases 页面出现「旧版本比新版本更晚」的倒挂。
+| ai-memory-template | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-template?label=&color=blue)](https://github.com/dpkg-s/ai-memory-template/releases/latest) | MCP 服务端本体，装在这台机器上 |
+| ai-memory-web | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-web?label=&color=blue)](https://github.com/dpkg-s/ai-memory-web/releases/latest) | 浏览器控制台，只连 MCP 端点，装不装都行 |
+| ai-memory-docker | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-docker?label=&color=blue)](https://github.com/dpkg-s/ai-memory-docker/releases/latest) | 镜像内置上表两个上游版本 |
 
 ## 它能做什么
 
@@ -126,8 +111,9 @@ latest 转挂同一个安装器 exe。
 | [docs/tools.md](docs/tools.md) | 25 个工具的分类速查与签名 |
 | [docs/configuration.md](docs/configuration.md) | `memory.toml` 全部选项、tier 与归档策略、JSON 输出 |
 | [docs/obsidian-and-sync.md](docs/obsidian-and-sync.md) | Obsidian 图谱、双链约定、多设备同步与版本控制 |
-| [docs/architecture.md](docs/architecture.md) | 分层结构、模块职责、测试体系与 CI |
+| [docs/architecture.md](docs/architecture.md) | 分层结构、模块职责、测试体系 |
 | [docs/faq.md](docs/faq.md) | 常见问题与排错 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 改代码、发版本（开发者向） |
 | [CHANGELOG.md](CHANGELOG.md) | 逐版本变更 |
 | [Releases](https://github.com/dpkg-s/ai-memory-template/releases) | 下载安装器与校验和 |
 

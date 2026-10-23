@@ -1,8 +1,8 @@
 # ai-memory-template
 
-**让所有 AI 工具共用同一个长期记忆。**
+**让不同 AI 工具共享同一份长期记忆。**
 
-基于 [MCP](https://modelcontextprotocol.io/) 的跨工具共享记忆库：纯 Markdown 存储、零外部依赖、Obsidian 可视化。WorkBuddy / Codex CLI / Claude Desktop / Cursor 等任何支持 MCP 的客户端即插即用。
+一个通过 [MCP](https://modelcontextprotocol.io/) 接入 AI 客户端的本地记忆库。内容以 Markdown 文件保存，可用 Obsidian 浏览；支持 WorkBuddy、Codex、Claude Desktop、Cursor 等 MCP 客户端，无需数据库或云服务。
 
 [![Release](https://img.shields.io/github/v/release/dpkg-s/ai-memory-template?label=release&color=blue)](https://github.com/dpkg-s/ai-memory-template/releases/latest)
 [![CI](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml/badge.svg)](https://github.com/dpkg-s/ai-memory-template/actions/workflows/ci.yml)
@@ -12,95 +12,95 @@
 
 ---
 
-## 30 秒安装
+## 快速安装
+
+需要 Python 3.10 或更高版本。运行安装脚本前，建议先阅读脚本内容。
 
 ```bash
 # macOS / Linux
-curl -sSLO https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.sh
-less install.sh && bash install.sh
+curl -fsSLO https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.sh
+less install.sh
+bash install.sh
 ```
 
 ```powershell
 # Windows PowerShell
 Invoke-WebRequest -Uri https://raw.githubusercontent.com/dpkg-s/ai-memory-template/master/install.ps1 -OutFile install.ps1
-Get-Content install.ps1; .\install.ps1
+Get-Content -LiteralPath .\install.ps1 -Raw
+.\install.ps1
 ```
 
-Windows 图形化安装：从 [最新 Release](https://github.com/dpkg-s/ai-memory-template/releases/latest) 下载
-`ai-memory-setup.exe`。当前 v3.1.2 尚未提供校验文件；下一次由新工作流发布的版本起，Release
-会同时附 `ai-memory-setup.exe.sha256`，可用 `sha256sum -c ai-memory-setup.exe.sha256` 校验。
+Windows 也可使用图形安装器：从[最新 Release](https://github.com/dpkg-s/ai-memory-template/releases/latest)下载 `ai-memory-setup.exe`。不同版本提供的校验附件可能不同，请以对应 Release 页面为准；如同时提供 `ai-memory-setup.exe.sha256`，可在 macOS / Linux 使用 `sha256sum -c ai-memory-setup.exe.sha256` 校验。
 
-安装器只做三件事：`pip install mcp`（`mcp>=1.30,<2`）、创建 `~/ai-memory/` 并写入模板、复制 `server.py`
-及其依赖模块。不改 shell 配置、不写注册表、不需要管理员权限、不常驻后台。
+安装器会安装 `mcp`（`mcp>=1.30,<2`）、创建 `~/ai-memory/` 并写入模板，以及复制 `server.py` 和所需模块。不修改 shell 配置或注册表，不需要管理员权限，也不会在后台常驻。
 
-> 三种安装路径的完整说明（含「交给 AI 助手部署」提示词、各平台 MCP 客户端配置、验证步骤）见
+> 四种安装路径的说明（含 AI 助手部署、各平台 MCP 客户端配置与验证步骤）见
 > **[docs/install.md](docs/install.md)**。
 
 ---
 
 ## 为什么需要它
 
-你同时用多个 AI 工具吗？它们各有独立的上下文窗口，互相不知道对方做过什么。于是：
+多个 AI 客户端通常各自维护对话上下文，换一个工具，之前的项目背景和处理记录就不一定跟得上：
 
-- 同一个偏好，你要对每个 AI 重复交代一遍
-- A 工具刚修好的坑，B 工具下一轮又从零排查
-- 对话一结束，上下文清空，项目决策随之丢失
+- 同一个偏好，需要在不同客户端重复说明
+- 一个客户端刚排查过的问题，另一个客户端可能从头再查
+- 对话结束后，项目决策和关键背景容易散落或遗失
 
-**ai-memory-template** 给所有 AI 接上同一个记忆库。一个 AI 写进去的知识，其余 AI 全部可读。
+**ai-memory-template** 将这些客户端连接到同一个记忆库。只要它们配置为访问同一份库，一个客户端写入的内容就能被其他客户端读取。
 
 | 场景 | 没有共享记忆 | 有共享记忆 |
 | --- | --- | --- |
-| 你告诉 AI「我用 VS Code、偏好 Python」 | 下次对话又问一遍 | AI 从记忆库读到，直接记住 |
-| WorkBuddy 修了一个 bug | Codex 不知道，可能重复排查 | Codex 一查记忆库就明白 |
-| 项目架构决策 | 上下文一清就丢 | 永久留在项目页，跨对话保持 |
-| 多 AI 协作 | 各自为政，信息割裂 | 共享同一份知识库 |
+| 个人偏好 | 在每个客户端重复说明 | 从共享记忆库读取 |
+| 问题排查 | 其他客户端可能重复调查 | 复用已有的原因与处理记录 |
+| 项目决策 | 随对话上下文一起丢失 | 作为 Markdown 笔记持续保存 |
+| 多客户端协作 | 信息分散在各自的上下文里 | 访问同一份知识库 |
 
-## 实际使用效果
+## 使用示例
 
-记忆库的价值在于**你不需要手动管理它**。典型的一天：
+在一个客户端记录问题处理过程，再从另一个客户端查阅：
 
-**上午 · 在 WorkBuddy 里**
+**WorkBuddy**
 
-> 主人：帮我修一下这个爬虫的超时问题，记到记忆库
+> 帮我修一下爬虫的超时问题，并把原因和处理方式记下来。
 >
-> AI：已写入 `项目_爬虫超时修复`，标签 `[python, fix]`，关联到 `[[项目_数据采集]]`
+> 已将问题记录到记忆库，并关联到对应的数据采集项目。
 
-**下午 · 换到 Codex CLI**
+**之后在 Codex 中**
 
-> 主人：爬虫那个超时问题之前怎么修的？
+> 爬虫的超时问题之前是怎么处理的？
 >
-> AI：记忆库里有记录 —— `[[项目_爬虫超时修复]]`：根因是连接池未复用，改为 `requests.Session` 并加 `timeout=(3, 10)` 后恢复正常。
+> 记忆库里记录的根因是连接池未复用；改用 `requests.Session` 并设置 `timeout=(3, 10)` 后恢复正常。
 
-**关键点**：第二次查询发生在**另一个 AI 工具**里，且**完全不需要你复述任何背景**。
+前提是两个客户端都已连接到同一记忆库，并且按配置读取相关记录。
 
 ## 三个仓的关系
 
-本产品拆成三仓，各自独立发布 —— **按你要做的事选一个，不必都装**。
+项目由三个独立仓库组成，按需选择即可，不必全部安装。
 
 | 仓 | 职责 | 适用场景 |
 | --- | --- | --- |
-| **ai-memory-template**（本仓） | MCP 服务端本体、安装器 | 装服务端、调配置、查工具文档 |
-| [ai-memory-web](https://github.com/dpkg-s/ai-memory-web) | Web 控制台（前端 + Starlette 后端） | 想在浏览器里看记忆库 |
-| [ai-memory-docker](https://github.com/dpkg-s/ai-memory-docker) | 两个镜像与一栈式编排 | 想一条 `docker compose up` 跑全套 |
+| **ai-memory-template**（本仓） | MCP 服务端与安装器 | 安装服务端、配置客户端、使用工具 |
+| [ai-memory-web](https://github.com/dpkg-s/ai-memory-web) | Web 控制台 | 在浏览器中查看和管理记忆库 |
+| [ai-memory-docker](https://github.com/dpkg-s/ai-memory-docker) | Docker 镜像与 Compose 编排 | 通过 Docker 部署 MCP 和 Web 服务 |
 
 ## 版本对照
 
-三仓版本号**不同轨**，各自按自己的节奏升，不要靠数字大小推断兼容性。
+三个仓库独立发布，版本号各自演进；不要根据版本号大小推断兼容关系。
 
 | 组件 | 当前版本 | 说明 |
 | --- | --- | --- |
-| ai-memory-template | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-template?label=&color=blue)](https://github.com/dpkg-s/ai-memory-template/releases/latest) | MCP 服务端本体，装在这台机器上 |
-| ai-memory-web | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-web?label=&color=blue)](https://github.com/dpkg-s/ai-memory-web/releases/latest) | 浏览器控制台，只连 MCP 端点，装不装都行 |
-| ai-memory-docker | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-docker?label=&color=blue)](https://github.com/dpkg-s/ai-memory-docker/releases/latest) | 镜像内置上表两个上游版本 |
+| ai-memory-template | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-template?label=&color=blue)](https://github.com/dpkg-s/ai-memory-template/releases/latest) | MCP 服务端与安装器 |
+| ai-memory-web | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-web?label=&color=blue)](https://github.com/dpkg-s/ai-memory-web/releases/latest) | 连接 MCP 端点的浏览器控制台 |
+| ai-memory-docker | [![v](https://img.shields.io/github/v/release/dpkg-s/ai-memory-docker?label=&color=blue)](https://github.com/dpkg-s/ai-memory-docker/releases/latest) | 提供 MCP 与 Web 服务的 Docker 部署方案 |
 
 ## 它能做什么
 
-- **25 个 MCP 工具**：写入 / 读取 / 搜索 / 图谱 / 上下文组装 / 归档 / 批量维护 / 审计 / 热重启，
-  含乐观锁、可信度、作用域与生命周期字段。完整签名见 **[docs/tools.md](docs/tools.md)**。
-- **纯文件存储**：Markdown + frontmatter 是唯一事实源，SQLite 索引只是可删可重建的缓存。
-- **零外部依赖**：Python 3.10+ 与 `mcp` 一个包，不需要数据库、容器或云账号。
-- **可观测**：`memory_stats` / `memory_doctor` / `memory_schema_diff` 分别查健康度、索引一致性、结构偏差。
-- **跨设备**：vault 就是一个目录，git 或任意同步盘即可多机共用（见 [docs/obsidian-and-sync.md](docs/obsidian-and-sync.md)）。
+- **完整的记忆操作**：写入、读取、搜索、图谱、上下文组装、归档、批量维护与审计；支持乐观锁、可信度、作用域和生命周期字段。工具列表见 **[docs/tools.md](docs/tools.md)**。
+- **Markdown 为数据源**：笔记以 Markdown 和 frontmatter 保存；SQLite 仅作可重建索引。
+- **轻量运行**：需要 Python 3.10+ 和 `mcp` 包；无需数据库、容器或云账号。
+- **状态可检查**：`memory_stats`、`memory_doctor`、`memory_schema_diff` 分别检查库状态、索引一致性和条目结构。
+- **支持同步与版本控制**：记忆库是普通目录，可使用 Git 等方案在多设备间管理；配置前请阅读[同步说明](docs/obsidian-and-sync.md)。
 
 更完整的能力清单与设计取舍见 **[docs/features.md](docs/features.md)**。
 
@@ -108,15 +108,15 @@ Windows 图形化安装：从 [最新 Release](https://github.com/dpkg-s/ai-memo
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/install.md](docs/install.md) | 三种安装方式、客户端配置、`mcp<2` 的版本上界原因、验证步骤 |
-| [docs/tools.md](docs/tools.md) | 25 个工具的分类速查与签名 |
-| [docs/configuration.md](docs/configuration.md) | `memory.toml` 全部选项、tier 与归档策略、JSON 输出 |
-| [docs/obsidian-and-sync.md](docs/obsidian-and-sync.md) | Obsidian 图谱、双链约定、多设备同步与版本控制 |
-| [docs/architecture.md](docs/architecture.md) | 分层结构、模块职责、测试体系 |
+| [docs/install.md](docs/install.md) | 安装方式、客户端配置与验证步骤 |
+| [docs/tools.md](docs/tools.md) | MCP 工具分类与调用签名 |
+| [docs/configuration.md](docs/configuration.md) | `memory.toml` 选项、分层与归档策略 |
+| [docs/obsidian-and-sync.md](docs/obsidian-and-sync.md) | Obsidian、双链、多设备同步与版本控制 |
+| [docs/architecture.md](docs/architecture.md) | 模块职责与测试体系 |
 | [docs/faq.md](docs/faq.md) | 常见问题与排错 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 改代码、发版本（开发者向） |
-| [CHANGELOG.md](CHANGELOG.md) | 逐版本变更 |
-| [Releases](https://github.com/dpkg-s/ai-memory-template/releases) | 下载安装器与校验和 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发、测试与发布流程 |
+| [CHANGELOG.md](CHANGELOG.md) | 各版本变更记录 |
+| [Releases](https://github.com/dpkg-s/ai-memory-template/releases) | 安装器及各版本提供的附件 |
 
 ## 许可
 

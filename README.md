@@ -27,7 +27,8 @@ Get-Content install.ps1; .\install.ps1
 ```
 
 Windows 图形化安装：从 [最新 Release](https://github.com/dpkg-s/ai-memory-template/releases/latest) 下载
-`ai-memory-setup.exe`，同页附 `ai-memory-setup.exe.sha256`，可 `sha256sum -c` 校验后再执行。
+`ai-memory-setup.exe`。当前 v3.1.2 尚未提供校验文件；下一次由新工作流发布的版本起，Release
+会同时附 `ai-memory-setup.exe.sha256`，可用 `sha256sum -c ai-memory-setup.exe.sha256` 校验。
 
 安装器只做三件事：`pip install mcp`（`mcp>=1.30,<2`）、创建 `~/ai-memory/` 并写入模板、复制 `server.py`
 及其依赖模块。不改 shell 配置、不写注册表、不需要管理员权限、不常驻后台。

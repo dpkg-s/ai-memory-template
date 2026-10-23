@@ -14,6 +14,18 @@
 
 ## 快速安装
 
+### 直接启动 MCP Server（uv / PyPI）
+
+发布后，安装 [uv](https://docs.astral.sh/uv/) 即可直接运行，无需克隆仓库：
+
+```bash
+uvx --from ai-memory-mcp-dpkg-s ai-memory-mcp
+```
+
+默认记忆库目录为 `~/ai-memory`。连接已有目录时传入 `--vault`，例如 `uvx --from ai-memory-mcp-dpkg-s ai-memory-mcp --vault "D:/Notes/ai-memory"`。也可通过 `AI_MEMORY_DIR` 环境变量设置路径。
+
+DSH 用户可安装配套的 [DSH bundle](integrations/dsh/README.md)，它会用本机 stdio 启动同一 MCP Server。
+
 需要 Python 3.10 或更高版本。运行安装脚本前，建议先阅读脚本内容。
 
 ```bash
@@ -109,6 +121,7 @@ Windows 也可使用图形安装器：从[最新 Release](https://github.com/dpk
 | 文档 | 内容 |
 | --- | --- |
 | [docs/install.md](docs/install.md) | 安装方式、客户端配置与验证步骤 |
+| [integrations/dsh/README.md](integrations/dsh/README.md) | DSH 插件安装、数据目录与市场收录 |
 | [docs/tools.md](docs/tools.md) | MCP 工具分类与调用签名 |
 | [docs/configuration.md](docs/configuration.md) | `memory.toml` 选项、分层与归档策略 |
 | [docs/obsidian-and-sync.md](docs/obsidian-and-sync.md) | Obsidian、双链、多设备同步与版本控制 |

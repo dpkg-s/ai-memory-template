@@ -74,7 +74,7 @@ ASSEMBLY_MODULES = {"serve_http", "transport_http"}
 # 打包）随 Web 控制台拆仓一并提交进本仓，但清单未同步 ⇒ CI 四个 Python 版本同报
 # I0a「多=['ai_memory_setup']」。补登记即修。此类不参与 I2 无环、I5a 组装完整性、
 # I9 依赖方向三组检查（它没有任何本地边）。
-TOOL_MODULES = {"ai_memory_setup"}
+TOOL_MODULES = {"ai_memory_setup", "cli"}
 
 # 2026-10-22：管家化改造带来的四个自足模块，同样既不被 server import、也不 import
 # 任何本地模块（gui 为了能被打包成单文件 exe，刻意只用标准库 + tkinter）：

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-memory-mcp-dpkg-s"
+version = "0.1.0"
+description = "A local, Markdown-first shared memory vault exposed through MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "dpkg-s" }]
+keywords = ["mcp", "memory", "markdown", "ai", "obsidian"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = ["mcp>=1.30,<2"]
+
+[project.urls]
+Homepage = "https://github.com/dpkg-s/ai-memory-template"
+Repository = "https://github.com/dpkg-s/ai-memory-template"
+Issues = "https://github.com/dpkg-s/ai-memory-template/issues"
+
+[project.scripts]
+ai-memory-mcp = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+  "cli",
+  "server",
+  "memory_config",
+  "memory_index",
+  "metrics",
+  "text_utils",
+  "yaml_io",
+  "locks",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

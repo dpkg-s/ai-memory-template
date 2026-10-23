@@ -1,0 +1,38 @@
+{
+  "name": "dsh-ai-memory-vault",
+  "version": "0.1.0",
+  "description": "Connect DeepSeek Harness to an existing local Markdown memory vault through MCP.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dpkg-s/ai-memory-template.git",
+    "directory": "integrations/dsh"
+  },
+  "homepage": "https://github.com/dpkg-s/ai-memory-template/tree/master/integrations/dsh#readme",
+  "bugs": {
+    "url": "https://github.com/dpkg-s/ai-memory-template/issues"
+  },
+  "files": [
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "mcp",
+    "markdown",
+    "obsidian"
+  ]
+}

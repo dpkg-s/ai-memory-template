@@ -1,0 +1,6 @@
+url: https://github.com/dpkg-s/ai-memory-template/tree/master/integrations/dsh
+name: dpkg-s/ai-memory-template#integrations/dsh
+category: memory
+description:
+  en: Connect DSH to a local Markdown memory vault shared across MCP clients.
+  zh: 将 DSH 接入可供多个 MCP 客户端共用的本机 Markdown 记忆库。

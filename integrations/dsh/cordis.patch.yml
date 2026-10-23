@@ -1,0 +1,17 @@
+- insert:
+    - id: mcp-ai-memory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ai-memory
+        transport: stdio
+        command: uvx
+        args:
+          - --from
+          - ai-memory-mcp-dpkg-s==0.1.0
+          - ai-memory-mcp
+          - --vault
+          - !!js process.env.AI_MEMORY_DIR || ''
+        env:
+          AI_MEMORY_SOURCE_CONTEXT: dsh
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false

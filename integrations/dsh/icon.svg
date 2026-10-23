@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">AI Memory</title>
+  <rect width="64" height="64" rx="16" fill="#243b53"/>
+  <path d="M17 16h30v7H25v8h19v7H25v10h22v7H17z" fill="#f0c674"/>
+  <circle cx="48" cy="45" r="5" fill="#7cc4a5"/>
+</svg>

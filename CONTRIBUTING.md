@@ -22,6 +22,29 @@ docker 仓的两个镜像 tag 跟随本仓与 web 的版本。
 反序的后果：web 仓的 Release 会从本仓 `latest` 拿到**上一个版本**的安装器，而 exe 文件名
 不带版本号，下载的人无从发现。
 
+## 改动记录只写本仓
+
+**谁改了东西，就写在谁自己的那个仓里。** 本仓只记录本仓的改动，另两端去看它们自己的记录。
+
+| 端 | 仓库 | 谁能写进本仓的文档 |
+| --- | --- | --- |
+| **核心（本仓）** | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) | MCP 服务端与各模块、索引/检索、工具实现、测试、安装器 exe、根 `VERSION` —— 只有这些 |
+| 外部端 | [ai-memory-web](https://github.com/dpkg-s/ai-memory-web) · [CONTRIBUTING](https://github.com/dpkg-s/ai-memory-web/blob/master/CONTRIBUTING.md) | 控制台页面 / CSS / 前端交互 —— 归它自己写 |
+| 容器端 | [ai-memory-docker](https://github.com/dpkg-s/ai-memory-docker) · [CONTRIBUTING](https://github.com/dpkg-s/ai-memory-docker/blob/master/CONTRIBUTING.md) | Dockerfile / compose / 镜像 tag —— 归它自己写 |
+
+执行细则：
+
+1. `commit message`、`CHANGELOG.md`、`README.md`、PR 正文、Release 正文，**只描述本仓的改动**。
+2. **不写**另两端的改动清单、对方的 commit SHA、对方的运行/验证过程、对方的发版动作。
+   那些属于对方仓自己那份记录 —— 写在这里就是混写。
+3. 必须提到另一端时，**给完整超链接**（仓 / commit / 文件 / Release 的绝对 URL），
+   并只写结论（如「需配合容器端 v1.1.3」），不复述对方实现细节。
+4. 一次改动横跨多端 ⇒ 三仓各一笔提交、各写一句，本仓只留本仓那一笔。
+5. `web-console/` 的 submodule 指针登记在本仓，指针 bump 由本仓记录；**指针指向的界面改了什么，看
+   [ai-memory-web 的 CHANGELOG](https://github.com/dpkg-s/ai-memory-web/blob/master/CHANGELOG.md)**，不要抄过来。
+
+提交前自查：`git diff --cached` 里出现的仓库名，只能是本仓（超链接除外）。
+
 ## 版本号规则
 
 major 位固定不动，**只叠加**：

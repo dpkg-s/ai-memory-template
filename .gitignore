@@ -80,3 +80,7 @@ _tmp_*.json
 _pkg/
 _shots/
 *.prebak.*
+
+# 控制台令牌表（web_store / web_console 运行时生成）：内含明文与哈希令牌，
+# 属设备本地凭据。2026-10-27 实测它出现在仓库根且当时无规则挡住，故显式封一条。
+tokens.json

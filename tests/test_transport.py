@@ -213,14 +213,22 @@ section("E 装配（替身 FastMCP，不真起服务）")
 class _FakeSettings:
     """允许任意属性赋值（FastMCP.settings 是 pydantic BaseSettings，可写）。"""
 
+    log_level = "INFO"
+
 
 class _FakeMCP:
     def __init__(self) -> None:
         self.settings = _FakeSettings()
         self.calls: list[tuple[tuple, dict]] = []
+        self.app_calls = 0
 
     def run(self, *a, **kw):
         self.calls.append((a, kw))
+
+    def streamable_http_app(self):
+        """HTTP 分支现在走 `streamable_http_app()` + 外层 ClearanceRouter。"""
+        self.app_calls += 1
+        return "<fake-starlette-app>"
 
 
 with env():
@@ -231,18 +239,78 @@ with env():
 
 with env(AI_MEMORY_TRANSPORT="http", AI_MEMORY_HTTP_PORT="8791"):
     f2 = _FakeMCP()
-    transport_http.run(f2)
-    check("E2 http 分支传 transport=streamable-http",
-          f2.calls == [((), {"transport": "streamable-http"})], str(f2.calls))
+    served: dict = {}
+    _orig_serve = transport_http._serve
+    transport_http._serve = lambda app, **kw: served.update(kw, app=app)
+    try:
+        # 权级钩子由入口注入（装配层不许反向 import server）。这里用两个假钩子
+        # 代表 serve_http 传进来的 server.set_clearance / reset_clearance。
+        transport_http.run(f2, clearance_hooks=(lambda lvl: ("tok", lvl), lambda t: None))
+    finally:
+        transport_http._serve = _orig_serve
+    check("E2 http 分支构造 Streamable HTTP 应用（不再走 mcp.run）",
+          f2.app_calls == 1 and f2.calls == [], f"app_calls={f2.app_calls} calls={f2.calls}")
+    _app = served.get("app")
+    check("E2a 启用权级分档（外层包了 ClearanceRouter）",
+          isinstance(_app, transport_http.ClearanceRouter)
+          and getattr(_app, "inner", None) == "<fake-starlette-app>", repr(_app))
+    check("E2a2 六档路由就位（4 视野 + 2 只读变体）",
+          isinstance(_app, transport_http.ClearanceRouter)
+          and _app.routes.get("/mcp") == ("owner", True)
+          and _app.routes.get("/mcp/member") == ("member", True)
+          and _app.routes.get("/mcp/guest") == ("guest", True)
+          and _app.routes.get("/mcp/owner-ro") == ("owner", False),
+          str(getattr(_app, "routes", None)))
+    check("E2a3 权级钩子已注入（不是 None）",
+          isinstance(_app, transport_http.ClearanceRouter)
+          and _app._set is not None and _app._reset is not None)
     check("E2b settings.host/port 已写入",
           (f2.settings.host, f2.settings.port) == ("127.0.0.1", 8791),
           f"{getattr(f2.settings, 'host', None)}:{getattr(f2.settings, 'port', None)}")
+    check("E2b2 _serve 收到同一 host/port",
+          (served.get("host"), served.get("port")) == ("127.0.0.1", 8791), str(served))
     check("E2c settings.transport_security 已写入且防护开启",
           getattr(f2.settings.transport_security, "enable_dns_rebinding_protection", False) is True)
     check("E2d streamable_http_path 已写入",
           f2.settings.streamable_http_path == "/mcp", getattr(f2.settings, "streamable_http_path", None))
     check("E2e 刻意不设 auth（避免 401→OAuth 发现流程陷阱）",
           getattr(f2.settings, "auth", None) is None)
+
+with env(AI_MEMORY_TRANSPORT="http", AI_MEMORY_HTTP_PORT="8792"):
+    ok, msg = _raises(lambda: transport_http.run(_FakeMCP()), CfgErr)
+    check("E2f 声明了受限档位却没注入钩子 ⇒ 拒绝启动（不静默当 owner）",
+          ok and "权级钩子" in msg, msg)
+
+with env(AI_MEMORY_TRANSPORT="http", AI_MEMORY_HTTP_PORT="8792",
+         AI_MEMORY_HTTP_CLEARANCE_ROUTES="off"):
+    _f3 = _FakeMCP()
+    _orig_serve = transport_http._serve
+    transport_http._serve = lambda app, **kw: None
+    try:
+        transport_http.run(_f3)          # 关闭分档时不要求钩子
+        _off_ok = True
+    except Exception:  # noqa: BLE001
+        _off_ok = False
+    finally:
+        transport_http._serve = _orig_serve
+    check("E2g 关闭分档（只有 owner）⇒ 允许无钩子启动", _off_ok)
+
+section("E' 权级路由表（纯函数）")
+with env(AI_MEMORY_HTTP_CLEARANCE_ROUTES="off"):
+    _r = transport_http.clearance_routes("/mcp")
+    check("E3 off ⇒ 只剩 owner 端点", _r == {"/mcp": ("owner", True)}, str(_r))
+with env(AI_MEMORY_HTTP_CLEARANCE_ROUTES="member"):
+    _r = transport_http.clearance_routes("/mcp")
+    check("E4 只登记 member ⇒ 无 guest 端点",
+          _r == {"/mcp": ("owner", True), "/mcp/member": ("member", True)}, str(_r))
+with env(AI_MEMORY_HTTP_CLEARANCE_ROUTES="owner,member"):
+    _r = transport_http.clearance_routes("/mcp")
+    check("E5 owner 不允许有别名路径（只认 /mcp 本身）",
+          "/mcp/owner" not in _r and _r.get("/mcp") == ("owner", True), str(_r))
+with env(AI_MEMORY_HTTP_CLEARANCE_ROUTES="member,adnim"):
+    _r = transport_http.clearance_routes("/mcp")
+    check("E6 拼错的档位被丢弃，不会静默当成全权",
+          "/mcp/adnim" not in _r and "/mcp/member" in _r, str(_r))
 
 
 # ---------------------------------------------------------------------------
@@ -271,10 +339,23 @@ def _child_env(**extra) -> dict:
     e["AI_MEMORY_METRICS"] = "0"
     for k in ("AI_MEMORY_TRANSPORT", "AI_MEMORY_HTTP_HOST", "AI_MEMORY_HTTP_PORT",
               "AI_MEMORY_HTTP_ALLOWED_HOSTS", "AI_MEMORY_HTTP_DNS_REBINDING",
+              "AI_MEMORY_HTTP_CLEARANCE_ROUTES",
               "AI_MEMORY_RESTART", "AI_MEMORY_RESUME", "AI_MEMORY_RESTART_CHAIN"):
         e.pop(k, None)
     e.update({k: str(v) for k, v in extra.items()})
     return e
+
+
+def _exc_text(e: BaseException) -> str:
+    """把 ExceptionGroup 递归摊平成一行 —— 只取最外层等于什么都没说。
+
+    e2e 失败的真实原因通常在两层 TaskGroup 里面（httpx 状态码 / 连接被拒），
+    所以要一路挖到底。
+    """
+    parts = [f"{type(e).__name__}: {e}"]
+    for sub in (getattr(e, "exceptions", None) or []):
+        parts.append(_exc_text(sub))
+    return " <- ".join(parts)
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -301,6 +382,30 @@ async def _wait_ready(proc: subprocess.Popen, port: int, timeout: float = 30.0):
         except OSError:
             await asyncio.sleep(0.2)
     return False, f"等待 {timeout:.0f}s 仍未就绪"
+
+
+async def _wait_log(logpath: str, proc: subprocess.Popen,
+                    needle: str = "startup complete", timeout: float = 40.0):
+    """等**日志里**出现就绪标志，而不是等端口可连。
+
+    为什么不能只等端口：``_free_port`` 拿到端口到子进程真正 bind 之间有一段空窗，
+    而那段空窗里该端口完全可能已被别的进程（前一次测试的残留 / 系统服务）监听。
+    此时 ``create_connection`` 会成功 —— 但连上的是**别人**，它对本协议一无所知，
+    表现就是客户端拿到 404 后报 ``Session terminated``。这类假红极难归因，故就绪
+    判据一律以「服务自己说自己起来了」为准。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if proc.poll() is not None:
+            return False, f"进程提前退出 rc={proc.returncode}"
+        try:
+            txt = _decode(Path(logpath).read_bytes())
+        except OSError:
+            txt = ""
+        if needle in txt:
+            return True, "ok"
+        await asyncio.sleep(0.2)
+    return False, f"等待 {timeout:.0f}s 未见「{needle}」"
 
 
 # =====================================================================
@@ -349,9 +454,11 @@ async def _http_e2e() -> tuple[bool, str]:
                                            + mr.content[0].text[:160])
                 return True, f"工具 {len(names)} 个；initialize/list/write/read 全通；restart 已禁用"
             except Exception as e:  # noqa: BLE001
-                last = f"{type(e).__name__}: {e}"
+                last = _exc_text(e)
                 await asyncio.sleep(1.0)
-        return False, f"连接重试耗尽：{last}"
+        logf.flush()
+        return False, (f"连接重试耗尽：{last} | 服务端日志："
+                       f"{_decode(Path(logpath).read_bytes())[-600:].replace(chr(10), ' / ')}")[:1200]
     finally:
         _terminate(proc)
         logf.close()
@@ -362,6 +469,100 @@ try:
 except Exception as _e:  # noqa: BLE001
     _ok_f, _detail_f = False, f"抛异常 {type(_e).__name__}: {_e}"
 check("F1 HTTP 通道端到端（initialize/list_tools/write/read）", _ok_f, _detail_f)
+
+# =====================================================================
+section("F2 只读视野端点（/mcp/owner-ro）——读得全，写不了")
+
+
+async def _readonly_e2e() -> tuple[bool, str]:
+    """唯一能证明「四跳都不断」的硬证据。
+
+    单测只能证明 ``server.py`` 里写着 ``writable=False``；证不了 HTTP 层真把那个
+    布尔带到了工具调用那一刻。这条 e2e 走完整路径：路径 → ClearanceRouter →
+    contextvar → 工具守卫，任何一跳断掉都会在这里显形。
+
+    样本条目**直接落盘**而不是先用全权端点写一条：SDK 在 ``stateless=False`` 下
+    同一进程连开两个会话，第二个会撞上 ``Session terminated``（第一个会话关闭时
+    发的 DELETE 会连带清掉共享的 session 管理器状态）。那与被测逻辑无关，但会把
+    这条测试变成「随机红」—— 故收敛成单会话。
+    """
+    sample = Path(_TMP) / "只读端点样本.md"
+    sample.write_text(
+        "---\ntitle: 只读端点样本\nsecurity: secret\nclearance: owner\ntier: warm\n---\n\n"
+        "绝密正文：内网 10.9.9.9。\n", encoding="utf-8")
+
+    port = _free_port()
+    # 回环测试必须绕开系统代理：本机环境常带 http_proxy（Clash 之类），httpx 会
+    # 照单把 127.0.0.1 的请求也交给代理，代理再转发回来 —— 表现为「502」或
+    # 「Session terminated」这类与被测逻辑毫无关系的假红。真实部署里别的设备
+    # 直连本机也不经过这层，所以这里显式绕过不影响测的东西的保真度。
+    _proxy_saved = {k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy")}
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+    logpath = os.path.join(_TMP, "serve_http_ro.log")
+    logf = open(logpath, "wb")
+    proc = subprocess.Popen(
+        [sys.executable, str(_SERVER_DIR / "serve_http.py")],
+        env=_child_env(AI_MEMORY_TRANSPORT="http", AI_MEMORY_HTTP_PORT=port),
+        cwd=str(_SERVER_DIR), stdout=logf, stderr=logf)
+    try:
+        ok, why = await _wait_log(logpath, proc)
+        if not ok:
+            logf.flush()
+            return False, f"{why} | {_decode(Path(logpath).read_bytes())[-400:]}"
+
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        last = ""
+        for _attempt in range(4):
+            try:
+                async with streamablehttp_client(
+                        f"http://127.0.0.1:{port}/mcp/owner-ro") as (r, w, _s):
+                    async with ClientSession(r, w) as s:
+                        await s.initialize()
+                        rd = await s.call_tool("memory_read", {"title": "只读端点样本"})
+                        if "10.9.9.9" not in rd.content[0].text:
+                            return False, ("只读端点读不到 secret（视野没生效）："
+                                           + rd.content[0].text[:160])
+                        ls = await s.call_tool("memory_list", {"limit": 50})
+                        if "只读端点样本" not in ls.content[0].text:
+                            return False, "只读端点列表不含 secret（过滤口径与 read 不一致）"
+                        wr = await s.call_tool("memory_write",
+                                               {"title": "只读端点越权", "content": "不该写进来"})
+                        if "只读" not in wr.content[0].text:
+                            return False, f"只读端点竟能写：{wr.content[0].text[:160]}"
+                        dl = await s.call_tool("memory_delete", {"title": "只读端点样本"})
+                        if "不可用" not in dl.content[0].text:
+                            return False, f"只读端点竟能删：{dl.content[0].text[:160]}"
+                        rd2 = await s.call_tool("memory_read", {"title": "只读端点样本"})
+                        if "10.9.9.9" not in rd2.content[0].text:
+                            return False, "写被拒之后读路径也失效了"
+                        return True, "owner-ro：读 secret 通过、写/删被拒、读路径完好"
+            except Exception as e:  # noqa: BLE001
+                last = _exc_text(e)
+                await asyncio.sleep(1.0)
+        logf.flush()
+        return False, (f"连接重试耗尽：{last} | 服务端日志："
+                       f"{_decode(Path(logpath).read_bytes())[-600:].replace(chr(10), ' / ')}")[:1200]
+    finally:
+        _terminate(proc)
+        logf.close()
+        try:
+            sample.unlink()
+        except OSError:
+            pass
+        for k, v in _proxy_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+try:
+    _ok_f2, _detail_f2 = asyncio.run(_readonly_e2e())
+except Exception as _e:  # noqa: BLE001
+    _ok_f2, _detail_f2 = False, _exc_text(_e)[:600]
+check("F2 /mcp/owner-ro 端到端（读全库 / 写与删被拒）", _ok_f2, _detail_f2)
 
 # =====================================================================
 section("G fail-fast 进程级验证（非回环 + 无白名单必须拒绝启动）")
@@ -401,7 +602,10 @@ async def _stdio_e2e() -> tuple[bool, str]:
                 await session.initialize()
                 tools = await session.list_tools()
                 n = len(tools.tools)
-                return n == 25, f"stdio 工具数={n}（期望 25）"
+                # 26 = 既有工具集（含 memory_commit）。这里的判据不是「数字是几」，
+                # 而是「HTTP 装配有没有偷偷改掉 stdio 的工具面」—— 数字跟着工具集
+                # 一起走，改工具时同步这一处即可。
+                return n == 26, f"stdio 工具数={n}（期望 26）"
 
 
 try:

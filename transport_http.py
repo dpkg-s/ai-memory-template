@@ -16,10 +16,36 @@
    实测部分客户端会据此**强行走 OAuth 发现流程且不回落**，而我们没有授权服务器
    ⇒ 直接踩死。鉴权一律做在外层（反向代理 / Tailscale / Cloudflare Access）。
    本模块因此**不暴露任何 auth 相关配置**。
+   —— 2026-10-25 追加：**权级分档不走 SDK auth，而是路径分档**（见下节）。
 3. **Host 校验绝不静默关闭**。监听非回环地址时，SDK 里的 Host / Origin 校验极易
    被误配成「放行一切」（``host=0.0.0.0`` 是典型触发条件，mcp 1.30.0 实测其
    ``transport_security`` 会退化为空）。本模块在非回环监听上**强制要求显式
    allowed_hosts**，并**拒绝关闭** DNS rebinding 防护，违规即 fail-fast。
+
+权级分档（2026-10-25，2026-10-26 加只读变体）
+---------------------------------------------
+`/mcp` 是 owner 全权端点，`/mcp/member`、`/mcp/guest` 各挂一个更低的读权级；
+`/mcp/reader`（2026-10-26 新增）只读共享档：能读 internal、不读 sensitive/secret、
+完全禁写。
+
+**2026-10-26 再加第二根轴：只读变体**。`/mcp/owner-ro` 与 `/mcp/member-ro` 表示
+「视野照旧、禁止一切写入」—— 此前读写能力是焊死在档位上的（owner 必能写、
+reader 必不能写），于是「全库可读、一字不许改」这个真实需求（别的设备上的
+分析客户端 / 只读镜像）在档位表里没有坐标。拆成两轴之后判据是：
+
+    实到写权 = 档位允许写 AND 本次请求允许写
+
+路径里带 `-ro` 就打上后者为假。`guest` / `reader` **不生成** `-ro` 变体 ——
+它们本来就只读，多一条等价路径只是多一个可绕过的口子。反过来 `owner-ro` 是
+`/mcp` 的严格子集，多这一条不会放宽任何东西。
+
+`ClearanceRouter` 把受限路径**改写**回 `streamable_http_path` 再转交 SDK，同时把
+（档位, 是否允许写）二元组写进 ``server.set_clearance`` 的两个 contextvar —— 因此：
+
+* 不需要改 mcp SDK、不需要改任何工具签名（已用 PoC 实测三条路径档位互不串味）；
+* 不需要客户端支持自定义 header（AstrBot 的 ``mcp_server.json`` 只有 url 字段，
+  改 URL 是它唯一确定支持的配置项）；
+* 未登记的路径**一律 404**，防止有人用别名绕过档位。
 
 环境变量
 --------
@@ -36,6 +62,9 @@
 ``AI_MEMORY_HTTP_STATELESS``        ``0``        1 则无状态（多副本 / 无会话保持）
 ``AI_MEMORY_HTTP_SESSION_IDLE_TIMEOUT``  ``1800`` 会话空闲超时（秒）
 ``AI_MEMORY_HTTP_MAX_SESSIONS``     ``10000``    并发会话上限
+``AI_MEMORY_HTTP_CLEARANCE_ROUTES`` ``member,guest,reader,member-ro,owner-ro``
+                                               受限端点后缀（``-ro`` = 只读变体）；
+                                               ``off`` 关闭分档，只剩 ``/mcp``
 ==================================  ===========  ==============================
 
 运行
@@ -114,6 +143,82 @@ def _dedup(items: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 权级分档：路径 → 档位
+# ---------------------------------------------------------------------------
+CLEARANCE_ROUTES_ENV = "AI_MEMORY_HTTP_CLEARANCE_ROUTES"
+#: 受限档位后缀的默认值。owner 是**路径本身**（`/mcp`），不需要也不允许后缀
+#: （否则会出来 `/mcp/owner` 这种与 `/mcp` 等价却多一条绕过口的路由）。
+#:
+#: ``reader``（2026-10-26 新增）是「只读共享档」：够得着 internal 内容，
+#: 够不着 sensitive / secret，且完全禁写。它排在 guest 与 member 之间，
+#: 存在的理由见 ``yaml_io.SECURITY_MIN_CLEARANCE`` 上方那段注释。
+DEFAULT_RESTRICTED_SUFFIXES = ("member", "guest", "reader", "member-ro", "owner-ro")
+_CLEARANCE_LEVELS = ("guest", "reader", "member", "owner")
+#: 关掉分档的写法。允许 "off" / "none" / "" 三种 —— 配置项写错时的默认必须是
+#: **保持分档**（fail-safe），所以只有明确写 off/none 才关。
+_ROUTES_OFF = {"off", "none", "0", "false"}
+#: 只读后缀（2026-10-26）。`member-ro` / `owner-ro` 表示「视野照旧，禁止写入」。
+_RO_SUFFIX = "-ro"
+#: 本来就只读的档位：不给它们生成 `-ro` 变体。多一条等价路径 = 多一个可绕过的
+#: 口子，而没有任何语义收益（reader-ro 与 reader 完全等价）。
+_INHERENTLY_READONLY = frozenset({"guest", "reader"})
+
+
+def clearance_routes(base_path: str, raw: str | None = None) -> dict[str, tuple[str, bool]]:
+    """构造 ``{路径: (视野, 是否允许写)}`` 路由表。纯函数，供 ``ClearanceRouter`` 与测试共用。
+
+    * ``base_path`` 恒等于 owner 可写档（``/mcp``）；
+    * 其余按 ``AI_MEMORY_HTTP_CLEARANCE_ROUTES`` 生成 ``<base>/<档位>``；
+      后缀带 ``-ro`` 表示只读。默认生成
+      ``member / guest / reader / member-ro / owner-ro``；写 ``off`` 关闭分档
+      （只剩 owner 端点）；
+    * 非法档位名一律**丢弃并告警**，不猜测、不静默映射到 owner —— 拼错一个字母
+      就变成全权端点，是这类配置最危险的失效模式；
+    * ``owner``（可写）不生成别名，但 ``owner-ro`` **要**生成：它是 `/mcp` 的
+      严格子集，多这一条不会放宽任何东西，而它正是「全库可读、一字不许改」
+      唯一的挂载点。与之相对，``guest-ro`` / ``reader-ro`` 一律丢弃 —— 它们与
+      基础档完全等价。
+
+    返回值里的布尔位刻意用「是否允许写」而非「是否只读」：判据在服务端是
+    ``if not writable: 拒绝``，与 ``server.current_writable()`` 的名词保持一致，
+    少一层取反就少一处取反写错的机会。
+    """
+    base = base_path or DEFAULT_PATH
+    if not base.startswith("/"):
+        base = "/" + base
+    routes: dict[str, tuple[str, bool]] = {base: ("owner", True)}
+
+    if raw is None:
+        raw = _env_str(CLEARANCE_ROUTES_ENV)
+    items = [x.strip().lower() for x in raw.split(",") if x.strip()] if raw else []
+    if not items:
+        items = list(DEFAULT_RESTRICTED_SUFFIXES)
+    if len(items) == 1 and items[0] in _ROUTES_OFF:
+        return routes
+
+    for suffix in items:
+        if suffix in _ROUTES_OFF:
+            continue
+        writable = not suffix.endswith(_RO_SUFFIX)
+        lvl = suffix[:-len(_RO_SUFFIX)] if not writable else suffix
+        if lvl not in _CLEARANCE_LEVELS:
+            logger.warning("忽略 %s 中无法识别的档位 %r（合法：guest / reader / member / owner，"
+                           "可选 -ro 后缀）", CLEARANCE_ROUTES_ENV, suffix)
+            continue
+        if lvl == "owner" and writable:
+            # owner 全权只能走 `/mcp` 本身，不额外开别名
+            logger.warning("忽略 %s 中的 owner 档位：全权端点只能是 %s 本身",
+                           CLEARANCE_ROUTES_ENV, base)
+            continue
+        if lvl in _INHERENTLY_READONLY and not writable:
+            logger.warning("忽略 %s 中的 %r：%s 档本身就是只读，无需 -ro 变体",
+                           CLEARANCE_ROUTES_ENV, suffix, lvl)
+            continue
+        routes[f"{base.rstrip('/')}/{suffix}"] = (lvl, writable)
+    return routes
+
+
+# ---------------------------------------------------------------------------
 # 纯函数：模式判定 + 安全设置
 # ---------------------------------------------------------------------------
 def transport_mode() -> str:
@@ -186,6 +291,69 @@ def build_security(
 # ---------------------------------------------------------------------------
 # 配置解析 / 应用 / 启动
 # ---------------------------------------------------------------------------
+class ClearanceRouter:
+    """ASGI 包装层：把 ``/mcp/<档>`` 改写回 ``/mcp`` 并设定该请求的读权级。
+
+    为什么是 ASGI 中间件而不是 MCP 中间件：``streamable_http_app()`` 返回的是标准
+    Starlette 应用，包一层即可，**完全不碰 SDK 内部**。工具实现那边只需要读一个
+    contextvar（``server.current_clearance``），签名与 MCP schema 都不变。
+
+    权级钩子**由入口注入**（``serve_http.py`` 传 ``server.set_clearance`` /
+    ``reset_clearance``），本模块不 import server —— 分层守卫（I6a/I9b）要求装配
+    层不得反向依赖主程序，而这条约束正是「server.py 零改动」的保障。没有注入钩
+    子却声明了受限档位时，``run()`` 会 fail-fast 而不是默默当 owner 放行。
+
+    三个必须守住的细节：
+
+    1. **路径要改写两份**：``scope["path"]`` 与 ``scope["raw_path"]`` 都得改。
+       Starlette 路由匹配用前者，但部分中间件会用后者，只改一个会出现「路由命中
+       但日志/校验对不上」的错位。
+    2. **contextvar 必须在 finally 里 reset**：泄漏一次的后果是「上一个请求的
+       member 档位粘到下一个 owner 请求上」或反之 —— 两个方向都不可接受。
+    3. **未登记路径返回 404 而不是 401/403**：401/403 会告诉扫描者「这里有个受保
+       护的端点」，而 404 什么也不说。
+    """
+
+    def __init__(self, inner, base: str = DEFAULT_PATH,
+                 routes: dict[str, tuple[str, bool]] | None = None,
+                 setter=None, resetter=None):
+        self.inner = inner
+        self.base = base if base.startswith("/") else "/" + base
+        self.routes = dict(routes or {self.base: ("owner", True)})
+        self._set = setter
+        self._reset = resetter
+
+    @property
+    def restricted(self) -> bool:
+        """除「owner 可写」端点外是否还有别的档位。"""
+        return any(not (lvl == "owner" and w) for lvl, w in self.routes.values())
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            spec = self.routes.get(path)
+            if spec is None and path.startswith(self.base):
+                await send({"type": "http.response.start", "status": 404,
+                            "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
+                await send({"type": "http.response.body", "body": b"not found"})
+                return
+            if spec is not None:
+                level, writable = spec
+                rewritten = dict(scope)
+                rewritten["path"] = self.base
+                rewritten["raw_path"] = self.base.encode()
+                if self._set is None:
+                    # 无钩子只能是 owner：带受限档位时 run() 已拒绝启动，走到这里
+                    # 说明有人手工构造了 router —— 保持不可被利用（不给低档位）。
+                    return await self.inner(rewritten, receive, send)
+                token = self._set(level, writable)
+                try:
+                    return await self.inner(rewritten, receive, send)
+                finally:
+                    self._reset(token)
+        return await self.inner(scope, receive, send)
+
+
 def config() -> dict:
     """从环境变量解析出完整配置（含全部校验）。stdio 模式返回最小字典。"""
     mode = transport_mode()
@@ -217,7 +385,20 @@ def config() -> dict:
         "session_idle_timeout": _env_int("AI_MEMORY_HTTP_SESSION_IDLE_TIMEOUT", 1800),
         "max_sessions": _env_int("AI_MEMORY_HTTP_MAX_SESSIONS", 10000),
         "security": security,
+        "clearance_routes": clearance_routes(path),
     }
+
+
+def _fmt_routes(routes: dict) -> str:
+    """把路由表渲染成 ``/mcp→owner、/mcp/reader→reader(ro)`` 一行人读摘要。
+
+    ``-ro`` 刻意显示成 ``(ro)`` 而不是把后缀原样重复一遍：路径里已经带了 ``-ro``，
+    日志里再写 ``/mcp/owner-ro→owner-ro`` 会让「路径」与「档位」两个概念糊成一片。
+    """
+    if not routes:
+        return "{}"
+    return "、".join(f"{p}→{lvl}{'' if w else '(ro)'}"
+                    for p, (lvl, w) in sorted(routes.items()))
 
 
 def describe(cfg: dict) -> str:
@@ -227,6 +408,7 @@ def describe(cfg: dict) -> str:
     sec = cfg["security"]
     return (
         f"streamable-http  http://{cfg['host']}:{cfg['port']}{cfg['path']}  "
+        f"clearance={_fmt_routes(cfg.get('clearance_routes') or {})}  "
         f"allowed_hosts={sec.allowed_hosts}  origins={sec.allowed_origins or '[]'}  "
         f"stateless={cfg['stateless']}")
 
@@ -246,11 +428,32 @@ def apply(mcp, cfg: dict | None = None) -> dict:
     return cfg
 
 
-def run(mcp) -> None:
+def _serve(app, *, host: str, port: int, log_level: str) -> None:
+    """起 uvicorn。抽成独立函数只为一件事：让测试能替换它。
+
+    直接 `uvicorn.run(...)` 会让「装配是否正确的单元测试」变成「真的起一个服务
+    并阻塞」—— 那既慢又不稳，还会占端口。测试注入替身即可断言装配结果。
+    """
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port, log_level=log_level)
+
+
+def run(mcp, clearance_hooks: tuple | None = None) -> None:
     """按 ``AI_MEMORY_TRANSPORT`` 启动 FastMCP。
 
     * stdio（默认）⇒ ``mcp.run()``，与加本模块之前**逐字节等价**。
-    * 其它 ⇒ 装配 HTTP 设置后 ``mcp.run(transport="streamable-http")``。
+    * 其它 ⇒ 装配 HTTP 设置，用 ``streamable_http_app()`` 拿到 Starlette 应用，
+      外面包一层 ``ClearanceRouter`` 再交给 uvicorn。
+
+    为什么不再用 ``mcp.run(transport="streamable-http")``：那条路会在内部直接
+    构造 app 并起 uvicorn，没有插入中间件的钩子。改成自建 app 后，行为与原来
+    等价（同一份 settings、同一个 session manager），只是多了路径分档。
+
+    ``clearance_hooks`` 是 ``(set_clearance, reset_clearance)`` 二元组，由入口
+    （``serve_http.py``）从 ``server`` 取来注入。**声明了受限档位却没给钩子 ⇒
+    直接拒绝启动**：那意味着所有档位的请求都会以 owner 身份执行，比不设分档更
+    危险 —— 表面上「已经隔离」，实际上全开放。
     """
     cfg = apply(mcp)
     if cfg["mode"] == "stdio":
@@ -258,8 +461,29 @@ def run(mcp) -> None:
         mcp.run()
         return
 
+    routes = cfg.get("clearance_routes") or {}
+    has_restricted = any(not (lvl == "owner" and w) for lvl, w in routes.values())
+    if has_restricted and not clearance_hooks:
+        raise TransportConfigError(
+            "已声明受限权级端点（"
+            + "、".join(sorted(p for p, (lvl, w) in routes.items()
+                              if not (lvl == "owner" and w)))
+            + "）但没有注入权级钩子。请用 serve_http.py 启动（它会把 server 的 "
+              "set_clearance / reset_clearance 传进来），或设 "
+            f"{CLEARANCE_ROUTES_ENV}=off 关闭分档。拒绝以「表面隔离、实际全权」"
+              "的方式启动。")
+
     logger.info("ai-memory 传输层：%s", describe(cfg))
+    if has_restricted:
+        logger.info("权级分档已启用：%s", _fmt_routes(routes))
+    else:
+        logger.info("权级分档未启用（只有 %s，owner 全权）", cfg["path"])
     logger.warning(
         "HTTP 模式未启用 SDK 层鉴权（这是刻意的）：请把鉴权做在外层 —— "
         "反向代理 / Tailscale / Cloudflare Access。切勿直接暴露到不可信网络。")
-    mcp.run(transport="streamable-http")
+
+    setter, resetter = clearance_hooks if clearance_hooks else (None, None)
+    app = ClearanceRouter(mcp.streamable_http_app(), base=cfg["path"], routes=routes,
+                          setter=setter, resetter=resetter)
+    _serve(app, host=cfg["host"], port=cfg["port"],
+           log_level=str(getattr(mcp.settings, "log_level", "INFO")).lower())

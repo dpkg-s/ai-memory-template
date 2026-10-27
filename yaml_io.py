@@ -39,6 +39,15 @@ __all__ = [
     "DEFAULT_SCOPE",
     "LIFECYCLE_STATUSES",
     "DEFAULT_STATUS",
+    "SECURITY_LEVELS",
+    "CLEARANCE_LEVELS",
+    "DEFAULT_SECURITY",
+    "DEFAULT_CLEARANCE",
+    "SECURITY_RANK",
+    "CLEARANCE_RANK",
+    "SECURITY_MIN_CLEARANCE",
+    "normalize_access",
+    "clearance_allows",
     "SCHEMA_VERSION",
 ]
 
@@ -79,9 +88,103 @@ DEFAULT_SCOPE = "global"
 LIFECYCLE_STATUSES = ("candidate", "active", "stale", "deprecated", "archived")
 DEFAULT_STATUS = "active"
 
-# frontmatter 结构版本：旧笔记缺失该字段时按 1 对待，被写入时升到 2。
+# ── 访问控制字段取值域（2026-10-25） ───────────────────────────────────────
+# 解决的是**另一维度**的问题：前面那些字段回答「这条记忆是什么」，这里回答
+# 「谁能读到它」。动机是 AstrBot（QQ 机器人）以无凭据方式直连 MCP，服务端
+# 认不出调用者，隔离只能靠 prompt 与插件剥工具（软限制）；一旦模型被话术
+# 绕过，私密记忆就会在群里被念出来。
+#
+# 两个字段刻意**正交**，不合并成一个：
+#   security  内容敏感度 —— 这条内容假设被读出去，后果有多重（审计 / 展示口径）
+#   clearance 读取门槛   —— 要读它，调用者至少得是哪一档（执行口径）
+# 合并会丢掉「很敏感但可以授权给某人」这一档，而那恰恰是最常见的真实需求。
+#
+# 二者不是自由组合：security 隐含一个**下限**（SECURITY_MIN_CLEARANCE），
+# 例如 secret 内容不可能允许 guest 读取。写入口用 normalize_access 统一收紧，
+# 防止出现「标记为绝密、门槛却是访客」的自相矛盾条目。
+#
+# ── 为什么 2026-10-26 增加第四档 reader ──────────────────────────────────
+# 原三档（guest / member / owner）表达不了一个真实且高频的需求：**给非本人设备
+# 只读共享整个库，但不给敏感条目**。原因是 internal 与 sensitive 当时共用
+# member 这一档 —— 「读得到 internal、读不到 sensitive」在档位上无从区分。
+#
+# 引入 reader 后：reader 够得着 internal（日常笔记的大头），够不着 sensitive
+# 与 secret；且受限端点一律只读。member / owner 的语义**完全不变**，因此对
+# 既有客户端（AstrBot 等）零影响。
+#
+# 副作用是存量条目：它们没有 clearance 字段，读取时按 security 的下限补默认，
+# 于是 529 条 internal 条目自动落到 reader —— 既不必批量改文件，也不会
+# 意外放行给 guest。
+SECURITY_LEVELS = ("public", "internal", "sensitive", "secret")
+CLEARANCE_LEVELS = ("guest", "reader", "member", "owner")
+DEFAULT_SECURITY = "internal"
+DEFAULT_CLEARANCE = "reader"
+
+SECURITY_RANK = {"public": 0, "internal": 1, "sensitive": 2, "secret": 3}
+CLEARANCE_RANK = {"guest": 0, "reader": 1, "member": 2, "owner": 3}
+
+# security ⇒ 允许的最低 clearance。public 给谁都行；internal 给 reader（只读
+# 共享档）；sensitive / secret 分别要 member / owner（sensitive 仍不作为单独
+# 档位，是「较敏感的 internal」，避免档位膨胀）。
+SECURITY_MIN_CLEARANCE = {
+    "public": "guest",
+    "internal": "reader",
+    "sensitive": "member",
+    "secret": "owner",
+}
+
+
+def normalize_access(security: str | None = None,
+                     clearance: str | None = None,
+                     *,
+                     prev_security: str | None = None,
+                     prev_clearance: str | None = None,
+                     ) -> tuple[str, str]:
+    """归一 ``(security, clearance)``，并保证二者不矛盾。
+
+    规则（按优先级）：
+      1. 非法或缺省 ⇒ 先回落到 prev（更新场景保留原值），再回落到模块默认；
+      2. 只给了 security ⇒ clearance 取该敏感度隐含的最低门槛；
+         只给了 clearance ⇒ 保留 prev security（没有则默认），但仍受下限约束；
+      3. 两者都给 ⇒ clearance 取 ``max(给定, 下限)`` —— **只收紧、不放宽**。
+
+    第 3 条是刻意的不对称：调用方若写「secret + guest」，静默接受就等于制造
+    一条看似公开的绝密记忆，比直接报错更危险；而自动收紧到 owner 至少不会
+    泄露。真正想放宽的调用方必须先改 security，语义因此始终自洽。
+    """
+    sec = security if security in SECURITY_LEVELS else None
+    clr = clearance if clearance in CLEARANCE_LEVELS else None
+    if sec is None:
+        sec = prev_security if prev_security in SECURITY_LEVELS else DEFAULT_SECURITY
+    if clr is None:
+        clr = prev_clearance if prev_clearance in CLEARANCE_LEVELS else None
+
+    floor = SECURITY_MIN_CLEARANCE[sec]
+    if clr is None:
+        clr = floor
+    elif CLEARANCE_RANK[clr] < CLEARANCE_RANK[floor]:
+        clr = floor
+    return sec, clr
+
+
+def clearance_allows(reader: str | None, required: str | None) -> bool:
+    """读权级 ``reader`` 是否达到条目要求的 ``required``。
+
+    两侧非法值一律按**最严**处理（reader 视作 guest、required 视作 owner），
+    使脏数据只会「读不到」，不会「误放行」。
+    """
+    r = CLEARANCE_RANK.get(reader or "", 0)
+    need = CLEARANCE_RANK.get(required or "", CLEARANCE_RANK["owner"])
+    return r >= need
+
+
+# frontmatter 结构版本：旧笔记缺失该字段时按 1 对待，被写入时升到当前版本。
 # 目的是给将来的结构迁移留下判定依据，而不是现在就要求全库迁移。
-SCHEMA_VERSION = 2
+#
+# v3（2026-10-25）：追加 security / clearance 两个访问控制字段。升版本号的
+# 代价是 memory_schema_diff 会把存量条目列进「缺 v3 键」清单 —— 这正是迁移
+# 清单本身，比「结构变了但版本号不动」要诚实。
+SCHEMA_VERSION = 3
 
 
 def strip_bom(text: str) -> str:
@@ -409,13 +512,14 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
                       status: str | None = None, supersedes: str | None = None,
                       conflicts: list[str] | None = None,
                       source_context: str | None = None,
+                      security: str | None = None, clearance: str | None = None,
                       permalink: str | None = None) -> str:
     """构造 frontmatter 文本（含 title/tags/created/updated/tier/access_count 等）。
 
-    P0 可信度字段（type/confidence/verified）与 P1 生命周期字段
-    （scope/status/schema_version）**总是写出**，非法或缺失值回落到模块级默认，
-    使新笔记自带完整语义标签；旧笔记则在下次被写入时渐进补齐（读取端的默认值
-    注入见 server._apply_meta_defaults）。
+    P0 可信度字段（type/confidence/verified）、P1 生命周期字段
+    （scope/status）与 P2 访问控制字段（security/clearance）**总是写出**，
+    非法或缺失值回落到模块级默认，使新笔记自带完整语义标签；旧笔记则在下次
+    被写入时渐进补齐（读取端的默认值注入见 server._apply_meta_defaults）。
 
     按需写出的字段（project / supersedes / conflicts / source_context）只在有值时
     出现，避免给绝大多数条目增加无意义的空行。
@@ -444,6 +548,12 @@ def build_frontmatter(title: str, tags: list[str], source: str | None, created: 
     if project:
         meta["project"] = project
     meta["status"] = status if status in LIFECYCLE_STATUSES else DEFAULT_STATUS
+    # v3 访问控制：**总是写出**（与 type/confidence 同口径）。它们是执行期
+    # 过滤的依据，缺失就只能靠读取端猜默认值 —— 而「猜」在权限场景里等于
+    # 一条潜在的放行路径，不如落盘写死。
+    _sec, _clr = normalize_access(security, clearance)
+    meta["security"] = _sec
+    meta["clearance"] = _clr
     meta["schema_version"] = SCHEMA_VERSION
     if supersedes:
         meta["supersedes"] = supersedes

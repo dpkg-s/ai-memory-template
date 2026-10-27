@@ -87,7 +87,7 @@ from pathlib import Path
 # 常量
 # --------------------------------------------------------------------------
 
-SETUP_VERSION = "1.4.0"
+SETUP_VERSION = "1.5.0"
 REPO_SLUG = "dpkg-s/ai-memory-template"
 REPO_URL = f"https://github.com/{REPO_SLUG}"
 MCP_REQUIREMENT = "mcp>=1.30,<2"
@@ -133,6 +133,34 @@ DEFAULT_MIRRORS = [
 ]
 
 UA = f"ai-memory-setup/{SETUP_VERSION}"
+
+# --------------------------------------------------------------------------
+# 子进程
+# --------------------------------------------------------------------------
+
+# GUI 安装器以 console=False 打包，进程本身没有控制台。这种环境下每次
+# subprocess.run 都会**新建一个黑色控制台窗口并抢焦点**（git clone、pip
+# install 尤其明显）。统一走 _run_child，强制隐藏窗口。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+
+
+def _hidden_startupinfo():
+    """STARTUPINFO 兜底：个别打包环境下仅靠 creationflags 不够。"""
+    if os.name != "nt":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    return si
+
+
+def _run_child(cmd, **kwargs):
+    """调用外部命令，且绝不在 Windows 上弹出控制台窗口。"""
+    if os.name == "nt":
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | _NO_WINDOW
+        kwargs.setdefault("startupinfo", _hidden_startupinfo())
+    return subprocess.run(cmd, **kwargs)
+
 
 
 # --------------------------------------------------------------------------
@@ -421,7 +449,7 @@ def _tags_from_git(quiet: bool = False) -> list[str]:
     if shutil.which("git") is None:
         return []
     try:
-        r = subprocess.run(["git", "ls-remote", "--tags", "--refs", f"{REPO_URL}.git"],
+        r = _run_child(["git", "ls-remote", "--tags", "--refs", f"{REPO_URL}.git"],
                            capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             return []
@@ -513,7 +541,7 @@ def source_from_git(url: str, ref: str | None) -> Source:
         if ref:
             cmd += ["--branch", ref]
         cmd += [url, str(tmpdir / "repo")]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        proc = _run_child(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip().splitlines()[-1] if proc.stderr else "git clone 失败")
         repo = tmpdir / "repo"
@@ -525,7 +553,7 @@ def source_from_git(url: str, ref: str | None) -> Source:
         if ref and ref[:1] in ("v", "V") and parse_version(ref):
             ver = ref[1:]
         try:
-            d = subprocess.run(["git", "-C", str(repo), "describe", "--tags", "--abbrev=0"],
+            d = _run_child(["git", "-C", str(repo), "describe", "--tags", "--abbrev=0"],
                                capture_output=True, text=True, timeout=30)
             if d.returncode == 0 and d.stdout.strip():
                 ver = d.stdout.strip().lstrip("v")
@@ -779,7 +807,7 @@ def is_frozen() -> bool:
 
 def python_has_mcp(python: str) -> bool:
     try:
-        r = subprocess.run([python, "-c", "import mcp, sys; sys.exit(0)"],
+        r = _run_child([python, "-c", "import mcp, sys; sys.exit(0)"],
                            capture_output=True, timeout=60)
         return r.returncode == 0
     except Exception:
@@ -1371,7 +1399,7 @@ def do_check(args) -> int:
     py = find_python()
     if py:
         try:
-            v = subprocess.run([py, "--version"], capture_output=True, text=True, timeout=30)
+            v = _run_child([py, "--version"], capture_output=True, text=True, timeout=30)
             ok(f"Python: {(v.stdout or v.stderr).strip()}  ({py})")
         except Exception as e:
             warn(f"Python 调用异常：{e}")
@@ -1482,7 +1510,7 @@ def _ensure_pip(py: str | None, args) -> None:
         ok(f"mcp 包已就绪（{MCP_REQUIREMENT}）")
         return
     note(f"安装依赖 {MCP_REQUIREMENT} …")
-    r = subprocess.run([py, "-m", "pip", "install", MCP_REQUIREMENT],
+    r = _run_child([py, "-m", "pip", "install", MCP_REQUIREMENT],
                        capture_output=True, text=True)
     if r.returncode == 0:
         ok("mcp 安装完成")

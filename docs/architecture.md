@@ -53,7 +53,7 @@ ai-memory-template/
 ├── CHANGELOG.md             # 版本变更记录
 ├── LICENSE                  # MIT
 │
-├── server.py                # MCP 服务端：25 个工具注册 + 存储层 + 业务逻辑（stdio 入口）
+├── server.py                # MCP 服务端：26 个工具注册 + 存储层 + 业务逻辑（stdio 入口）
 ├── serve_http.py            # 可选：Streamable HTTP 入口（主程序零改动的 HTTP 装配）
 ├── transport_http.py        # HTTP 传输层：环境变量解析 + Host 校验 fail-fast（只依赖 mcp）
 ├── web-console/             # 🔗 submodule → ai-memory-web：Web 控制台（前端 + 后端一体）

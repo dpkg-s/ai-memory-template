@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""25 个 MCP 工具全量冒烟测试。
+"""26 个 MCP 工具全量冒烟测试。
 
 用途:
     确认 server.py 的**全部** MCP 工具都能被正常调用且不抛异常。与
     test_roundtrip.py 分工互补:
       - test_roundtrip.py 验证「语义正确性」(frontmatter 写读无损、反斜杠
         不雪崩、read 不污染 updated、SQLite 索引自愈等)
-      - 本脚本验证「覆盖面」(25 个工具一个不漏、全部可调用)
+      - 本脚本验证「覆盖面」(26 个工具一个不漏、全部可调用)
     两者结合才能支撑 server.py 的安全重构（P3 模块化即以此护航）。
 
     脚本把 AI_MEMORY_DIR 指向临时目录, 绝不触碰真实记忆库。
@@ -158,6 +158,9 @@ EXPECTED_TOOLS = {
     # memory_config，两仓之间只剩「连接」。注册名 memory_config，Python 函数名
     # 为 _memory_config_tool（避免遮蔽同名模块，见 server.py 该处注释）。
     "memory_config",
+    # 2026-10-25：统一写入口（core 侧后加）—— 带当日时间线条目与项目状态行同步，
+    # 语义上属内容读写；此前本表未同步，导致「工具总数 = 25」恒红。
+    "memory_commit",
 }
 # A1 (2026-09-17) 行为标注：MCP 规范里 destructiveHint / openWorldHint 默认都是
 # True，漏标会让客户端把普通 upsert 也当成需二次确认的破坏性操作，并误以为工具
@@ -176,11 +179,12 @@ EXPECTED_DESTRUCTIVE = {
 # 非幂等（重复调用语义不同或有额外副作用）：
 #   memory_restore —— 从 .archive 移回后再次调用，目标位置可能已被新条目占用；
 #   memory_restart —— 每调用一次就真的再换一次进程，重复调用有真实副作用。
-EXPECTED_NONIDEM = {"memory_restore", "memory_restart"}
+#   memory_commit — 重复提交会替换当日时间线条目而非追加，语义非幂等。
+EXPECTED_NONIDEM = {"memory_restore", "memory_restart", "memory_commit"}
 try:
     tools = asyncio.run(server.mcp.list_tools())
     registered = {t.name for t in tools}
-    check("工具总数 = 25", len(registered) == 25, f"实际 {len(registered)}: {sorted(registered)}")
+    check("工具总数 = 26", len(registered) == 26, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
 

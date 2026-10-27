@@ -123,10 +123,14 @@ def module_files() -> list[Path]:
     （GUI 冒烟、截图取证、虚拟时间动画逐帧比对），只在开发机存在、从不入库。
     此前一律计入「磁盘模块」，导致本机跑 I0a 恒红（实测多出 52 项），而干净
     检出下是绿的 —— 一条本机永远红、CI 永远绿的判据等于没有判据。
+
+    `_mock_*.py`（2026-10-25）：FNS 联调用的本地假服务，同样是一次性、不入库。
+    漏了这条前缀 ⇒ 本机 I0a 恒报「多=['_mock_fns']」，与上面是同一类失效。
     """
     return sorted(
         p for p in ROOT.glob("*.py")
-        if not (p.name.startswith("_probe_") or p.name.startswith("_v3_"))
+        if not (p.name.startswith("_probe_") or p.name.startswith("_v3_")
+                or p.name.startswith("_mock_"))
     )
 
 

@@ -77,8 +77,9 @@ server.memory_write("范围_默认值", "这是一条普通记忆。", tags=["sc
 _m1, _b1 = load_meta("范围_默认值")
 check("S1a scope 默认落盘为 global", _m1.get("scope") == "global", f"scope={_m1.get('scope')}")
 check("S1b status 默认落盘为 active", _m1.get("status") == "active", f"status={_m1.get('status')}")
-check("S1c schema_version 落盘为 2",
-      _m1.get("schema_version") == 2, f"v={_m1.get('schema_version')}")
+check(f"S1c schema_version 落盘为当前版本 {server.SCHEMA_VERSION}",
+      _m1.get("schema_version") == server.SCHEMA_VERSION,
+      f"v={_m1.get('schema_version')}")
 check("S1d project 未指定时不写出该字段", "project" not in _m1)
 check("S1e supersedes / conflicts 未指定时不写出",
       "supersedes" not in _m1 and "conflicts" not in _m1)
@@ -147,7 +148,8 @@ check("S5d conflicts 列表已写入", _m5.get("conflicts") == ["范围_项目�
 check("S5e scope/project 已改写", _m5.get("scope") == "project" and _m5.get("project") == "项目C")
 check("S5f source_context 已写入", _m5.get("source_context") == "manual")
 check("S5g 正文未被改写（只动元数据）", "普通记忆" in _b5, f"body={_b5[:40]!r}")
-check("S5h schema_version 升为 2", _m5.get("schema_version") == 2)
+check(f"S5h schema_version 升为当前版本 {server.SCHEMA_VERSION}",
+      _m5.get("schema_version") == server.SCHEMA_VERSION)
 
 server.memory_update_metadata("范围_默认值", supersedes="", conflicts=[],
                               project="", source_context="")
@@ -256,7 +258,8 @@ _stats = server.memory_stats()
 check("S10a stats 含作用域分布", "作用域分布" in _stats and "project:" in _stats)
 check("S10b stats 含生命周期分布", "生命周期分布" in _stats and "archived:" in _stats)
 check("S10c stats 含写入方上下文分布", "写入方上下文分布" in _stats and "workbuddy" in _stats)
-check("S10d stats 含结构版本分布", "frontmatter 结构版本" in _stats and "v2:" in _stats)
+check("S10d stats 含结构版本分布",
+      "frontmatter 结构版本" in _stats and f"v{server.SCHEMA_VERSION}:" in _stats)
 check("S10e stats 含项目分布", "项目A" in _stats)
 
 server.memory_write("范围_审计对象", "审计测试。", scope="project")  # 故意缺 project

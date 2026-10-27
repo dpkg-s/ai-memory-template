@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS entries (
     access_count INTEGER NOT NULL DEFAULT 0,
     summary      TEXT,
     permalink    TEXT,               -- A3: 稳定标识（首次写入冻结），文件改名后仍可定位
+    type         TEXT,               -- P0: 记忆类型（缺省视为 fact）
+    scope        TEXT,               -- P0: 作用域 global / project
+    project      TEXT,               -- P1: 项目名（仅 scope=project 时有值）
+    status       TEXT,               -- P1: 生命周期 active / stale / ...
+    confidence   TEXT,               -- P0: 可信度 high / medium / low
+    verified     INTEGER,            -- P0: 是否核验 0/1（布尔存整数）
     size         INTEGER NOT NULL DEFAULT 0,
     mtime        REAL NOT NULL DEFAULT 0
 );
@@ -48,7 +54,30 @@ CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title);
 CREATE INDEX IF NOT EXISTS idx_entries_stem ON entries(stem);
 CREATE INDEX IF NOT EXISTS idx_entries_tier ON entries(tier);
 """
-# ⚠️ permalink 的索引**刻意不写在这里**，见 _migrate 的说明。
+# ⚠️ permalink 与下面 _RETRIEVAL_COLS 里各列的索引**一律刻意不写在本 SCHEMA 中**，
+#    理由见 _migrate 的说明：旧库表已存在且缺列，SCHEMA 内的 CREATE INDEX 会抛
+#    `no such column` 并打断整个 executescript，连补列的机会都没有。
+
+# 检索过滤列（2026-10-23 新增）。`memory_search` / `memory_list` 的
+# mem_type / scope / project / status 过滤原先只能「读完正文再判断」——
+# 索引表根本没有这些列。补进表后，检索可以先用元数据把候选池缩小，
+# 再对剩余候选读正文，避免每次全库 2.84 MB 的扇入扫描。
+_RETRIEVAL_COLS: tuple[tuple[str, str], ...] = (
+    ("type", "TEXT"),
+    ("scope", "TEXT"),
+    ("project", "TEXT"),
+    ("status", "TEXT"),
+    ("confidence", "TEXT"),
+    ("verified", "INTEGER"),
+)
+
+# 只有会被 WHERE 命中的列才建索引。confidence / verified 选择度过低，建了反而
+# 增加写放大，故不建。
+_RETRIEVAL_IDX: frozenset[str] = frozenset({"type", "scope", "status", "project"})
+
+# 与 yaml_io.DEFAULT_MEMORY_TYPE 保持一致。此处内联而非 import，是为了让索引层
+# 保持「零业务依赖」——它只镜像字段，不参与 frontmatter 语义判断。
+_DEFAULT_TYPE = "fact"
 
 
 def db_path(state_dir: Path, memory_dir: Path) -> Path:
@@ -98,6 +127,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     except sqlite3.Error:
         pass
 
+    # 检索过滤列（2026-10-23）：逐列独立 try —— 某一列补失败不应拖累其余列，
+    # 也不能让异常冒到 connect() 外面（否则整个索引层降级成「只剩全库回退」）。
+    # 补完一列立刻建该列索引，理由同 permalink：索引必须在列存在之后才能建。
+    for name, decl in _RETRIEVAL_COLS:
+        try:
+            if name not in cols:
+                conn.execute(f"ALTER TABLE entries ADD COLUMN {name} {decl}")
+            if name in _RETRIEVAL_IDX:
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_entries_{name} ON entries({name})")
+        except sqlite3.Error:
+            continue
+
 
 def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str, Any]:
     """把 frontmatter meta + 文件状态合成一行 (不读正文)."""
@@ -125,6 +167,14 @@ def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str,
         "access_count": meta.get("access_count") if isinstance(meta.get("access_count"), int) else 0,
         "summary": str(meta.get("summary") or ""),
         "permalink": str(meta.get("permalink") or ""),
+        # 检索过滤列。`_load_memory` 经 `_apply_meta_defaults` 后通常已带默认值，
+        # 但 meta_to_row 也会被测试直接调用，故这里仍兜一层。
+        "type": str(meta.get("type") or _DEFAULT_TYPE),
+        "scope": str(meta.get("scope") or ""),
+        "project": str(meta.get("project") or ""),
+        "status": str(meta.get("status") or ""),
+        "confidence": str(meta.get("confidence") or ""),
+        "verified": 1 if meta.get("verified") else 0,
         "size": size,
         "mtime": mtime,
     }
@@ -133,15 +183,22 @@ def meta_to_row(memory_dir: Path, path: Path, meta: dict[str, Any]) -> dict[str,
 def upsert(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     conn.execute(
         """INSERT INTO entries(relpath, title, stem, tags, tier, created, updated,
-                              source, version, access_count, summary, permalink, size, mtime)
+                              source, version, access_count, summary, permalink,
+                              type, scope, project, status, confidence, verified,
+                              size, mtime)
            VALUES(:relpath,:title,:stem,:tags,:tier,:created,:updated,
-                  :source,:version,:access_count,:summary,:permalink,:size,:mtime)
+                  :source,:version,:access_count,:summary,:permalink,
+                  :type,:scope,:project,:status,:confidence,:verified,
+                  :size,:mtime)
            ON CONFLICT(relpath) DO UPDATE SET
              title=excluded.title, stem=excluded.stem, tags=excluded.tags,
              tier=excluded.tier, created=excluded.created, updated=excluded.updated,
              source=excluded.source, version=excluded.version,
              access_count=excluded.access_count, summary=excluded.summary,
              permalink=excluded.permalink,
+             type=excluded.type, scope=excluded.scope, project=excluded.project,
+             status=excluded.status, confidence=excluded.confidence,
+             verified=excluded.verified,
              size=excluded.size, mtime=excluded.mtime""",
         row,
     )
@@ -166,6 +223,66 @@ def find(conn: sqlite3.Connection, title_or_stem: str) -> list[sqlite3.Row]:
 
 def iter_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM entries ORDER BY updated DESC").fetchall()
+
+
+def candidates(conn: sqlite3.Connection, *, mem_type: str | None = None,
+               scope: str | None = None, project: str | None = None,
+               status: str | None = None, tier: str | None = None,
+               tag: str | None = None,
+               include_archived: bool = False,
+               null_is_candidate: bool = True) -> list[sqlite3.Row]:
+    """按 frontmatter 元数据预筛候选行 —— 供检索做「过滤前置」，全程不碰磁盘。
+
+    这是「先筛后读」的入口：调用方拿到 relpath 列表后，只对这批候选读正文，
+    不再全库扫。相比现状（先 `_load_memory` 全库、再判断 tag/scope/project），
+    带任一过滤条件的查询可把 IO 砍掉大半。
+
+    ⚠️ 三处刻意保守，调用方必须知悉：
+
+    1. `null_is_candidate=True`（默认）时，**该列为 NULL 或空串的行一律保留为
+       候选**。索引是缓存，旧行可能尚未回填；若据「缺失」做排除，会静默吞掉
+       真实命中（比慢更糟）。索引全部回填后可传 False 收紧。
+    2. `tag` 用 `LIKE '%"tag"%'` 粗筛。tags 列是 JSON 数组，这个模式能命中
+       带引号的元素，但也可能命中子串（`"mcp"` 会匹配 `"mcp-extra"`）——
+       调用方**仍须用真实 tag 列表做一次精确判定**。
+    3. 未指定 `status` 时默认排除 `archived`（与 `memory_search` 默认语义一致），
+       但 NULL 状态不在此列 —— `COALESCE(status,'') != 'archived'` 会把未知
+       状态保留下来。
+
+    排序为 `updated DESC`，与 `memory_search` 的 recent-first 同向；调用方若要
+    再排序（如按 tier / access_count），自行重排即可。
+    """
+    sql = ["SELECT * FROM entries WHERE 1=1"]
+    args: list[Any] = []
+
+    def _eq(col: str, value: str) -> None:
+        """精确匹配；保守模式下把 NULL/空串也算作候选（未知≠不匹配）。"""
+        if null_is_candidate:
+            sql.append(f"AND ({col} = ? OR {col} IS NULL OR {col} = '')")
+        else:
+            sql.append(f"AND {col} = ?")
+        args.append(value)
+
+    if mem_type:
+        # type 缺省按 fact 处理（与 server 的 DEFAULT_MEMORY_TYPE 一致），
+        # 故用 COALESCE 补齐后再比，不需要"未知即保留"。
+        sql.append("AND COALESCE(type, ?) = ?")
+        args.extend([_DEFAULT_TYPE, mem_type])
+    if scope:
+        _eq("scope", scope)
+    if project:
+        _eq("project", project)
+    if tier:
+        _eq("tier", tier)
+    if status and status != "any":
+        _eq("status", status)
+    elif not include_archived:
+        sql.append("AND COALESCE(status, '') != 'archived'")
+    if tag:
+        sql.append("AND tags LIKE ?")
+        args.append(f'%"{tag}"%')
+    sql.append("ORDER BY updated DESC")
+    return conn.execute(" ".join(sql), args).fetchall()
 
 
 def rebuild(conn: sqlite3.Connection, memory_dir: Path, loader) -> int:

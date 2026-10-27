@@ -53,4 +53,8 @@ import server  # noqa: E402  （聚合器，必须最后 import）
 
 
 if __name__ == "__main__":
-    transport_http.run(server.mcp)
+    # 权级钩子由入口注入：transport_http 属装配层，不允许反向 import server
+    # （分层守卫 I6a/I9b），而 contextvar 的写入口在 server 侧。入口是唯一同时
+    # 认识两者的地方 —— 这也是「server.py 零改动」能一直成立的原因。
+    transport_http.run(server.mcp,
+                       clearance_hooks=(server.set_clearance, server.reset_clearance))

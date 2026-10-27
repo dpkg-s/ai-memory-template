@@ -1,6 +1,6 @@
 > 本页由仓库主页拆分而来，内容与拆分前逐字一致。返回 [主页](../README.md)。
 
-# 25 个工具速查
+# 26 个工具速查
 
 > 带 `output_format` 的四个只读工具（`memory_read` / `memory_list` / `memory_recent` / `memory_orphans`）可传 `output_format="json"` 拿到结构化输出，详见[脚本化调用](#脚本化调用可选-json-输出)。
 
@@ -8,10 +8,11 @@
 
 | 工具 | 签名 | 说明 |
 |------|------|------|
-| `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁、可信度与作用域/生命周期标记 |
+| `memory_write` | `(title, content, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, security?, clearance?, expected_version?)` | 写入或更新。自动标签 + 自动归档；同标题 upsert；支持乐观锁、可信度、作用域/生命周期标记与访问控制两字段 |
+| `memory_commit` | `(title, content, timeline_summary?, project_name?, project_status?, project_focus?, tags?, source?, summary?, tier?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, security?, clearance?, expected_version?, duplicate_reviewed?)` | 标准提交入口：写前查重；同名更新要求读取并携带版本；项目提交同步「近期工作动态」当日项与「项目状态」表，支持安全重试 |
 | `memory_read` | `(title, max_chars=None, output_format=None)` | 按标题精确读取（含文件名回退，含 `permalink` 与文件名 stem 回退，可命中 `.archive`）。`max_chars` 省略时取 `memory.toml` 的 `body_truncate_chars`（内置 8000），`0` = 取全文；`output_format="json"` 可拿结构化输出 |
 | `memory_delete` | `(title, trash=True, purge=False, empty_trash=False)` | 删除。默认软删到 `.trash/` 可恢复，`purge=True` 永久删除，`empty_trash=True` 清空回收站 |
-| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?)` | 只改 frontmatter 元数据（含可信度、作用域、生命周期字段），不重写正文。传空串 / 空列表可清除 |
+| `memory_update_metadata` | `(title, tier?, tags?, summary?, source?, mem_type?, confidence?, verified?, scope?, project?, status?, supersedes?, conflicts?, source_context?, security?, clearance?)` | 只改 frontmatter 元数据（含可信度、作用域、生命周期与访问控制字段），不重写正文。传空串 / 空列表可清除 |
 | `memory_recent` | `(days=7, limit=20, output_format=None)` | 列出近 N 天更新的记忆，最新优先 |
 
 ### 查询
@@ -48,5 +49,39 @@
 | `memory_schema_diff()` | **结构对账（只读）**：把「写入端承诺写出什么」与「磁盘上实际有什么」对照。契约来源就是代码（`yaml_io.build_frontmatter` 是唯一写出源），不另立 schema 文件。键分三层 —— core（`title`/`tags`/`created`/`updated`/`tier`/`access_count`，缺失即真实缺陷）/ v2（`type`/`confidence`/`verified`/`scope`/`status`/`schema_version`，v1 存量缺属预期）/ opt（按需写出）。输出六节：核心键缺失 / v2 缺键 / v1 迁移清单 / 未知键（附行号）/ 可选键使用率 / **无 frontmatter 文件**（普通 Markdown 不受结构契约约束，单列且不计入缺陷数） |
 | `memory_index_draft()` | 自动生成记忆索引草稿（不回写，需人工确认） |
 | `memory_rebuild_links()` | 只读校验：扫描正文双链，报告死链与计数，不修改文件 |
+
+---
+
+### 访问控制（v3，2026-10-25；2026-10-26 加只读端点）
+
+两条互不相同的轴，**故意不合并成一个字段**：
+
+| 字段 | 取值 | 含义 |
+|------|------|------|
+| `security` | `public` / `internal`（默认）/ `sensitive` / `secret` | 内容本身多敏感，用于审计与展示 |
+| `clearance` | `guest` / `reader`（默认）/ `member` / `owner` | 读它所需的最低权级 |
+
+两者只收紧不放宽：`security=secret` 隐含 `clearance>=owner`，传 `secret + guest` 会被自动抬到 `owner`。
+
+**权级从哪来**：HTTP 端点路径决定，不由调用方自报 ——
+
+| 端点 | 视野 | 能读什么 | 能写吗 |
+|------|------|----------|--------|
+| `/mcp` | owner | 全部 | 能 |
+| `/mcp/owner-ro` | owner | 全部 | **不能** |
+| `/mcp/member` | member | `public` + `internal` + `sensitive` | 能写普通条目 |
+| `/mcp/member-ro` | member | 同上 | 不能 |
+| `/mcp/reader` | reader | `public` + `internal` | 不能 |
+| `/mcp/guest` | guest | 只有 `public` | 不能 |
+
+**读写能力是与视野正交的第二根轴**（2026-10-26）。此前它焊死在档位上 —— owner 必能写、reader 必不能写，于是「全库可读、一字不许改」这个需求没有坐标。现在判据是：
+
+    实到写权 = 档位允许写 AND 本次端点允许写
+
+所以 `owner-ro` 是「读得和主人一样全、写权和访客一样没有」，正好给别的设备上的分析客户端 / 只读镜像用。`guest` / `reader` 不提供 `-ro` 变体（它们本来就只读，多一条等价路径只是多一个可绕过的口子）。`AI_MEMORY_HTTP_CLEARANCE_ROUTES` 可自定义生成哪些端点，写 `off` 则只剩 `/mcp`。
+
+stdio（本机 `python server.py`）恒为 owner 且可写，行为与改动前完全一致。受限端点上越权读取返回的**与「条目不存在」逐字节同构**（不给 403、不说「权限不足」），图谱 / 索引 / 孤立清单也一并按标题过滤 —— 否则光列标题就泄了。
+
+写侧的拒绝语则**明说**「该端点为只读」：调用方本来就是从 `-ro` 端点进来的，这句话不泄露任何它尚未知道的信息，而且能让人一眼分清「选错了身份」还是「选错了端点」。
 
 ---

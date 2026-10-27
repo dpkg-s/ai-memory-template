@@ -41,6 +41,13 @@ C_ACTIVE = "#0b5cad"
 VER_LOADING = "（正在获取版本列表…）"
 VER_NO_NET = "最新（远端不可达，无法选版本）"
 
+# 底栏那个「跳过安装、直接接入」按钮的文案。检测中会临时换成别的字，
+# 所以放在模块级：两处（常态 / 复位）必须用同一份，不能各写一遍。
+# 文案刻意与第 ⑤ 步同名 —— 它做的正是"跳到那一步"，不加"跳过安装"之类的解释性
+# 前缀（那是按钮状态的职责，见 _refresh_skip_btn），否则一行字塞两件事。
+SKIP_LABEL = "接入 AI 工具"
+SKIP_BUSY_LABEL = "检测中…"
+
 
 # --------------------------------------------------------------------------
 # 关于「带参数启动」
@@ -80,6 +87,138 @@ class _QueueStream:
 
 
 # --------------------------------------------------------------------------
+# 「已经装过」的识别 —— 给第 ① 步的「已装过？直接接入 AI」用
+# --------------------------------------------------------------------------
+# 目的：本机明明已经装好了程序，用户却被逼着重走一遍「选库 → 定本体 → 附加组件
+# → 确认」。这四步的产物在磁盘上早就存在，正确的动作只有第 ⑤ 步：把已有的
+# 程序写进 AI 工具的 MCP 配置。
+#
+# 判据用逻辑层现成的 ``core.verify_install``（纯离线、不打印、不写盘），
+# 不另造一套"看起来装了"的启发式 —— 两套判据必然会在某天给出互相矛盾的答案。
+
+# 可跳过性排序：完好 > 记录与文件不一致 > 有程序无安装记录
+_SKIP_RANK = {core.VERIFY_OK: 3, core.VERIFY_DRIFT: 2, core.VERIFY_PARTIAL: 1}
+
+
+def _path_key(p) -> str:
+    """路径去重键。Windows 上大小写不敏感，全小写归一后再比。"""
+    try:
+        return str(Path(p)).replace("\\", "/").rstrip("/").lower()
+    except (TypeError, ValueError):
+        return ""
+
+
+def installed_candidates(seed: Path | None = None) -> list[Path]:
+    """收集「可能装着程序本体」的目录（含 server.py 或安装记录的那个）。
+
+    来源与 ``setup_vault`` 的候选一致（环境变量 / 安装元数据 / 客户端配置反推 /
+    上次使用 / 默认路径 / 盘符浅扫），再各加两种常见落法：``<库>/ai-memory``
+    与库根本身 —— 两者都出现过（有人把程序直接装在库根）。
+    """
+    seen: dict[str, None] = {}
+    order: list[Path] = []
+
+    def add(p) -> None:
+        if not p:
+            return
+        try:
+            pp = Path(p)
+        except (TypeError, ValueError):
+            return
+        k = _path_key(pp)
+        if k and k not in seen:
+            seen[k] = None
+            order.append(pp)
+
+    add(seed)
+    try:
+        import setup_vault as vault
+
+        cur = vault.get_current()
+        if cur:
+            add(cur)
+            add(Path(cur) / "ai-memory")
+        for v in vault.scan(seed):
+            add(v.path / "ai-memory")
+            add(v.path)
+    except Exception:
+        # 候选收集失败不该让按钮整体失效：至少 seed 与默认路径还在
+        pass
+    add(core.default_install_dir())
+    return order
+
+
+def _data_dir_for(vf: dict, install: Path) -> Path:
+    """反推库目录：安装记录 > 往上找带「记忆索引.md」的那一层 > 本体目录。
+
+    为什么不能拿「目录里有 md 文件」当判据：程序目录本身就带 README.md /
+    CHANGELOG.md / rules/*.md，实测把 ``D:\\ai记忆\\ai-memory`` 自己认成了库
+    （真库是它的父目录）。``记忆索引.md`` 是模板播种的固定产物，才是硬信号。
+    """
+    dd = vf.get("data_dir")
+    if dd:
+        try:
+            if Path(dd).is_dir():
+                return Path(dd)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        import setup_vault as vault
+
+        mark = vault.INDEX_MARK
+        up: Path | None = install
+        for _ in range(3):          # 本体自己 / 父目录 / 祖父目录，再往上就是瞎猜
+            if up is None:
+                break
+            try:
+                if (up / mark).is_file():
+                    return up
+            except OSError:
+                pass
+            up = up.parent if up.parent != up else None
+    except Exception:
+        pass
+    return install
+
+
+def find_installed(seed: Path | None = None) -> dict:
+    """找本机「已装好、可以直接接入 AI」的实例。纯离线、不弹窗、不写盘。
+
+    只认**程序文件真的在**的实例：``server.py`` 都不在了还把它写进客户端配置，
+    只会让 MCP 启动失败，而错误要拖到用户下次开客户端才暴露 —— 那种情况
+    必须回第 ④ 步重装，不能跳过。这类"有记录没程序"的目录单独报给界面。
+
+    返回 ``{"found": {install, data, vf} | {}, "broken": [路径…], "scanned": n}``。
+    """
+    cands = installed_candidates(seed)
+    best: dict = {}
+    best_key: tuple = ()
+    broken: list[str] = []
+    for c in cands:
+        try:
+            vf = core.verify_install(c)
+        except Exception:
+            continue
+        state = vf.get("state", core.VERIFY_NONE)
+        if state == core.VERIFY_NONE:
+            continue
+        if not vf.get("has_program"):
+            broken.append(str(c))
+            continue
+        key = (
+            _SKIP_RANK.get(state, 0),
+            1 if vf.get("integrity_checked", True) else 0,
+            core.parse_version(vf.get("version") or ""),
+        )
+        if not best or key > best_key:
+            best_key = key
+            best = {"install": str(c), "data": str(_data_dir_for(vf, c)), "vf": vf}
+    return {"found": best, "broken": broken, "scanned": len(cands)}
+
+
+
+# --------------------------------------------------------------------------
 # 主界面
 # --------------------------------------------------------------------------
 
@@ -96,6 +235,8 @@ class SetupApp:
         self.env: dict = {}
         self.auto_argv = list(auto_argv) if auto_argv else None
         self._closing = False
+        self.detect_busy = False
+        self.busy = False
 
         root.title(APP_TITLE)
         root.minsize(760, 720)
@@ -190,6 +331,8 @@ class SetupApp:
                     self._on_link_scan(payload)
                 elif kind == "link_apply":
                     self._on_link_applied(payload)
+                elif kind == "installed":
+                    self._on_installed(payload)
         except queue.Empty:
             pass
         self.root.after(80, self._drain)
@@ -293,8 +436,14 @@ class SetupApp:
         self.btn_link_apply.grid(row=0, column=4, padx=(0, 8))
         self.btn_link_apply.grid_remove()
         self.btn_link_apply.configure(state="disabled")
+        # 快捷入口：已经装好的人不必把前四步再走一遍。
+        # 常态 disabled —— 没装的时候它无事可做，一个能点却只能弹"没找到"的按钮
+        # 比灰着更糟（用户会怀疑是按钮坏了）。启用条件见 _refresh_skip_btn。
+        self.btn_skip = ttk.Button(bar, text=SKIP_LABEL, command=self._detect_installed)
+        self.btn_skip.grid(row=0, column=5, padx=(0, 8))
+        self.btn_skip.configure(state="disabled")
         self.btn_quit = ttk.Button(bar, text="关闭", command=self.on_close)
-        self.btn_quit.grid(row=0, column=5)
+        self.btn_quit.grid(row=0, column=6)
 
         self._goto(1)
 
@@ -808,6 +957,14 @@ class SetupApp:
         else:
             self.btn_link_apply.grid_remove()
 
+        # 「接入 AI 工具」这个捷径只在还没到接入页时有意义 —— 到了第 ⑤ 步，
+        # 跳过这件事已经发生了，留着按钮等于给用户一个"点了没反应"的控件。
+        if step == last:
+            self.btn_skip.grid_remove()
+        else:
+            self.btn_skip.grid()
+        self._refresh_skip_btn()
+
     def _next_step(self) -> None:
         from tkinter import messagebox
 
@@ -832,6 +989,85 @@ class SetupApp:
     def _prev_step(self) -> None:
         if self.step > 1:
             self._goto(self.step - 1)
+
+    # ---------------------------------------------------------- 跳过安装
+
+    def _detect_installed(self) -> None:
+        """「已装过？」—— 找到本机已有实例就直跳第 ⑤ 步。
+
+        探测必须走后台线程：``setup_vault.scan`` 会按盘符浅扫并逐个体检候选库
+        （要 walk 每个目录数 md 条目），在机械盘或网络盘上足以让窗口白屏两秒。
+        """
+        if self.detect_busy:
+            return
+        self.detect_busy = True
+        self.btn_skip.configure(state="disabled", text=SKIP_BUSY_LABEL)
+        raw = self.var_install.get().strip()
+        self._append("\n[..  ] 正在检测本机是否已装过记忆库…\n")
+        threading.Thread(target=self._detect_worker,
+                         args=(Path(raw) if raw else None,), daemon=True).start()
+
+    def _detect_worker(self, seed: Path | None) -> None:
+        try:
+            info = find_installed(seed)
+            err = ""
+        except Exception as e:      # 探测炸了也只是"没找到"，不该带走窗口
+            info, err = {}, f"{type(e).__name__}: {e}"
+        self.q.put(("installed", {"info": info, "error": err}))
+
+    def _on_installed(self, payload: dict) -> None:
+        from tkinter import messagebox
+
+        self.detect_busy = False
+        self.btn_skip.configure(text=SKIP_LABEL)
+        self._refresh_skip_btn()
+
+        err = payload.get("error") or ""
+        if err:
+            self._append(f"[FAIL] 检测已装实例失败：{err}\n")
+            messagebox.showerror(APP_TITLE, f"检测已装实例时出错：\n{err}")
+            return
+
+        info = payload.get("info") or {}
+        found = info.get("found") or {}
+        if not found:
+            n = info.get("scanned", 0)
+            self._append(f"[WARN] 扫了 {n} 个候选目录，没有可以直接接入的已装实例\n")
+            for p in info.get("broken") or []:
+                self._append(f"[WARN]   {p} 有安装记录但 server.py 已不在（需重装）\n")
+            messagebox.showinfo(
+                APP_TITLE,
+                "没有找到可以直接接入的已装实例。\n\n"
+                "请先走完前四步完成安装 —— 装好后会自动进入第 ⑤ 步。")
+            return
+
+        install = Path(found["install"])
+        data = Path(found["data"])
+        vf = found["vf"]
+
+        # 先定库目录（会派生一次本体），再覆盖成实际本体并按需标「手动」：
+        # 反过来的话 _on_data_changed 会把本体重新派生回 库/ai-memory，
+        # 已经分开放置的实例会被悄悄指到不存在的路径。
+        self.var_install_manual = (install != (data / "ai-memory"))
+        self.var_data.set(str(data))
+        self.var_install.set(str(install))
+        self._refresh_derive()
+        self._refresh_state_label()
+        self._refresh_summary()
+
+        self._append(f"[OK  ] 找到已装实例：{install}\n")
+        self._append(f"       {core.verify_state_line(vf)}\n")
+        self._append(f"       记忆库：{data}\n")
+        for note in vf.get("notes") or []:
+            self._append(f"       · {note}\n")
+        if vf.get("state") == core.VERIFY_DRIFT:
+            self._append("[WARN] 文件核验不通过：接入后可能启动失败，"
+                         "建议回第 ④ 步强制重装\n")
+
+        # 第 ⑤ 步必须重扫：现有列表可能是上一个本体目录的结论
+        self.link_rows = []
+        self.link_statuses = []
+        self._goto(5)
 
     # ---------------------------------------------------------------- 交互
 
@@ -1070,6 +1306,7 @@ class SetupApp:
         self.txt.configure(state="disabled")
 
     def _busy(self, busy: bool, label: str = "") -> None:
+        self.busy = busy
         st = "disabled" if busy else "normal"
         self.btn_dry.configure(state=st)
         self.btn_run.configure(state=st)
@@ -1077,6 +1314,26 @@ class SetupApp:
         self.btn_prev.configure(state="disabled" if busy
                                 else ("normal" if self.step > 1 else "disabled"))
         self.btn_run.configure(text=label or ("开始更新" if self._installed() else "开始安装"))
+        # 捷径按钮的可点与否由「已装 + 不忙」两个条件共同决定，不能跟着 st 走：
+        # 安装结束后 st 会回到 normal，但没装成时它仍然不该可点。
+        self._refresh_skip_btn()
+
+    def _refresh_skip_btn(self, vf: dict | None = None) -> None:
+        """底栏「接入 AI 工具」的启用闸门：**本机确有已装实例**才允许点。
+
+        为什么不做成"永远可点、点了再告诉你没装"：那个按钮的语义是"跳过前四步"，
+        而没装的时候前四步无可跳过 —— 可点却只能弹一句"没找到"，用户会先怀疑
+        按钮坏了。灰着 + 顶部状态行那句「未检测到已安装实例，将执行全新安装」
+        已经把理由说清楚了。
+
+        ``vf`` 可由调用方传入（``_refresh_state_label`` 刚算过一份），避免为了一次
+        状态刷新重复 hash 七个核心文件。
+        """
+        if not hasattr(self, "btn_skip"):
+            return
+        v = vf if vf is not None else self._verify()
+        ok = (not self.busy) and v.get("state", core.VERIFY_NONE) != core.VERIFY_NONE
+        self.btn_skip.configure(state="normal" if ok else "disabled")
 
     def _verify(self) -> dict:
         """核验当前本体目录。**每次现读盘**，只读一个小 json + 几个小文件，
@@ -1165,6 +1422,7 @@ class SetupApp:
         if vf.get("state") == core.VERIFY_NONE:
             self.lbl_state.configure(text="未检测到已安装实例，将执行全新安装",
                                      foreground=C_DIM)
+            self._refresh_skip_btn(vf)
             return
         ver = f"v{vf['version']}" if vf.get("version") else "版本未知"
         ev = core.VERIFY_EVIDENCE_LABEL.get(vf.get("evidence", "none"), "")
@@ -1174,6 +1432,9 @@ class SetupApp:
         self.lbl_state.configure(
             text=line,
             foreground=C_FAIL if vf.get("state") == core.VERIFY_DRIFT else C_DIM)
+        # 状态行与捷径按钮读的是同一份核验结论 —— 两处各算一次会出现
+        # 「上面说有、下面按钮灰着」这种自相矛盾
+        self._refresh_skip_btn(vf)
 
     def _set_dot(self, label, good: bool, text: str) -> None:
         label.configure(text=text, foreground=C_OK if good else C_WARN)

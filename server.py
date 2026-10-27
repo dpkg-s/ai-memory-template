@@ -22,6 +22,7 @@ Features:
 from __future__ import annotations
 
 import atexit
+import contextvars
 import json
 import re
 import sqlite3
@@ -66,16 +67,24 @@ from text_utils import (
     safe_filename as _safe_filename,
 )
 from yaml_io import (
+    CLEARANCE_LEVELS,
+    CLEARANCE_RANK,
     CONFIDENCE_LEVELS,
+    DEFAULT_CLEARANCE,
     DEFAULT_CONFIDENCE,
     DEFAULT_MEMORY_TYPE,
     DEFAULT_SCOPE,
+    DEFAULT_SECURITY,
     DEFAULT_STATUS,
     DEFAULT_VERIFIED,
     LIFECYCLE_STATUSES,
     MEMORY_TYPES,
     SCHEMA_VERSION,
+    SECURITY_LEVELS,
+    SECURITY_MIN_CLEARANCE,
     SCOPES,
+    clearance_allows as _clearance_allows,
+    normalize_access as _normalize_access,
     build_frontmatter as _build_frontmatter,
     dump_yaml_frontmatter as _dump_yaml_frontmatter,
     parse_frontmatter as _parse_frontmatter,
@@ -334,6 +343,66 @@ def _ensure_index() -> None:
         logger.debug("_ensure_index: rebuild after discard failed: %s", e)
 
 
+def _index_candidate_rels(*, tag: str | None = None, tier: str | None = None,
+                          mem_type: str | None = None, scope: str | None = None,
+                          project: str | None = None,
+                          status: str | None = None) -> set[str] | None:
+    """用索引元数据预筛候选 relpath —— 「过滤前置」(2026-10-23)。
+
+    背景：`memory_search` / `memory_list` 原先是「先把全库正文读完，再判断
+    tag/type/scope/project」。只要带了过滤条件，那批 IO 里绝大部分是白读的
+    （实测带 project= 的查询仍会把 476 篇全读一遍再丢掉 285 篇）。
+
+    本函数把「判断谁符合条件」提前到不碰磁盘的 SQL 里，返回候选 relpath 集合；
+    调用方据此跳过非候选文件，只对候选读正文。
+
+    Returns:
+        ``set[str]`` —— 候选相对路径（posix，相对 MEMORY_DIR）。
+        ``None`` —— **不要剪枝**。发生条件：索引文件不存在、无任何过滤条件、
+        或索引查询异常。调用方见到 None 必须走原全扫路径，行为与改动前一致。
+
+    ⚠️ 三层保守设计（正确性优先于性能）：
+
+    1. 索引里该列为 NULL/空串时**保留为候选**（``null_is_candidate=True``）——
+       旧库刚补列、尚未 rebuild 时全表都是 NULL，此时剪枝会吞掉所有真实命中。
+    2. 候选集为空也返回 None ⇒ 回退全扫，避免「索引滞后导致零结果」。
+    3. 异常一律吞掉并 debug 记录 —— 索引是可重建缓存，不该成为检索的单点故障。
+    """
+    if not any((tag, tier, mem_type, scope, project, status)):
+        return None                      # 无过滤条件：本来就要读全库，查索引白费
+    if not _IDX_FILE.exists():
+        return None
+    conn = None
+    try:
+        _ensure_index()
+        conn = midx.connect(_IDX_FILE)
+        # 回填完成度检测：决定「空值」是"未知"还是"确实为空"。
+        # 刚补列未 rebuild 时整表 NULL ⇒ 必须保守保留；rebuild 之后 NULL 只剩
+        # 真正的 global 条目（本来就没有 project），此时可以严格剪枝。
+        # 判据用 scope 而非 project：scope 覆盖率 96%，能代表整表回填状态；
+        # project 只覆盖 45%（global 条目本就无值），不能当回填判据。
+        total, filled = conn.execute(
+            "SELECT COUNT(*), SUM(scope IS NOT NULL AND scope != '') FROM entries"
+        ).fetchone()
+        backfilled = bool(total) and (filled or 0) / total >= 0.8
+        rows = midx.candidates(
+            conn, mem_type=mem_type, scope=scope, project=project,
+            status=status, tier=tier, tag=tag,
+            include_archived=(status == "any"),
+            null_is_candidate=not backfilled,
+        )
+        rels = {r["relpath"] for r in rows}
+        logger.debug("_index_candidate_rels: %d/%d 候选 (backfilled=%s)",
+                     len(rels), total, backfilled)
+    except Exception as e:               # noqa: BLE001 - 索引坏了就退回全扫
+        logger.debug("_index_candidate_rels: fallback to full scan: %s", e)
+        return None
+    finally:
+        if conn is not None:
+            midx.close(conn)
+    return rels or None
+
+
 def _idx_sync_path(path: Path) -> None:
     """写盘成功后同步索引行(重新读 meta). 失败静默.
 
@@ -421,7 +490,14 @@ def _release_lock() -> None:
     locks.release_lock(MEMORY_LOCK)
 
 
-mcp = FastMCP("ai-memory", instructions="本地共享 Markdown 记忆库，支持多个 AI 工具读写")
+MEMORY_PROTOCOL_INSTRUCTIONS = (
+    "共享记忆库协议：新会话读取 AI身份档案，再搜索 近期工作动态。"
+    "只写明确要求记住、技术决策、问题修复、实质项目进展或新偏好；普通问答不写。"
+    "所有写入优先走 memory_commit；它会写前查重并拒绝未审查的疑似重复，确认后传 duplicate_reviewed=true。"
+    "同名笔记须先 memory_read，再用 expected_version 做合并更新。AI 推断内容 verified=false。"
+    "项目笔记必须通过 memory_commit 同步更新 近期工作动态 当日行与项目状态；失败时如实说明。"
+)
+mcp = FastMCP("ai-memory", instructions=MEMORY_PROTOCOL_INSTRUCTIONS)
 
 
 def _rel_display(path: Path) -> str:
@@ -1213,6 +1289,168 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+# ---- P2 访问控制：读权级 ---------------------------------------------------
+# 设计要点（2026-10-25，主人要求「qqbot 从软限制改成硬限制」）：
+#
+# 1. **权级来自传输层，不来自入参**。它由 HTTP 端点路径决定（`/mcp/member`
+#    等），由 `transport_http.ClearanceRouter` 写入本 contextvar。绝不作为工具
+#    参数暴露 —— 参数是调用方自报的，等于没有。
+# 2. **默认 owner**。stdio 模式（本机 WorkBuddy / Codex 直连）与单元测试都拿
+#    全权，保持既有行为完全不变；限制只在显式挂到受限端点时才生效。
+# 3. **越权一律表现为「不存在」**。不返回 403、不说「权限不足」—— 那本身就
+#    泄露了「这里有东西」。与 Web 端「权限不足的界面直接隐藏」是同一条原则。
+_READER_CLEARANCE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ai_memory_reader_clearance", default="owner")
+
+# ---- 第二根轴：本次请求是否允许写入（2026-10-26） --------------------------
+# 动机：「能读多少」与「能不能写」本是两件事，此前却焊死在档位上 —— owner 必能
+# 写、reader 必不能写，于是「全库可读、一字不许改」这个真实需求（别的设备上的
+# 分析客户端 / 只读镜像）在档位表里没有坐标。
+#
+# 为什么用独立 contextvar 而不是再给档位起名字：档位 4 × 读写 2 = 8 种组合，用
+# 8 个档位名表达会组合爆炸，且每加一档都要重算 SECURITY_MIN_CLEARANCE。拆成两
+# 轴之后判据收敛成一句：**实到写权 = 档位允许写 AND 本次请求允许写**。
+#
+# 注意这两者是**合取**而非并列：guest / reader 即使 writable=True 也写不了（那是
+# 档位语义，由 _WRITABLE_LEVELS 守着）；反过来 owner + writable=False 就得到
+# 「全库可读、零写」—— 这正是新增这一轴唯一要表达的形态。
+_WRITE_ENABLED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ai_memory_write_enabled", default=True)
+
+#: 档位自带的写能力。与 _WRITE_ENABLED 是合取关系，不能互相替代。
+_WRITABLE_LEVELS = frozenset({"owner", "member"})
+
+
+def current_clearance() -> str:
+    """当前请求的读权级（owner / member / reader / guest）。"""
+    v = _READER_CLEARANCE.get()
+    return v if v in CLEARANCE_LEVELS else "owner"
+
+
+def current_writable() -> bool:
+    """本次请求是否允许写入：档位允许写 **且** 未被子级降为只读。
+
+    把合取写在一个函数里，是为了让所有守卫共享同一口径 —— 若让每个调用点自己
+    写 ``current_clearance() in (...) and _WRITE_ENABLED.get()``，漏一处就是
+    一条写后门。
+    """
+    if current_clearance() not in _WRITABLE_LEVELS:
+        return False
+    return bool(_WRITE_ENABLED.get())
+
+
+def set_clearance(level: str, writable: bool = True) -> tuple:
+    """设定读权级与写开关，返回 token 元组供 ``reset_clearance`` 还原。
+
+    contextvars 没有「批量设置 / 批量还原」，故两个变量各取一个 token 打包返回。
+    刻意不提供「只设 level、writable 沿用上一次」的用法：那会让相邻请求的写权
+    互相渗透，是这类实现里最隐蔽的泄漏形态。
+    """
+    tok_level = _READER_CLEARANCE.set(level if level in CLEARANCE_LEVELS else "guest")
+    tok_write = _WRITE_ENABLED.set(bool(writable))
+    return (tok_level, tok_write)
+
+
+def reset_clearance(token) -> None:
+    """还原权级与写开关。
+
+    接受 ``set_clearance`` 返回的元组，也兼容单个 token（老调用点 / 测试直接
+    传 token 的情形）。**元组必须按 LIFO 顺序还原** —— contextvars 的
+    ``Token.reset`` 要求后设的先退，顺序反了会抛 ValueError 或留下脏值。
+    """
+    if isinstance(token, tuple):
+        _WRITE_ENABLED.reset(token[1])
+        _READER_CLEARANCE.reset(token[0])
+        return
+    _READER_CLEARANCE.reset(token)
+
+
+def _meta_access(meta: dict[str, Any]) -> tuple[str, str]:
+    """取条目的 (security, clearance)，缺字段按默认档补齐（内存态）。"""
+    return _normalize_access(meta.get("security"), meta.get("clearance"))
+
+
+def _can_read(meta: dict[str, Any]) -> bool:
+    """当前读权级能否读取该条目。脏数据只会「读不到」，绝不误放行。"""
+    _sec, need = _meta_access(meta)
+    return _clearance_allows(current_clearance(), need)
+
+
+def _filter_readable(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按读权级过滤条目列表（meta 放在 ``meta`` 键下或直接是 meta 均可）。"""
+    out = []
+    for e in entries:
+        meta = e.get("meta") if isinstance(e.get("meta"), dict) else e
+        if _can_read(meta):
+            out.append(e)
+    return out
+
+
+def _owner_only(tool: str) -> str | None:
+    """写操作与底层诊断的权级守卫；owner 返回 None（放行）。
+
+    这些工具的**返回值本身**就是情报：`memory_doctor` 会列全库文件名与漂移项，
+    `memory_schema_diff` 会逐条打印缺哪些键，写操作则能删除或降级别人的条目。
+    它们没有「过滤后仍然可用」的形态，只能整只关掉。
+
+    措辞刻意不用「权限不足」四字：受限端点上应尽量不暴露「这里有一道门」。
+    说「当前连接未提供该能力」，语义落在**能力**而非**许可**上 —— 与 Web 端
+    「权限不足的界面直接隐藏」同一取向。
+    """
+    if current_clearance() != "owner":
+        return f"「{tool}」在当前连接上不可用。"
+    if not current_writable():
+        # 走到这里说明视野是 owner、但端点被声明成只读。此时**可以**明说「只读」：
+        # 调用方自己就是从 -ro 端点进来的，这句话不泄露任何它尚未知道的信息。
+        return f"「{tool}」在当前连接上不可用：该端点为只读。"
+    return None
+
+
+def _readonly_endpoint(tool: str) -> str | None:
+    """写入拦截：档位不允许写、或本次请求被降为只读时返回拒绝语。
+
+    为什么单独一道，而不是并进 ``_owner_only``
+    ------------------------------------------
+    这两个工具的**写权是分档语义的一部分**，不能一刀切：``member`` 端点是给
+    自家其它 AI 客户端（AstrBot 等）用的，它们需要写普通条目，只是不得抬高
+    敏感度（见 ``memory_write`` 里的 sensitive/secret 拦截）。
+
+    ``guest`` / ``reader`` 的定位不同 —— 它们是**面向非本人设备**的共享端点。
+    这类端点一旦可写，后果不只是脏数据：写入方能在 owner 的检索、索引、图谱里
+    凭空插入内容，而 owner 侧的 ``_find_duplicate_hints`` / 时间线聚合都会被
+    这些条目影响。共享端点必须是纯读的，这道检查就是那条界。
+
+    2026-10-26 起多了一层：**档位能写 ≠ 这次允许写**。``owner`` / ``member``
+    还能被显式声明成只读端点（``/mcp/owner-ro`` / ``/mcp/member-ro``），用来
+    满足「全库可读、一字不许改」—— 那时 ``_WRITE_ENABLED`` 为 False，本函数
+    同样拦下。两条判据是合取的，但**拒绝语要分开**：一种说「这个档位只读」，
+    另一种说「这个端点只读」，否则主人排障时分不清是选错了身份还是选错了端点。
+
+    措辞沿用 ``_owner_only`` 的取向：说「只读」，不说「权限不足」。
+    """
+    level = current_clearance()
+    if level not in _WRITABLE_LEVELS:
+        return f"「{tool}」在 {level} 端点不可用：该端点只读。"
+    if not current_writable():
+        return f"「{tool}」在当前端点上不可用：该端点为只读（视野 {level}）。"
+    return None
+
+
+def _owner_gate(fn):
+    """把 `_owner_only` 包成装饰器，供写/诊断类工具统一挂载。
+
+    挂载顺序固定为 `@mcp.tool(...)` → `@_owner_gate` → `@_locked_write`：
+    先判权再拿锁，受限调用不会白占锁、也不会在锁里做一次无意义的拒绝。
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        denied = _owner_only(fn.__name__)
+        if denied is not None:
+            return denied
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 def _apply_meta_defaults(meta: dict[str, Any]) -> dict[str, Any]:
     """为 frontmatter 缺失 P0/P1 字段的旧笔记注入默认值（内存态）。
 
@@ -1244,6 +1482,11 @@ def _apply_meta_defaults(meta: dict[str, Any]) -> dict[str, Any]:
         meta["scope"] = DEFAULT_SCOPE
     if meta.get("status") not in LIFECYCLE_STATUSES:
         meta["status"] = "archived" if meta.get("archived_to") else DEFAULT_STATUS
+    # v3 访问控制：旧笔记没有这两个字段，读取端补默认档（internal / member），
+    # 磁盘保持原样，下次写入时由 build_frontmatter 渐进补齐。
+    sec, clr = _normalize_access(meta.get("security"), meta.get("clearance"))
+    meta["security"] = sec
+    meta["clearance"] = clr
     conflicts = meta.get("conflicts")
     if conflicts is not None and not isinstance(conflicts, list):
         meta["conflicts"] = [str(conflicts)]
@@ -1263,9 +1506,12 @@ def _schema_version(meta: dict[str, Any]) -> int:
 #
 #   core   任何版本都必须有（v1 时代就已存在）。缺 = 真实缺陷。
 #   v2     仅 schema_version>=2 承诺写出。v1 条目缺它们属**预期**，是迁移清单。
+#   v3     仅 schema_version>=3 承诺写出（访问控制两字段）。v2 及更早缺它们
+#          同属预期 —— 存量 416 条正是在这张清单上，属渐进补齐而非缺陷。
 #   opt    按需写出（有值才写）。缺失不是缺陷。
 _SCHEMA_CORE_KEYS = ("title", "tags", "created", "updated", "tier", "access_count")
 _SCHEMA_V2_KEYS = ("type", "confidence", "verified", "scope", "status", "schema_version")
+_SCHEMA_V3_KEYS = ("security", "clearance")
 _SCHEMA_OPTIONAL_KEYS = ("permalink", "verified_at", "project", "supersedes",
                          "conflicts", "source_context", "source", "summary",
                          "links", "version")
@@ -1273,7 +1519,8 @@ _SCHEMA_OPTIONAL_KEYS = ("permalink", "verified_at", "project", "supersedes",
 # 漏掉它会把全部归档 stub 误报成「未知键」，把真信号淹没在噪声里。
 _SCHEMA_KNOWN_EXTRA = ("archived_to",)
 _SCHEMA_ALL_KNOWN = frozenset(
-    _SCHEMA_CORE_KEYS + _SCHEMA_V2_KEYS + _SCHEMA_OPTIONAL_KEYS + _SCHEMA_KNOWN_EXTRA
+    _SCHEMA_CORE_KEYS + _SCHEMA_V2_KEYS + _SCHEMA_V3_KEYS
+    + _SCHEMA_OPTIONAL_KEYS + _SCHEMA_KNOWN_EXTRA
 )
 
 
@@ -1327,6 +1574,13 @@ def _credential_badge(meta: dict[str, Any]) -> str:
     conflicts = meta.get("conflicts")
     if conflicts:
         badge += f" ⚠conflicts({len(conflicts)})"
+    # v3 访问控制：默认档（internal/member）不显示，避免 416 条全部拖一条尾巴；
+    # 一旦被提级（secret / owner）就必须显式出现 —— 那是调用方要立刻看到的信息。
+    sec, clr = _meta_access(meta)
+    if sec != DEFAULT_SECURITY:
+        badge += f" | sec={sec}"
+    if clr != DEFAULT_CLEARANCE:
+        badge += f" clr={clr}"
     return badge
 
 
@@ -1421,7 +1675,8 @@ def _meta_facets(meta: dict[str, Any]) -> dict[str, Any]:
         "confidence": meta.get("confidence", DEFAULT_CONFIDENCE),
         "verified": bool(meta.get("verified")),
     }
-    for key, default in (("scope", DEFAULT_SCOPE), ("status", DEFAULT_STATUS)):
+    for key, default in (("scope", DEFAULT_SCOPE), ("status", DEFAULT_STATUS),
+                         ("security", DEFAULT_SECURITY), ("clearance", DEFAULT_CLEARANCE)):
         val = meta.get(key, default)
         if val != default:
             facets[key] = val
@@ -1550,6 +1805,7 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
                   status: str | None = None,                   supersedes: str | None = None,
                   conflicts: list[str] | None = None,
                   source_context: str | None = None,
+                  security: str | None = None, clearance: str | None = None,
                   permalink: str | None = None) -> None:
     # Merge cached access_count increments into the written count
     cached = _ACCESS_CACHE.pop(title, 0)
@@ -1559,7 +1815,8 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
     # P0/P1 语义字段同理：更新正文不应把 type/confidence/verified/scope/status
     # 重置为默认值——否则「只改正文」会静默丢掉项目的隔离标记与生命周期状态）。
     if any(v is None for v in (version, mem_type, confidence, verified, scope, status,
-                               project, supersedes, conflicts, source_context, permalink)):
+                               project, supersedes, conflicts, source_context, permalink,
+                               security, clearance)):
         try:
             em, _ = _load_memory(path)
             if version is None:
@@ -1584,6 +1841,12 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
                 conflicts = em.get("conflicts")
             if source_context is None:
                 source_context = em.get("source_context")
+            # v3 访问控制：只改正文时不得把条目悄悄降级/升级。这里继承磁盘原值，
+            # 与 type/scope 同一口径 —— 「更新」不是「重置」。
+            if security is None:
+                security = em.get("security")
+            if clearance is None:
+                clearance = em.get("clearance")
             # A3：permalink 一旦写过就永不重置 —— 若这里写成 `or path.stem`，
             # 文件改名时会把冻结值悄悄改掉，稳定标识就失去意义了。
             if permalink is None:
@@ -1608,7 +1871,9 @@ def _write_memory(path: Path, title: str, tags: list[str], source: str | None, c
                                      mem_type=mem_type, confidence=confidence, verified=verified,
                                      verified_at=verified_at, scope=scope, project=project,
                                      status=status, supersedes=supersedes, conflicts=conflicts,
-                                     source_context=source_context, permalink=permalink)
+                                     source_context=source_context,
+                                     security=security, clearance=clearance,
+                                     permalink=permalink)
     _atomic_write_text(path, f"---\n{frontmatter}\n---\n\n{content}")
 
 
@@ -1770,6 +2035,7 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                  status: str | None = None, supersedes: str | None = None,
                  conflicts: list[str] | None = None,
                  source_context: str | None = None,
+                 security: str | None = None, clearance: str | None = None,
                  expected_version: int | None = None) -> str:
     """Write a memory entry, updating an existing one with the same title if found.
 
@@ -1828,10 +2094,22 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         来源标识（可含会话/设备信息），source_context 是「哪类客户端写入」的粗分类，
         便于按来源统计与追溯。
 
+    security (optional): 内容安全等级 public / internal / sensitive / secret，
+        默认 internal。它描述「这条内容被读出去的后果有多重」，用于审计与展示。
+
+    clearance (optional): 读取该条目所需的最低权级 guest / member / owner，默认由
+        security 推导（public→guest、internal/sensitive→member、secret→owner）。
+        两者**只收紧不放宽**：传 security=secret 却要求 clearance=guest 时会被
+        自动抬到 owner（宁可多拦，不能把绝密标成公开）。受限端点（如 /mcp/member）
+        只能写 internal 及以下。省略时更新保留原值。
+
     expected_version (optional): optimistic concurrency check. If provided and the
     entry's current on-disk version does not match, the write is rejected to prevent
     one client silently overwriting another's concurrent edit. Omit for normal upsert.
     """
+    _guest_denied = _readonly_endpoint("memory_write")
+    if _guest_denied:
+        return _guest_denied
     tags = tags or []
 
     # 第三轮 P0-6：拒绝空壳与空标题
@@ -1865,6 +2143,19 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
     if status is not None and status not in LIFECYCLE_STATUSES:
         return (f"错误：status 取值非法（'{status}'）。"
                 f"合法取值：{', '.join(LIFECYCLE_STATUSES)}。")
+    # P2 访问控制字段：同样拒绝非法值
+    if security is not None and security not in SECURITY_LEVELS:
+        return (f"错误：security 取值非法（'{security}'）。"
+                f"合法取值：{', '.join(SECURITY_LEVELS)}。")
+    if clearance is not None and clearance not in CLEARANCE_LEVELS:
+        return (f"错误：clearance 取值非法（'{clearance}'）。"
+                f"合法取值：{', '.join(CLEARANCE_LEVELS)}。")
+    # 受限写入方不得**抬高**敏感度：否则它可以把一批内容标成 secret，让 owner
+    # 的检索里凭空多出「读不到的东西」，也能借「secret 自动抬到 owner」把
+    # 自己写得进去的条目从自己手里锁走。写操作必须有确定性反馈，故明确报错，
+    # 而不是像读路径那样假装不存在。
+    if current_clearance() != "owner" and security in ("sensitive", "secret"):
+        return "错误：当前连接不能写入 sensitive / secret 级内容。"
     # source_context 未显式给出时回落环境变量（各客户端可在自己的 MCP 配置里设定）
     if source_context is None:
         source_context = os.environ.get("AI_MEMORY_SOURCE_CONTEXT") or None
@@ -1934,6 +2225,12 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         if existing_path is not None:
             fresh_meta, fresh_body = _load_memory(existing_path)
             existing_meta, existing_body = fresh_meta, fresh_body
+            # 覆盖写必须对**原条目**有读权。否则受限方只要猜中标题，就能把一个
+            # 自己读不到的 secret 条目整条替换成普通内容（内容被毁 + 档位被降），
+            # 「读不到」就绕成了「改得掉」。与读路径不同，写操作必须给确定性
+            # 反馈，所以这里明确拒绝而不是假装成功。
+            if not _can_read(existing_meta):
+                return f"错误：标题 '{title}' 在当前连接上不可写。"
             if expected_version is not None:
                 current_version = existing_meta.get("version", 0)
                 if isinstance(current_version, int) and current_version != expected_version:
@@ -1972,6 +2269,8 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                 supersedes=supersedes,
                 conflicts=conflicts,
                 source_context=source_context,
+                security=security,
+                clearance=clearance,
             )
             # Auto-archive: if tier is cold or very-low-heat, move to archive
             _maybe_auto_archive(title, existing_path)
@@ -2004,7 +2303,8 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
                           mem_type=mem_type, confidence=confidence, verified=verified,
                           verified_at=_today_utc() if verified else None,
                           scope=scope, project=project, status=status, supersedes=supersedes,
-                          conflicts=conflicts, source_context=source_context)
+                          conflicts=conflicts, source_context=source_context,
+                          security=security, clearance=clearance)
             _maybe_auto_archive(title, filepath)
             logger.info("CREATE  title=%s tags=%s source=%s (new) path=%s",
                         title, tags, source, _rel_display(filepath))
@@ -2030,13 +2330,329 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         _flush_access_counts()
         _release_lock()
 
+
+# ==== v3.2.0（2026-10-27）时间线分片 ==========================================
+# 主人定案：聚合页「近期工作动态」只保留项目状态表 + 索引，逐日 - [x] 条目
+# 下沉到 近期工作动态/YYYY-Www.md；单周超过 80KB 时按日切为
+# YYYY-Www-MMDD.md。服务端只看「当日文件在不在」来决定落点，不需要记账
+# 「这一周被切过」——切分与写入因此互不耦合。
+TIMELINE_TITLE = "近期工作动态"
+TIMELINE_FRAG_LIMIT = 80 * 1024
+
+
+def _timeline_fragment_title(when) -> str:
+    """当日条目应落的分片标题（带目录前缀）。
+
+    优先级：当日分片 > 整周分片 > 整周分片（待新建）。
+    """
+    iso = when.isocalendar()
+    week = f"{iso[0]}-W{iso[1]:02d}"
+    base = MEMORY_DIR / TIMELINE_TITLE
+    daily = f"{week}-{when.strftime('%m%d')}"
+    if (base / f"{daily}.md").exists():
+        return f"{TIMELINE_TITLE}/{daily}"
+    return f"{TIMELINE_TITLE}/{week}"
+
+
+def _upsert_dated_item(text: str, date_text: str, timeline_item: str,
+                       link: str) -> str:
+    """在分片正文里插入/替换当天的 - [x] 条目（同日同笔记幂等）。
+
+    与拆分前的聚合页逻辑逐字一致：新日期段总插在最前（保持降序），同日同笔记
+    的条目就地替换而不是追加，重试因此安全。
+    """
+    lines = text.splitlines()
+    date_headers = [i for i, line in enumerate(lines)
+                    if re.fullmatch(r"## \d{4}-\d{2}-\d{2}", line.strip())]
+    day_index = next((i for i in date_headers
+                      if lines[i].strip() == f"## {date_text}"), None)
+    if day_index is None:
+        if date_headers:
+            insert_at = date_headers[0]
+        else:
+            heading = next((i for i, line in enumerate(lines)
+                            if re.match(r"^# .+", line)), None)
+            if heading is not None:
+                insert_at = heading + 1
+                while insert_at < len(lines) and lines[insert_at].strip():
+                    insert_at += 1
+                while insert_at < len(lines) and not lines[insert_at].strip():
+                    insert_at += 1
+            else:
+                insert_at = len(lines)
+        lines[insert_at:insert_at] = [f"## {date_text}", "", timeline_item, ""]
+    else:
+        day_end = next((i for i in date_headers if i > day_index), len(lines))
+        existing_item = next((i for i in range(day_index + 1, day_end)
+                              if lines[i].startswith("- [x] ") and link in lines[i]), None)
+        if existing_item is not None:
+            lines[existing_item] = timeline_item
+        else:
+            overview = next((i for i in range(day_index + 1, day_end)
+                             if lines[i].startswith("> [!abstract]+ 当日概览")), None)
+            insert_at = overview if overview is not None else day_index + 1
+            lines[insert_at:insert_at] = [timeline_item, ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _sync_timeline_fragment(date_text: str, timeline_item: str, leaf_title: str,
+                            source_context: str | None,
+                            timeline_meta: dict[str, Any]) -> tuple[str, str]:
+    """把当日条目写入当周/当日分片；文件不存在则按模板新建。"""
+    when = datetime.strptime(date_text, "%Y-%m-%d").date()
+    frag_title = _timeline_fragment_title(when)
+    frag_path = MEMORY_DIR / _safe_filename(frag_title)
+    notice = ""
+    if frag_path.exists():
+        try:
+            frag_meta, frag_body = _load_memory(frag_path)
+        except Exception as exc:
+            return (f"错误：无法读取分片 {frag_title}（{exc}），未写当日条目。",
+                    frag_title)
+        new_body = _upsert_dated_item(frag_body, date_text, timeline_item,
+                                      f"[[{leaf_title}]]")
+        # summary / tags 必须显式回传：memory_write 的 tags 是 ``tags or []``，
+        # summary 缺省会用正文前 100 字重算，两者都会把已有元数据洗干净。
+        result = memory_write(
+            title=frag_title, content=new_body,
+            summary=frag_meta.get("summary"), tags=frag_meta.get("tags"),
+            source_context=source_context or timeline_meta.get("source_context"))
+    else:
+        leaf = frag_title.rsplit("/", 1)[-1]
+        week = leaf[:8]
+        new_body = (f"# {leaf}\n\n"
+                    f"> [!info] 所属引导页：[[{TIMELINE_TITLE}]]\n\n"
+                    f"## {date_text}\n\n{timeline_item}\n")
+        result = memory_write(
+            title=frag_title, content=new_body,
+            summary=f"近期工作动态 {week}（周分片，逐日条目）",
+            tags=["近期工作动态", "时间线", "obsidian", "episodic"],
+            tier="warm", mem_type="episodic", confidence="high",
+            scope=timeline_meta.get("scope") or "global",
+            source_context=source_context or timeline_meta.get("source_context"))
+    if result.startswith("错误："):
+        return result, frag_title
+    try:
+        size = frag_path.stat().st_size
+    except OSError:
+        size = 0
+    if size > TIMELINE_FRAG_LIMIT:
+        notice = (f"\n⚠️ 分片 {frag_title} 已达 {size // 1024} KB，"
+                  f"超过 {TIMELINE_FRAG_LIMIT // 1024} KB 阈值，"
+                  "建议运行切分脚本把该周按日拆分。")
+    return f"已写入分片 {frag_title}{notice}", frag_title
+
+
+@mcp.tool(annotations=_WRITE_NONIDEM)
+def memory_commit(title: str, content: str, timeline_summary: str | None = None,
+                  project_name: str | None = None, project_status: str | None = None,
+                  project_focus: str | None = None, tags: list[str] | None = None,
+                  source: str | None = None, summary: str | None = None,
+                  tier: str | None = None, mem_type: str | None = None,
+                  confidence: str | None = None, verified: bool | None = None,
+                  scope: str | None = None, project: str | None = None,
+                  status: str | None = None, supersedes: str | None = None,
+                  conflicts: list[str] | None = None,
+                  source_context: str | None = None,
+                  security: str | None = None, clearance: str | None = None,
+                  expected_version: int | None = None,
+                  duplicate_reviewed: bool = False) -> str:
+    """Commit a memory entry and, for project work, synchronize its daily timeline.
+
+    This is the preferred write path for project notes. It checks for likely
+    duplicates before writing, upserts the note, adds/replaces one dated ``[x]``
+    timeline item, and updates or creates the matching row in the "项目状态" table.
+    Repeating the same commit updates the note and replaces the matching daily
+    item rather than adding another copy. ``timeline_summary`` requires
+    ``project_name``, ``project_status`` and ``project_focus``; omit all four for
+    a non-project note.
+
+    v3.2.0（2026-10-27）时间线分片：当日 ``[x]`` 条目写入
+    ``近期工作动态/YYYY-Www.md``（该周已按日切分则写 ``…-MMDD.md``），
+    聚合页「近期工作动态」只保留项目状态表与索引——它已是引导页，
+    不再承载逐日正文。分片超过 80KB 时返回值附切分提示。
+
+    The two Markdown files are each atomically replaced under the same reentrant
+    vault lock. A process crash between replacements can leave a partial commit;
+    the returned error names the unfinished timeline step so the call can be retried.
+    """
+    _guest_denied = _readonly_endpoint("memory_commit")
+    if _guest_denied:
+        return _guest_denied
+    project_args = (project_name, project_status, project_focus)
+    if timeline_summary is not None and not all(
+            isinstance(value, str) and value.strip() for value in project_args):
+        return ("错误：项目提交需同时提供 project_name、project_status、project_focus；"
+                "非项目笔记请省略 timeline_summary。")
+    if timeline_summary is None and any(value is not None for value in project_args):
+        return "错误：project_name/status/focus 只能与 timeline_summary 一起提供。"
+    if timeline_summary is not None and not timeline_summary.strip():
+        return "错误：timeline_summary 不能为空。"
+
+    locked = _acquire_lock()
+    if not locked:
+        return "错误：无法取得记忆库写锁，未写入。"
+    try:
+        timeline_path: Path | None = None
+        timeline_meta: dict[str, Any] = {}
+        updated_timeline = ""
+        timeline_version: int | None = None
+        if timeline_summary is not None:
+            timeline_path = _resolve_title_via_index("近期工作动态")
+            if timeline_path is None:
+                for candidate in _iter_md_files():
+                    try:
+                        candidate_meta, _ = _load_memory(candidate)
+                    except Exception:
+                        continue
+                    if _entry_matches(candidate_meta, candidate, "近期工作动态"):
+                        timeline_path = candidate
+                        break
+            if timeline_path is None:
+                return "错误：找不到聚合笔记「近期工作动态」，未写入项目笔记。"
+            try:
+                timeline_meta, timeline_body = _load_memory(timeline_path)
+            except Exception as exc:
+                return f"错误：无法读取「近期工作动态」（{exc}），未写入项目笔记。"
+            version_value = timeline_meta.get("version", 0)
+            timeline_version = version_value if isinstance(version_value, int) else 0
+
+            today = datetime.now().astimezone().date()
+            date_text = today.isoformat()
+            date_cell = today.strftime("%m-%d")
+            leaf_title = title.rsplit("/", 1)[-1].strip()
+            clean_summary = re.sub(r"\s+", " ", timeline_summary).strip()
+            clean_summary = re.sub(r"^-\s*\[x\]\s*", "", clean_summary)
+            clean_summary = clean_summary.replace("[[", "［［").replace("]]", "］］")
+            timeline_item = f"- [x] {clean_summary} [[{leaf_title}]]"
+            lines = timeline_body.splitlines()
+
+            # v3.2.0（2026-10-27）：当日 - [x] 条目不再写进引导页，
+            # 由 _sync_timeline_fragment 落到 近期工作动态/YYYY-Www.md。
+            # 本函数对 timeline_body 只做「项目状态表 + 更新日期」两件事。
+
+            # Update the project status table. Cell text is escaped to keep Markdown rows intact.
+            safe_project = re.sub(r"\s+", " ", project_name or "").strip().replace("|", "\\|")
+            safe_status = re.sub(r"\s+", " ", project_status or "").strip().replace("|", "\\|")
+            safe_focus = re.sub(r"\s+", " ", project_focus or "").strip().replace("|", "\\|")
+            safe_focus = safe_focus.replace("\n", " ")
+            safe_focus = re.sub(r"\s+", " ", safe_focus).strip()
+            row_prefix = re.compile(r"^>\s*\|\s*([^|]+?)\s*\|\s*(.*)$")
+            row_updated = False
+            for i, line in enumerate(lines):
+                match = row_prefix.match(line)
+                if not match or match.group(1).strip() != safe_project:
+                    continue
+                rest = match.group(2)
+                status_split = rest.split(" | ", 1)
+                if len(status_split) != 2:
+                    continue
+                focus_split = status_split[1].rsplit(" | ", 1)
+                if len(focus_split) != 2:
+                    continue
+                lines[i] = f"> | {safe_project} | {safe_status} | {safe_focus} | {date_cell} |"
+                row_updated = True
+                break
+            if not row_updated:
+                header_index = next((i for i, line in enumerate(lines)
+                                     if line.strip().startswith("> | 项目 | 状态 |")), None)
+                if header_index is None or header_index + 1 >= len(lines):
+                    return ("错误：项目笔记尚未写入；「近期工作动态」中找不到项目状态表，"
+                            "请先修复聚合页结构。")
+                lines.insert(header_index + 2,
+                             f"> | {safe_project} | {safe_status} | {safe_focus} | {date_cell} |")
+
+            # Keep the callout's update date current when a project row changes.
+            for i, line in enumerate(lines):
+                if line.startswith("> [!info]+ 项目状态"):
+                    lines[i] = re.sub(r"更新于 \d{4}-\d{2}-\d{2}",
+                                      f"更新于 {date_text}", line, count=1)
+                    break
+            updated_timeline = "\n".join(lines).rstrip() + "\n"
+
+        entries = _iter_entries()
+        exact_path = _resolve_title_via_index(title)
+        if exact_path is None:
+            leaf_title = title.rsplit("/", 1)[-1].strip()
+            explicit_path = MEMORY_DIR / _safe_filename(title) if "/" in title else None
+            exact_record = next((record for record in entries
+                                 if _entry_title(record[1], record[0]) == leaf_title
+                                 and (explicit_path is None or record[0] == explicit_path)), None)
+            if exact_record is not None:
+                exact_path = exact_record[0]
+        exact_meta: dict[str, Any] = {}
+        if exact_path is not None:
+            try:
+                exact_meta, _ = _load_memory(exact_path)
+            except Exception as exc:
+                return f"错误：无法读取同名笔记以进行安全更新（{exc}），未写入。"
+            current_version = exact_meta.get("version", 0)
+            current_version = current_version if isinstance(current_version, int) else 0
+            if expected_version is None:
+                return (f"未写入：已存在同名笔记 [[{_entry_title(exact_meta, exact_path)}]]，"
+                        f"当前 version={current_version}。请先 memory_read 合并内容，再以"
+                        " expected_version 和 duplicate_reviewed=true 重试。")
+            if expected_version != current_version:
+                return (f"错误：版本冲突（当前 version={current_version}，"
+                        f"收到 expected_version={expected_version}），未写入。")
+
+        duplicate_hints = _find_duplicate_hints(title, content, entries)
+        if duplicate_hints and not duplicate_reviewed:
+            return ("未写入：发现疑似重复/相关笔记。请先 memory_read 核对候选，"
+                    "决定合并、注明 supersedes/conflicts 或确认独立后，"
+                    "以 duplicate_reviewed=true 重试：\n- " +
+                    "\n- ".join(duplicate_hints))
+
+        note_result = memory_write(
+            title=title, content=content, tags=tags, source=source, summary=summary,
+            tier=tier, mem_type=mem_type, confidence=confidence, verified=verified,
+            scope=scope, project=project, status=status, supersedes=supersedes,
+            conflicts=conflicts, source_context=source_context,
+            security=security, clearance=clearance,
+            expected_version=expected_version,
+        )
+        if note_result.startswith("错误："):
+            return note_result
+        if timeline_summary is None:
+            return note_result
+
+        timeline_result = memory_write(
+            title="近期工作动态", content=updated_timeline,
+            tags=timeline_meta.get("tags"), source=timeline_meta.get("source"),
+            summary=timeline_meta.get("summary"), tier=timeline_meta.get("tier"),
+            mem_type=timeline_meta.get("type"), confidence=timeline_meta.get("confidence"),
+            verified=timeline_meta.get("verified"), scope=timeline_meta.get("scope"),
+            project=timeline_meta.get("project"), status=timeline_meta.get("status"),
+            source_context=source_context or timeline_meta.get("source_context"),
+            expected_version=timeline_version,
+        )
+        if timeline_result.startswith("错误："):
+            return (f"部分完成：{note_result}；但聚合更新失败：{timeline_result}。"
+                    "再次调用 memory_commit 可安全重试。")
+        frag_result, frag_title = _sync_timeline_fragment(
+            date_text=date_text, timeline_item=timeline_item,
+            leaf_title=leaf_title, source_context=source_context,
+            timeline_meta=timeline_meta)
+        if frag_result.startswith("错误："):
+            return (f"部分完成：{note_result}；引导页「项目状态」已更新，"
+                    f"但分片写入失败：{frag_result}。再次调用 memory_commit 可安全重试。")
+        result = (f"{note_result}\n已同步「{TIMELINE_TITLE}」当日条目（{frag_title}）"
+                  f"和「项目状态」行。")
+        if "⚠️" in frag_result:
+            result += "\n" + frag_result[frag_result.index("⚠️"):]
+        return result
+    finally:
+        _flush_access_counts()
+        _release_lock()
+
 # 2026-09-06 links 优化（Step4）：memory_read 只回检索必需的核心元数据，
 # 不再回传 links/version 等（links 已取消持久化，即使历史文件残留也不输出）。
 # 2026-09-10 P0：新增 type/confidence/verified/verified_at —— 让读取方一眼判断
 # 「这是用户明说的还是 AI 推断的、可信度如何」，遏制 Memory Poisoning。
 CORE_META_KEYS = ["title", "tags", "summary", "created", "updated", "tier", "access_count", "source",
                   "type", "confidence", "verified", "verified_at",
-                  "scope", "project", "status", "supersedes", "conflicts", "source_context"]
+                  "scope", "project", "status", "supersedes", "conflicts", "source_context",
+                  "security", "clearance"]
 # B5（2026-10-08）：默认预算已外置到 memory.toml 的 `body_truncate_chars`。
 # 本常量保留为**向后兼容别名**（tests/test_context.py 直接读它），运行时真值现取。
 BODY_TRUNCATE_CHARS = memory_config.DEFAULTS["body_truncate_chars"]
@@ -2078,6 +2694,14 @@ def memory_read(title: str, max_chars: int | None = None,
             meta, body = _load_memory(idx_hit)
         except Exception:
             meta, body = {}, ""
+        # 权级闸门：越权与「不存在」返回**逐字节一致**的结果（见 _READER_CLEARANCE
+        # 注释第 3 条）。判定必须先于 access_count 累加 —— 否则受限调用方会靠
+        # 反复读取把 owner 条目的热度刷上去，形成一条侧信道。
+        if not _can_read(meta):
+            _m_inc("read_misses")
+            if fmt == "json":
+                return _json_out({"found": False, "title": title})
+            return f"未找到标题为 '{title}' 的记忆"
         _ACCESS_CACHE[title] = _ACCESS_CACHE.get(title, 0) + 1
         if len(_ACCESS_CACHE) >= _ACCESS_FLUSH_THRESHOLD:
             _flush_access_counts()
@@ -2102,7 +2726,7 @@ def memory_read(title: str, max_chars: int | None = None,
             meta, body = _load_memory(f)
         except Exception:
             continue
-        if _entry_matches(meta, f, title):
+        if _entry_matches(meta, f, title) and _can_read(meta):
             # increment access_count in memory cache (lazy write-back)
             _ACCESS_CACHE[title] = _ACCESS_CACHE.get(title, 0) + 1
             if len(_ACCESS_CACHE) >= _ACCESS_FLUSH_THRESHOLD:
@@ -2137,7 +2761,7 @@ def memory_rebuild_links() -> str:
     校验：扫描全部根目录笔记正文，报告死链（指向不存在的标题）与计数，
     不修改任何文件、不刷新 mtime。
     """
-    all_entries = _iter_entries()
+    all_entries = [e for e in _iter_entries() if _can_read(e[1])]
     # A3：入库标识集合同时收 title 与 permalink —— 指向「改名前的旧标识」的双链
     # 因此不再被误报为死链（permalink 的稳定意义正在于此）。
     # **必须**再收 path.stem —— 生成器渲染双链走 `_wiki_link`，而它按 Obsidian 口径
@@ -2231,6 +2855,8 @@ def _bigram_fallback(keyword_lower: str, tag: str | None, mem_type: str | None,
     hidden = 0
     ranked: list[tuple[int, float, Path, dict[str, Any], str]] = []
     for f, meta, body in _iter_entries():
+        if not _can_read(meta):
+            continue
         entry_tags = _entry_tags(meta)
         if tag and tag.lower() not in [t.lower() for t in entry_tags]:
             continue
@@ -2308,8 +2934,14 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
     # 反而更难发现它是错的）。改为按 `updated` 排序后就不能再「边遍历边截断」，
     # 必须**先收全再排** ⇒ 这里显式收集候选行 `hits`。
     hits: list[tuple[str, str, str]] = []      # (updated, relpath, 渲染行)
+    # 过滤前置：带 tag/type/scope/project/status 时先用索引元数据剪枝，只对候选
+    # 读正文；None = 索引不可用或无过滤条件，走原全扫路径（行为与改动前一致）。
+    cand = _index_candidate_rels(tag=tag, mem_type=mem_type, scope=scope,
+                                 project=project, status=status)
     for search_dir in search_dirs:
         for f in _iter_md_files(search_dir):
+            if cand is not None and f.relative_to(MEMORY_DIR).as_posix() not in cand:
+                continue
             try:
                 meta, body = _load_memory(f)
             except Exception:
@@ -2326,6 +2958,10 @@ def memory_search(keyword: str, tag: str | None = None, limit: int = 20,
             searchable = f"{title} {tags_str} {body}".lower()
 
             if keyword_lower in searchable:
+                # 权级闸门：**静默丢弃**，不计入 hidden。hidden 会渲染成
+                # 「另有 N 条未显示」，在受限端点上等于确认「库里还有更敏感的东西」。
+                if not _can_read(meta):
+                    continue
                 if not _passes_lifecycle_filters(meta, status=status, scope=scope,
                                                  project=project):
                     hidden += 1
@@ -2452,7 +3088,13 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     records: list[dict[str, Any]] = []
     hidden = 0
 
+    # 过滤前置：与 memory_search 同源（见 _index_candidate_rels）。
+    # memory_list 是实际调用量最高的工具（运行时 1643 次），收益最大。
+    cand = _index_candidate_rels(tag=tag, tier=tier, mem_type=mem_type,
+                                 scope=scope, project=project, status=status)
     for f in sorted(_iter_md_files(), reverse=True):
+        if cand is not None and f.relative_to(MEMORY_DIR).as_posix() not in cand:
+            continue
         try:
             meta, body = _load_memory(f)
         except Exception:
@@ -2464,6 +3106,9 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
         if tier and meta.get("tier", "warm") != tier:
             continue
         if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
+            continue
+        # 权级闸门（同 memory_search：静默丢弃，不计数、不提示）
+        if not _can_read(meta):
             continue
         if not _passes_lifecycle_filters(meta, status=status, scope=scope, project=project):
             hidden += 1
@@ -2513,6 +3158,7 @@ def memory_list(tag: str | None = None, limit: int = 20, tier: str | None = None
     return result + _filter_hint(hidden)
 
 @mcp.tool(annotations=_DESTRUCTIVE)
+@_owner_gate
 @_locked_write
 def memory_delete(title: str, trash: bool = True, purge: bool = False,
                   empty_trash: bool = False) -> str:
@@ -2585,6 +3231,7 @@ def memory_delete(title: str, trash: bool = True, purge: bool = False,
     return f"未找到标题为 '{title}' 的记忆"
 
 @mcp.tool(annotations=_WRITE)
+@_owner_gate
 @_locked_write
 def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] | None = None,
                            summary: str | None = None, source: str | None = None,
@@ -2593,7 +3240,9 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
                            scope: str | None = None, project: str | None = None,
                            status: str | None = None, supersedes: str | None = None,
                            conflicts: list[str] | None = None,
-                           source_context: str | None = None) -> str:
+                           source_context: str | None = None,
+                           security: str | None = None,
+                           clearance: str | None = None) -> str:
     """Update only the frontmatter metadata of an entry without rewriting its body.
 
     Useful for changing tier/tags/summary/source of an existing note while keeping
@@ -2671,6 +3320,15 @@ def memory_update_metadata(title: str, tier: str | None = None, tags: list[str] 
                     meta["source_context"] = source_context.strip()
                 else:
                     meta.pop("source_context", None)
+            # v3 访问控制：两字段必须**一起**归一 —— 单独改 clearance 而不管
+            # security 会造出矛盾条目，所以这里把现状也读进来交给 normalize_access。
+            if security is not None or clearance is not None:
+                _sec, _clr = _normalize_access(
+                    security, clearance,
+                    prev_security=meta.get("security"),
+                    prev_clearance=meta.get("clearance"))
+                meta["security"] = _sec
+                meta["clearance"] = _clr
             old_version = meta.get("version", 0)
             meta["version"] = (old_version + 1) if isinstance(old_version, int) else 1
             meta["schema_version"] = SCHEMA_VERSION
@@ -2688,7 +3346,7 @@ def memory_audit() -> str:
     Now also covers filesystem-level issues that frontmatter-only stats miss
     (improvements #8/#9): empty shells, dead links, naming drift.
     """
-    entries = _iter_entries()
+    entries = [e for e in _iter_entries() if _can_read(e[1])]
     if not entries:
         return "记忆库为空"
 
@@ -2699,6 +3357,8 @@ def memory_audit() -> str:
         for f in _iter_md_files(d):
             try:
                 m, _ = _load_memory(f)
+                if not _can_read(m):
+                    continue
                 all_titles.add(_entry_title(m, f))
                 all_titles.add(f.stem)
             except Exception:
@@ -2818,6 +3478,7 @@ def memory_audit() -> str:
 
 
 @mcp.tool(annotations=_RO)
+@_owner_gate
 def memory_doctor(limit: int = 20) -> str:
     """Check SQLite index <-> disk consistency without repairing anything.
 
@@ -2930,6 +3591,7 @@ def memory_doctor(limit: int = 20) -> str:
 
 
 @mcp.tool(annotations=_RO)
+@_owner_gate
 def memory_schema_diff(limit: int = 15) -> str:
     """Diff the frontmatter *structure* across the vault — infer, never repair.
 
@@ -2976,6 +3638,9 @@ def memory_schema_diff(limit: int = 15) -> str:
     v2_missing: list[tuple[str, list[str]]] = []
     v1_entries: list[str] = []
     v1_gap_keys: Counter = Counter()
+    v3_missing: list[tuple[str, list[str]]] = []
+    v3_entries: list[str] = []
+    v3_gap_keys: Counter = Counter()
     unknown: list[tuple[str, list[str]]] = []
     unknown_keys: Counter = Counter()
     opt_used: Counter = Counter()
@@ -3015,7 +3680,10 @@ def memory_schema_diff(limit: int = 15) -> str:
         if miss_core:
             core_missing.append((rel, miss_core))
 
-        if ver >= SCHEMA_VERSION:
+        # v2 键：自 v2 起承诺写出。判定基准必须是**写死的历史常量 2**，不能写
+        # `SCHEMA_VERSION` —— 后者会随版本升级上移，于是「声明 v2 的条目」会突然
+        # 被当成存量货（v3 升级时就踩过：7 条 v2 条目全被归进 v1 迁移清单）。
+        if ver >= 2:
             miss_v2 = [k for k in _SCHEMA_V2_KEYS if k not in keys]
             if miss_v2:
                 v2_missing.append((rel, miss_v2))
@@ -3024,6 +3692,18 @@ def memory_schema_diff(limit: int = 15) -> str:
             for k in _SCHEMA_V2_KEYS:
                 if k not in keys:
                     v1_gap_keys[k] += 1
+
+        # v3 键（访问控制）：自 v3 起承诺写出。v2 及更早缺它们属**预期** ——
+        # 存量 416 条正在这张清单上，因此它不进缺陷数，只当回填输入。
+        if ver >= 3:
+            miss_v3 = [k for k in _SCHEMA_V3_KEYS if k not in keys]
+            if miss_v3:
+                v3_missing.append((rel, miss_v3))
+        else:
+            v3_entries.append(rel)
+            for k in _SCHEMA_V3_KEYS:
+                if k not in keys:
+                    v3_gap_keys[k] += 1
 
         extra = sorted(keys - _SCHEMA_ALL_KNOWN)
         if extra:
@@ -3064,7 +3744,7 @@ def memory_schema_diff(limit: int = 15) -> str:
     _add_section("1. 核心键缺失（有 frontmatter 却缺任何版本都该有的键 —— 真实缺陷）",
                  [f"- {rel}：缺 " + "、".join(ks) for rel, ks in core_missing],
                  len(core_missing))
-    _add_section(f"2. v2 条目缺 v2 必需键（声明了 v{SCHEMA_VERSION} 却没写全）",
+    _add_section(f"2. v2 条目缺 v2 必需键（声明了 v2 及以上却没写全）",
                  _with_lines(v2_missing), len(v2_missing))
 
     out.append(f"## 3. v1 存量迁移清单 — {len(v1_entries)} 条")
@@ -3077,6 +3757,27 @@ def memory_schema_diff(limit: int = 15) -> str:
         if len(v1_entries) > limit:
             out.append(f"- ... 共 {len(v1_entries)} 条，显示前 {limit} 条")
     else:
+        out.append("- 无")
+    out.append("")
+
+    # 刻意**不占用 `## N.` 编号**：这一节是 v3 新增的，若插成「第 4 节」会把后面
+    # 未知键 / 可选键 / 无 frontmatter 的整体编号顶掉，历史调用方与测试的
+    # 「按小节号取正文」全部错位。用无编号标题挂在第 3 节后面，语义与编号都不吃亏。
+    out.append(f"## v3 访问控制字段回填清单 — {len(v3_entries)} 条")
+    if v3_missing:
+        out.append(f"⚠️ 其中 {len(v3_missing)} 条**声明了 v3 却缺访问控制键**（属不一致）：")
+        out.extend(_with_lines(v3_missing[:limit]))
+        out.append("")
+    if v3_entries:
+        out.append("以下条目早于 v3，缺 security / clearance 属**预期**，读取端按 "
+                   "internal / member 兜底，下次写入时自动补齐：")
+        for k in _SCHEMA_V3_KEYS:
+            if v3_gap_keys[k]:
+                out.append(f"- 缺 `{k}`：{v3_gap_keys[k]} 条")
+        out.extend(f"- 样例：{rel}" for rel in v3_entries[:limit])
+        if len(v3_entries) > limit:
+            out.append(f"- ... 共 {len(v3_entries)} 条，显示前 {limit} 条")
+    elif not v3_missing:
         out.append("- 无")
     out.append("")
 
@@ -3099,17 +3800,21 @@ def memory_schema_diff(limit: int = 15) -> str:
     if unreadable:
         _add_section("7. 读取失败（未纳入统计）", unreadable, len(unreadable))
 
-    defects = len(core_missing) + len(v2_missing) + len(unreadable)
+    defects = len(core_missing) + len(v2_missing) + len(v3_missing) + len(unreadable)
     out.append("## 结论")
     if defects:
         out.append(f"- **发现 {defects} 条结构缺陷**"
                    f"（核心键缺失 {len(core_missing)} · v2 缺失 {len(v2_missing)}"
-                   f" · 读取失败 {len(unreadable)}），建议逐条核对。")
+                   f" · v3 缺失 {len(v3_missing)} · 读取失败 {len(unreadable)}），"
+                   "建议逐条核对。")
     else:
-        out.append("- 未发现结构缺陷：所有条目的核心键齐全，声明 v2 的条目亦写全 v2 键。")
+        out.append("- 未发现结构缺陷：所有条目的核心键齐全，声明 v2 / v3 的条目亦写全对应键。")
     if v1_entries:
         out.append(f"- v1 存量 {len(v1_entries)} 条待渐进迁移 —— 可据第 3 节按缺失键"
                    "批量回填，或等其被再次写入时自动补齐。")
+    if v3_entries:
+        out.append(f"- v3 访问控制待回填 {len(v3_entries)} 条（缺 security / clearance）"
+                   "—— 属预期存量，读取端已按 internal / member 兜底，可择机批量补。")
     out.append("> 本工具只诊断不修复；磁盘文件是唯一事实源，改结构走 `memory_write` / "
                "`memory_update_metadata`。")
     return "\n".join(out)
@@ -3118,7 +3823,7 @@ def memory_schema_diff(limit: int = 15) -> str:
 @mcp.tool(annotations=_RO)
 def memory_index_draft() -> str:
     """Generate a draft of the main index without writing it back automatically."""
-    entries = _iter_entries()
+    entries = [e for e in _iter_entries() if _can_read(e[1])]
     if not entries:
         return "记忆库为空"
 
@@ -3144,6 +3849,7 @@ def memory_index_draft() -> str:
     return "\n".join(lines).rstrip()
 
 @mcp.tool(annotations=_DESTRUCTIVE)
+@_owner_gate
 @_locked_write
 def memory_archive(title: str) -> str:
     """Archive a memory entry: move full content to .archive/, leave a summary stub."""
@@ -3269,6 +3975,7 @@ def _restore_from_trash(title: str) -> str:
 
 
 @mcp.tool(annotations=_WRITE_NONIDEM)
+@_owner_gate
 @_locked_write
 def memory_restore(title: str, source: str = "archive") -> str:
     """Restore an entry back to the vault root (P1-7).
@@ -3382,6 +4089,8 @@ def _heat_report(apply: bool) -> str:
             meta, _body = _load_memory(f)
         except Exception:
             continue
+        if not _can_read(meta):
+            continue
         title = _entry_title(meta, f)
         tier_val = meta.get("tier", "warm")
         reads = meta.get("access_count", 0)
@@ -3456,6 +4165,7 @@ def _heat_report(apply: bool) -> str:
 
 
 @mcp.tool(annotations=_WRITE)
+@_owner_gate
 def memory_heat_suggest(apply: bool = False) -> str:
     """Scan entries and suggest tier changes based on access_count and staleness.
 
@@ -3485,12 +4195,17 @@ def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
     输出过长；反向链接改为以「全库正文扫描」为唯一事实源（不读 frontmatter links）。
     """
     all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
+    # 图谱是**标题级**泄露面：即便目标条目本身可读，只要它的出链指向一条
+    # secret 条目，光把标题列出来就已经泄了（「记忆库MCP_凭据」这种标题本身
+    # 就是情报）。因此先算出「当前权级能看见的标题集合」，出链与反链都以它为
+    # 白名单 —— 不可见条目在图谱里彻底不存在。
+    readable_titles = {_entry_title(m, p) for p, m, _b in all_entries if _can_read(m)}
 
     target_path: Path | None = None
     target_meta: dict[str, Any] = {}
     target_body = ""
     for f, meta, body in all_entries:
-        if _entry_matches(meta, f, title):
+        if _entry_matches(meta, f, title) and _can_read(meta):
             target_meta = meta
             target_path = f
             target_body = body
@@ -3500,11 +4215,14 @@ def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
         return '未找到标题为 "{}" 的记忆'.format(title)
 
     outlinks = _extract_wiki_links(target_body)
-    outlinks = [link for link in outlinks if link != title]
+    outlinks = [link for link in outlinks
+                if link != title and link in readable_titles]
 
     backlinks: list[str] = []
     for f, meta, body in all_entries:
         if f == target_path:
+            continue
+        if not _can_read(meta):
             continue
         entry_title = _entry_title(meta, f)
         if title in _extract_wiki_links(body):
@@ -3618,7 +4336,7 @@ def memory_context(title: str, depth: int = 2, max_related: int = 10,
         自动生成的「记忆索引」不参与周边遍历（它的 [[链接]] 只是罗列全库，
         会挤掉真实关联）；但显式传它作为起点时仍可用。
     """
-    all_entries = _iter_entries()
+    all_entries = [e for e in _iter_entries() if _can_read(e[1])]
 
     by_name: dict[str, tuple[Path, dict[str, Any], str]] = {}
     for _f, _meta, _body in all_entries:
@@ -3793,7 +4511,8 @@ def memory_orphans(output_format: str | None = None) -> str:
         fmt = _norm_output_format(output_format)
     except ValueError as e:
         return f"错误：{e}"
-    all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
+    all_entries: list[tuple[Path, dict[str, Any], str]] = [
+        e for e in _iter_entries() if _can_read(e[1])]
 
     backlink_index: dict[str, list[str]] = {}
     title_map: dict[str, tuple[Path, dict[str, Any], str]] = {}
@@ -3858,6 +4577,7 @@ def memory_orphans(output_format: str | None = None) -> str:
     return "\n".join(lines)
 
 @mcp.tool(annotations=_DESTRUCTIVE)
+@_owner_gate
 @_locked_write
 def memory_batch_tag(old_tag: str, new_tag: str) -> str:
     """Rename a tag across all entries."""
@@ -3891,6 +4611,7 @@ def memory_batch_tag(old_tag: str, new_tag: str) -> str:
     return '未找到包含标签 "{}" 的记忆'.format(old_tag)
 
 @mcp.tool(annotations=_WRITE)
+@_owner_gate
 @_locked_write
 def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float | None = None) -> str:
     """Batch-set tier based on heat score range."""
@@ -3929,6 +4650,7 @@ def memory_batch_tier(target_tier: str, min_score: float = 0.0, max_score: float
     return "没有符合筛选条件的记忆"
 
 @mcp.tool(annotations=_DESTRUCTIVE)
+@_owner_gate
 @_locked_write
 def memory_archive_old(days: int = 90) -> str:
     """Archive entries not updated in N days."""
@@ -4002,6 +4724,8 @@ def memory_smart_search(query: str, tag: str | None = None, limit: int = 10,
         if tag and tag not in tags:
             continue
         if mem_type and meta.get("type", DEFAULT_MEMORY_TYPE) != mem_type:
+            continue
+        if not _can_read(meta):
             continue
         if not _passes_lifecycle_filters(meta, status=status, scope=scope, project=project):
             hidden += 1
@@ -4082,6 +4806,8 @@ def memory_recent(days: int = 7, limit: int = 20,
         updated_dt = _parse_dt_utc(updated_str)
         if updated_dt is None:
             continue
+        if not _can_read(meta):
+            continue
         if (now - updated_dt).days <= days:
             title = _entry_title(meta, f)
             summary = str(meta.get("summary", ""))
@@ -4109,7 +4835,10 @@ def memory_recent(days: int = 7, limit: int = 20,
 @mcp.tool(annotations=_RO)
 def memory_stats() -> str:
     """Show memory vault health statistics."""
-    all_entries: list[tuple[Path, dict[str, Any], str]] = _iter_entries()
+    # 统计口径随权级收窄：否则受限端点单看 total 就能推断出库规模与「有多少
+    # 东西瞒着我」，也是侧信道。owner 看到的就是全库。
+    all_entries: list[tuple[Path, dict[str, Any], str]] = [
+        e for e in _iter_entries() if _can_read(e[1])]
     now = datetime.now(timezone.utc)
 
     total = len(all_entries)
@@ -4220,6 +4949,23 @@ def memory_stats() -> str:
     for st in LIFECYCLE_STATUSES:
         lines.append(f"- {st}: {status_counter.get(st, 0)} 条")
     lines.append("")
+    # v3 访问控制分布：只在**全权视角**（owner）输出。受限调用方看到「secret
+    # 有 12 条」这种行，等于拿到了自己够不着的那部分的地图。
+    if current_clearance() == "owner":
+        sec_counter: Counter = Counter()
+        clr_counter: Counter = Counter()
+        for _f, _m, _b in all_entries:
+            _s, _c = _meta_access(_m)
+            sec_counter[_s] += 1
+            clr_counter[_c] += 1
+        lines.append("## 安全等级分布（v3）")
+        for lvl in SECURITY_LEVELS:
+            lines.append(f"- {lvl}: {sec_counter.get(lvl, 0)} 条")
+        lines.append("")
+        lines.append("## 权级门槛分布（v3）")
+        for lvl in CLEARANCE_LEVELS:
+            lines.append(f"- {lvl}: {clr_counter.get(lvl, 0)} 条")
+        lines.append("")
     lines.append("## 写入方上下文分布（P1）")
     if context_counter:
         for ctx, c in context_counter.most_common(10):
@@ -4315,6 +5061,7 @@ def _cfg_report(st: dict[str, Any], *, written: bool) -> str:
 
 
 @mcp.tool(name="memory_config", annotations=_WRITE)
+@_owner_gate
 def _memory_config_tool(action: str = "get", values: dict[str, Any] | None = None,
                         output_format: str | None = None) -> str:
     """Read or update the runtime thresholds stored in `memory.toml` at the vault root.
@@ -4543,6 +5290,7 @@ def _deferred_restart(argv: list[str], delay: float) -> None:
 
 
 @mcp.tool(annotations=_WRITE_NONIDEM)
+@_owner_gate
 def memory_restart(delay: float | None = None) -> str:
     """Restart this MCP server in place so edited server.py / module code takes effect at once.
 

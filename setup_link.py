@@ -107,6 +107,98 @@ class Client:
     note: str = ""
     unverified: bool = False                    # 路径未在本机验证：只改已存在的文件，绝不新建
     snippet: str = "json"                       # 手工片段风格：json / toml / zed / opencode / none
+    rules_path: Path | None = None              # 用户级"预置规则"文件：自动注入用，None=不部署
+
+
+# --------------------------------------------------------------------------
+# 预置规则（让客户端启动时就知道记忆库的存在与用法）
+# --------------------------------------------------------------------------
+
+RULES_BEGIN = "<!-- ai-memory:begin -->"
+RULES_END = "<!-- ai-memory:end -->"
+
+RULES_BODY = """## 共享记忆库（ai-memory）
+
+本机装有一套跨 AI 共享的 Markdown 记忆库（MCP 服务名 `ai-memory`）。
+
+**开工先查**：涉及既有项目、设备参数、历史决策、用户偏好时，先用 `memory_search` 查关键词，
+再用 `memory_read` 读全文；新会话或恢复会话时先读「近期工作动态」。不要凭印象作答。
+
+**写入先查重**：确需记录时用 `memory_commit`；写前 `memory_search` 查重，命中后 `memory_read`
+核对，优先更新旧条目而不是新建重复条目。
+
+- 该写：明确要求记住、技术决策、已修复的问题、实质项目进展、明确表达的新偏好。
+- 不该写：普通问答、临时琐事、密钥与任何凭据。
+- 可信度：AI 推断的内容标 `verified=false`，不得写成已确认事实。
+
+项目笔记由服务端同步「近期工作动态」与项目状态表，不必手工重复维护。
+"""
+
+
+def rules_block() -> str:
+    """受管区块：重复写入同一区块，不碰用户自己写的内容。"""
+    return f"{RULES_BEGIN}\n{RULES_BODY}{RULES_END}\n"
+
+
+def rules_state(client: Client) -> str:
+    """预置规则文件的当前状态：none / absent / same / stale。"""
+    p = client.rules_path
+    if p is None:
+        return "none"
+    if not p.is_file():
+        return "absent"
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "absent"
+    if RULES_BEGIN not in raw:
+        return "stale"
+    start = raw.find(RULES_BEGIN)
+    end = raw.find(RULES_END)
+    if end < 0:
+        return "stale"
+    current = raw[start:end + len(RULES_END)].strip()
+    return "same" if current == rules_block().strip() else "stale"
+
+
+def write_rules(client: Client) -> tuple[bool, str]:
+    """把预置规则写入用户级文件。返回 (是否改动, 说明)。
+
+    安全约束：客户端未安装不写；只用受管区块替换，绝不覆盖用户已有内容。
+    """
+    p = client.rules_path
+    if p is None:
+        return False, "该客户端不支持预置文件"
+    if not any(d.is_dir() for d in client.probe):
+        return False, "客户端未安装，跳过预置文件"
+
+    state = rules_state(client)
+    if state == "same":
+        return False, "预置文件已是最新"
+
+    newline = "\n"
+    old = ""
+    if p.is_file():
+        try:
+            old = p.read_text(encoding="utf-8", errors="replace")
+            newline = _detect_newline(old)
+        except OSError:
+            old = ""
+
+    if RULES_BEGIN in old and RULES_END in old:
+        head = old[: old.find(RULES_BEGIN)]
+        tail = old[old.find(RULES_END) + len(RULES_END):]
+        text = head + rules_block().rstrip("\n") + tail
+    else:
+        sep = "" if not old or old.endswith("\n") else newline
+        text = old + sep + (newline if old.strip() else "") + rules_block()
+
+    if newline != "\n":
+        text = text.replace("\n", newline)
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _write_text_atomic(p, text)
+    return True, str(p)
 
 
 def clients() -> list[Client]:
@@ -125,11 +217,13 @@ def clients() -> list[Client]:
             paths=(h / ".workbuddy" / "mcp.json",),
             probe=(h / ".workbuddy",),
             requires_type=True,
+            rules_path=h / ".workbuddy" / "CODEBUDDY.md",
         ),
         Client(
             id="claude_code", name="Claude Code", kind="json", layout="mcpServers",
             paths=(h / ".claude.json",),
             probe=(h / ".claude", h / ".claude.json"),
+            rules_path=h / ".claude" / "CLAUDE.md",
         ),
         Client(
             id="claude_desktop", name="Claude Desktop", kind="json", layout="mcpServers",
@@ -140,6 +234,7 @@ def clients() -> list[Client]:
             id="codex", name="Codex", kind="toml", layout="mcp_servers",
             paths=(h / ".codex" / "config.toml",),
             probe=(h / ".codex",),
+            rules_path=h / ".codex" / "AGENTS.md",
         ),
         # ---- 路径按官方文档约定（未在本机实测，但路径稳定，允许创建配置）----
         Client(
@@ -151,11 +246,13 @@ def clients() -> list[Client]:
             id="windsurf", name="Windsurf", kind="json", layout="mcpServers",
             paths=(h / ".codeium" / "windsurf" / "mcp_config.json",),
             probe=(h / ".codeium" / "windsurf",),
+            rules_path=h / ".codeium" / "windsurf" / "memories" / "global_rules.md",
         ),
         Client(
             id="gemini", name="Gemini CLI", kind="json", layout="mcpServers",
             paths=(h / ".gemini" / "settings.json",),
             probe=(h / ".gemini",),
+            rules_path=h / ".gemini" / "GEMINI.md",
         ),
         Client(
             id="qwen", name="Qwen Code", kind="json", layout="mcpServers",
@@ -818,6 +915,10 @@ def apply_status(
     if st.state == ST_MANUAL or not c.auto:
         return ApplyResult(c.id, c.name, "manual", c.note or MANUAL_NOTE)
     if st.state == ST_LINKED and not force:
+        # 配置已经连上了，但预置规则文件可能还没部署过 —— 顺手补齐
+        changed, why = write_rules(c)
+        if changed:
+            return ApplyResult(c.id, c.name, "written", f"配置无需改动；预置文件已更新：{why}", None)
         return ApplyResult(c.id, c.name, "skipped", "已是最新")
 
     path = st.config_path or c.paths[0]
@@ -825,7 +926,10 @@ def apply_status(
 
     if dry_run:
         what = "创建配置并写入" if st.state == ST_NO_CONFIG else "修正条目"
-        return ApplyResult(c.id, c.name, "planned", f"{what}：{path}")
+        extra = ""
+        if c.rules_path is not None and rules_state(c) in ("absent", "stale"):
+            extra = f"；并写预置文件 {c.rules_path}"
+        return ApplyResult(c.id, c.name, "planned", f"{what}：{path}{extra}")
 
     backup = backup_config(path)
     try:
@@ -850,8 +954,18 @@ def apply_status(
                 pass
         return ApplyResult(c.id, c.name, "failed", f"{why}（已回滚）", backup)
 
+    detail = str(path)
+    try:
+        changed, why = write_rules(c)
+        if changed:
+            detail = f"{path}；预置文件 {why}"
+        elif c.rules_path is not None and why != "预置文件已是最新":
+            detail = f"{path}；预置文件未写：{why}"
+    except Exception as e:  # noqa: BLE001 预置文件失败不影响 MCP 配置
+        detail = f"{path}；预置文件写入异常：{type(e).__name__}: {e}"
+
     action = "written" if st.state != ST_NO_CONFIG else "written"
-    return ApplyResult(c.id, c.name, action, str(path), backup)
+    return ApplyResult(c.id, c.name, action, detail, backup)
 
 
 def apply_all(

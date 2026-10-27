@@ -132,7 +132,8 @@ def main() -> int:
     check("E4 scope 保留", fm.get("scope") == "project", str(fm.get("scope")))
     check("E5 project 保留", fm.get("project") == "测试项目", str(fm.get("project")))
     check("E6 status 保留", fm.get("status") == "active", str(fm.get("status")))
-    check("E7 schema_version 保留为 2", str(fm.get("schema_version")) == "2",
+    check(f"E7 schema_version 保留为当前版本 {server.SCHEMA_VERSION}",
+          str(fm.get("schema_version")) == str(server.SCHEMA_VERSION),
           str(fm.get("schema_version")))
 
     print("\n== F. 核心页不被自动降级 ==")

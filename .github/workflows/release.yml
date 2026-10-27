@@ -39,6 +39,14 @@
 # ⚠️ 2026-10-22 校验和：每个二进制附件同附 `<文件名>.sha256`（`sha256sum` 格式，
 #   一行，只记裸文件名）。2026-10-16 弃用的是「多文件合并成 SHA256SUMS.txt」那种
 #   清单，理由是清单与安装集不同步；逐文件 .sha256 无此问题，也便于 `sha256sum -c`。
+#
+# ⚠️ 2026-10-27 正文口径：Release 正文优先取 `.github/release-notes/<tag>.md`。
+#   此前一律 `--generate-notes`，正文只有 "What's Changed" 和 PR 列表 —— 那是给
+#   改代码的人看的，而 Release 正文的读者是**装了但不动代码的人**（他们要知道
+#   「这版对我有什么变化、要不要重建索引、升级会不会覆盖配置」）。三仓现已统一：
+#   docker 仓最先这么改，本仓与 web 仓跟进，保证同一版本的正文口径一致。
+#   打 tag 前在 `.github/release-notes/<tag>.md` 写一份用户视角的说明；不写也能发，
+#   但会退回自动生成，正文质量就是原来那样。
 name: Release
 
 on:
@@ -118,7 +126,14 @@ jobs:
             if [ -n "$SUBJ" ]; then TITLE="$SUBJ"; fi
           fi
           echo "release title = $TITLE"
-          gh release create "$TAG" --title "$TITLE" --generate-notes
+          NOTES_FILE=".github/release-notes/$TAG.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "release body = $NOTES_FILE（人工写，用户视角）"
+            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            echo "release body = 自动生成（未提供 $NOTES_FILE）"
+            gh release create "$TAG" --title "$TITLE" --generate-notes
+          fi
 
       # 安装器只做「搬运」：把仓库里那份 dist/ai-memory-setup.exe 原样挂成附件，
       # 不在 CI 里重建（CI 构建的产物与该 tag 源码不是同一份事实源）。缺文件即红，

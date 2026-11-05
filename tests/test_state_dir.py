@@ -9,17 +9,17 @@
     锁等待、索引重建次数）。于是引入 `AI_MEMORY_STATE_DIR` 指向独立卷 `/state`。
 
     这条改动的危险点不在「新功能不生效」，而在**静默回落**：
-      * 目录不可写时不阻塞启动 ⇒ 一切看起来正常，只是数据悄悄落回镜像层；
+      * 目录不可写时不阻塞启动 -> 一切看起来正常，只是数据悄悄落回镜像层；
       * 卷挂载点存在但属主不对时 `mkdir` 会成功，直到写 sqlite 才失败；
       * 而 sqlite 失败的处置路径是「降级为全库扫描」—— 连报错都没有。
     所以本脚本断言的重点是**落点**与**回落时必须吭声**，不是「跑得通」。
 
 本脚本的断言口径（都可证伪）:
-    S1  未设变量 ⇒ 落点仍是源码目录（裸跑行为与 v3.0 逐字节一致，不能借这次
+    S1  未设变量 -> 落点仍是源码目录（裸跑行为与 v3.0 逐字节一致，不能借这次
         改动悄悄搬家）。
-    S2  设了可写目录 ⇒ 索引 db 与指标 json **都**落那里，且 db 真的能建表、
+    S2  设了可写目录 -> 索引 db 与指标 json **都**落那里，且 db 真的能建表、
         真的能写进条目（只比字符串等于没测）。
-    S3  设了不可用目录 ⇒ **回落源码目录 + stderr 必须有一句告警**。
+    S3  设了不可用目录 -> **回落源码目录 + stderr 必须有一句告警**。
         只回落不吭声等于把「卷没挂上」伪装成「一切正常」，这是本条的主体。
     S4  叶子模块 `db_path` / `path_for` 保持**纯函数**（不做 IO、不建目录）——
         一旦它们偷偷 mkdir，S3 的告警就失去意义（目录由模块建了，回落分支永远
@@ -119,8 +119,15 @@ def child(case: str) -> int:
 # 父进程模式：跑三个子进程 + 纯函数断言
 # ---------------------------------------------------------------------------
 def run_child(case: str) -> tuple[int, dict, str]:
+    # 两端编码必须一起钉成 utf-8：子进程（尤其 Windows 默认 GBK 输出）与父进程
+    # 解码口径不一致时，父进程会在读线程里抛 UnicodeDecodeError 并让 p.stderr
+    # 变成 None（断言处只报 "argument of type 'NoneType' is not iterable"，
+    # 看不出真因）；更隐蔽的是「解码成功但全是乱码」，于是告警关键词永远匹配
+    # 不上，测试会以一副「功能坏了」的样子失败。
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     p = subprocess.run([sys.executable, str(Path(__file__).resolve()), f"--case={case}"],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, encoding="utf-8", errors="replace",
+                       timeout=120, env=env)
     payload: dict = {}
     for line in p.stdout.splitlines():
         if line.startswith("__JSON__"):
@@ -144,7 +151,7 @@ def main() -> int:
     baseline = repo_state_files()
 
     # ---- S1 未设 --------------------------------------------------------
-    print("[S1] 未设 AI_MEMORY_STATE_DIR ⇒ 落回源码目录（裸跑行为不变）")
+    print("[S1] 未设 AI_MEMORY_STATE_DIR -> 落回源码目录（裸跑行为不变）")
     rc, j, _err = run_child("s1")
     check("S1a 子进程正常退出", rc == 0, f"rc={rc}")
     check("S1b _STATE_DIR == 源码目录",
@@ -155,7 +162,7 @@ def main() -> int:
           Path(j.get("metrics_path", "/x")).parent == _REPO, j.get("metrics_path"))
 
     # ---- S2 可写 --------------------------------------------------------
-    print("\n[S2] 设了可写目录 ⇒ 索引 db 与指标 json 都落那里，且真能写")
+    print("\n[S2] 设了可写目录 -> 索引 db 与指标 json 都落那里，且真能写")
     rc, j, err2 = run_child("s2")
     tmp = Path(j.get("tmp", "/nonexistent"))
     state = tmp / "state"
@@ -172,7 +179,7 @@ def main() -> int:
           [l for l in err2.splitlines() if "STATE_DIR" in l])
 
     # ---- S3 不可用 ------------------------------------------------------
-    print("\n[S3] 设了不可用目录 ⇒ 回落源码目录，且必须告警")
+    print("\n[S3] 设了不可用目录 -> 回落源码目录，且必须告警")
     rc, j, err3 = run_child("s3")
     check("S3a 子进程不崩（索引与指标都不该成为启动故障点）", rc == 0, f"rc={rc}")
     check("S3b 回落到源码目录", j.get("state_dir") == j.get("server_dir"),

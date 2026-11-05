@@ -37,6 +37,7 @@ import logging
 import sys
 import threading
 import functools
+import inspect
 
 logger = logging.getLogger("ai-memory")
 _log_handler = logging.StreamHandler(sys.stderr)
@@ -1436,11 +1437,20 @@ def _readonly_endpoint(tool: str) -> str | None:
     return None
 
 
+#: `_owner_gate` 打在包装函数上的标记属性名。**必须定义在 `_owner_gate` 之前** ——
+#: 装饰器在工具定义处就会执行并读取它，靠「模块顶层后置赋值」是能跑通的，但把
+#: 顺序依赖藏起来，日后有人把工具定义上移就会撞出 NameError。
+_OWNER_GATE_MARKER = "__ai_memory_owner_gate__"
+
+
 def _owner_gate(fn):
     """把 `_owner_only` 包成装饰器，供写/诊断类工具统一挂载。
 
     挂载顺序固定为 `@mcp.tool(...)` → `@_owner_gate` → `@_locked_write`：
     先判权再拿锁，受限调用不会白占锁、也不会在锁里做一次无意义的拒绝。
+
+    包装后在函数对象上打 ``__ai_memory_owner_gate__`` 标记，供 `_audit_tool_gates`
+    反射识别 —— 光看 ``__wrapped__`` 不够，`_locked_write` 也会留下它。
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -1448,7 +1458,143 @@ def _owner_gate(fn):
         if denied is not None:
             return denied
         return fn(*args, **kwargs)
+    setattr(wrapper, _OWNER_GATE_MARKER, True)
     return wrapper
+
+
+# ---- 工具权限声明门禁（2026-11-05） ------------------------------------------
+# 为什么要有这道自检：v3.3.0 把写操作与底层诊断**逐个**挂了 @_owner_gate，但那是
+# 人工约定 —— 新增一只写工具忘了挂，代码照跑、既有测试照绿，直到有人从受限端点
+# 调到了它。这类退化不会自己暴露，只会随时间累积，是权限护栏最现实的失效路径。
+# 故把「哪些工具必须有门」写成声明表，在模块加载完（工具全部注册后）反射校验：
+# **漏挂即启动失败**。
+#
+# 三类别语义不同，不能合并成一张名单：
+#   * `_TIERED_WRITE_TOOLS`：写权按档位分级（member 可写普通条目，但不能抬高
+#     敏感度），守卫是 `_readonly_endpoint` 而非 owner-only ⇒ 要求函数体真的
+#     调用了它，而不是要求 @_owner_gate。
+#   * 其余写/破坏性工具：只对 owner 开放 ⇒ 必须挂 @_owner_gate。
+#   * `_OWNER_ONLY_READ_TOOLS`：只读，但**返回值本身就是情报**（全库文件名、
+#     缺字段清单），没有「过滤后仍可用」的形态 ⇒ 同样必须 owner-only。
+#
+# 刻意**不**对普通只读工具做「是否调用了 _can_read」的文本检查：过滤常经
+# `_filter_readable` / 索引候选剪枝等多条路径发生，按源码字符串判定只会产生
+# 假阳性噪音。那类覆盖由 tests/test_tool_gates.py 的行为测试钉住。
+_TIERED_WRITE_TOOLS = frozenset({"memory_write", "memory_commit"})
+_OWNER_ONLY_READ_TOOLS = frozenset({"memory_doctor", "memory_schema_diff"})
+
+
+def _is_owner_gated(fn: Any) -> bool:
+    """沿 ``__wrapped__`` 链判断函数是否被 ``_owner_gate`` 包过。"""
+    cur = fn
+    for _ in range(8):
+        if getattr(cur, _OWNER_GATE_MARKER, False):
+            return True
+        code = getattr(cur, "__code__", None)
+        # 兼容打标记之前的旧包装：wrapper 的字节码里引用了 _owner_only。
+        if code is not None and "_owner_only" in code.co_names:
+            return True
+        if not hasattr(cur, "__wrapped__"):
+            return False
+        cur = cur.__wrapped__
+    return False
+
+
+def _calls_tiered_write_guard(fn: Any) -> bool:
+    """分级写工具是否真的调用了 ``_readonly_endpoint``。
+
+    判据优先用**字节码名字表**（``co_names``），而不是读源码文本：
+
+    * 源码判定依赖 ``inspect.getsource``，它在**冻结/打包/zipimport/exec 加载**
+      的代码上会失败 —— 那时 ``memory_write`` / ``memory_commit`` 会被误判成
+      「没校验写权」，自检直接拒启，把一个纯环境差异变成启动故障。
+    * 代价也是同一个：源码判定可能被注释或字符串里的 ``_readonly_endpoint(``
+      骗过，而名字表不会。
+    * 仅仅**引用**该名字（哪怕没有调用）已足以说明这个函数动过写权校验，
+      作为「有没有挂这道守卫」的判据足够强。
+
+    只有在拿不到代码对象（纯 Python 包装、C 扩展包装等）时才退回读源码。
+    """
+    code = getattr(inspect.unwrap(fn), "__code__", None)
+    if code is not None:
+        return "_readonly_endpoint" in code.co_names
+    try:
+        src = inspect.getsource(inspect.unwrap(fn))
+    except (OSError, TypeError):
+        return False
+    return "_readonly_endpoint(" in src
+
+
+def _gate_violation(name: str, annotations: Any, fn: Any) -> str | None:
+    """判定单个工具是否违反门禁声明；合规返回 None。
+
+    纯判定、不读 vault，故可在模块加载期与单元测试里直接调用。
+    """
+    if name in _OWNER_ONLY_READ_TOOLS:
+        if not _is_owner_gated(fn):
+            return (f"{name}: 底层诊断类只读工具必须挂 @_owner_gate"
+                    "（它的返回值本身就是情报，无法过滤后仍可用）")
+        return None
+    if getattr(annotations, "readOnlyHint", None) is False:
+        if name in _TIERED_WRITE_TOOLS:
+            if not _calls_tiered_write_guard(fn):
+                return f"{name}: 分级写工具必须调用 _readonly_endpoint 校验写权"
+            return None
+        if not _is_owner_gated(fn):
+            return f"{name}: 写/破坏性工具未挂 @_owner_gate"
+    return None
+
+
+def _registered_tools() -> list[Any]:
+    """取 FastMCP 已注册工具清单。
+
+    注册表是私有属性，故多路探测；**拿不到就报错而不是跳过** —— 安全自检
+    「因为读不到所以没检查」等于没有自检（fail closed）。
+    """
+    tm = getattr(mcp, "_tool_manager", None)
+    if tm is None:
+        raise RuntimeError("工具门禁自检：FastMCP 缺少 _tool_manager，无法枚举工具。")
+    if hasattr(tm, "list_tools"):
+        return list(tm.list_tools())
+    tools = getattr(tm, "_tools", None)
+    if tools is not None:
+        return list(tools.values())
+    raise RuntimeError("工具门禁自检：无法从 _tool_manager 取得工具清单。")
+
+
+def _audit_tool_gates(*, strict: bool | None = None, tools: Any = None) -> list[str]:
+    """反射校验所有已注册工具的门禁声明，返回违规描述清单（合规为空表）。
+
+    默认 fail closed：有违规就抛 RuntimeError，让服务**起不来**而不是带病运行。
+    排障时可用 ``AI_MEMORY_TOOL_GATE_AUDIT=warn`` 降级为只告警 —— 该开关仅用于
+    第三方 mcp 版本差异导致的误判，不应长期设置。
+
+    ``tools`` 仅供测试注入：None 时取 FastMCP 注册表，否则按传入对象序列校验
+    （每项需有 ``name`` / ``fn`` / 可选 ``annotations``）。留这个缝是为了让
+    「漏挂门禁会不会被拦住」这件事能写进测试，而不是只能靠人肉 review。
+
+    输出一律走 logger（stderr）：stdio 模式下 stdout 是 MCP 协议通道，任何 print
+    都会破坏会话。
+    """
+    if strict is None:
+        strict = os.environ.get("AI_MEMORY_TOOL_GATE_AUDIT", "strict").strip().lower() != "warn"
+    bad: list[str] = []
+    for tool in (tools if tools is not None else _registered_tools()):
+        fn = getattr(tool, "fn", None)
+        name = getattr(tool, "name", None) or getattr(fn, "__name__", "<unknown>")
+        problem = _gate_violation(name, getattr(tool, "annotations", None), fn)
+        if problem:
+            bad.append(problem)
+    if bad:
+        detail = "\n  - " + "\n  - ".join(bad)
+        if strict:
+            raise RuntimeError(
+                f"MCP 工具权限声明自检未通过（{len(bad)} 项）：{detail}\n"
+                "修复：写/破坏性工具加 @_owner_gate；分级写工具调用 _readonly_endpoint；"
+                "只读诊断工具挂 @_owner_gate 并列入 _OWNER_ONLY_READ_TOOLS。")
+        logger.error("MCP 工具权限声明自检有 %d 项违规（已按 warn 模式放行）：%s",
+                     len(bad), detail)
+    return bad
 
 
 def _apply_meta_defaults(meta: dict[str, Any]) -> dict[str, Any]:
@@ -5351,6 +5497,12 @@ def memory_restart(delay: float | None = None) -> str:
         "若数秒后所有调用都超时，说明新进程未能起来，请用 UI 重连该 MCP 服务"
         "（旧代码与记忆库数据均未受影响）。"
     )
+
+
+# 工具全部注册完毕后跑一次权限声明自检：漏挂门禁 ⇒ 启动失败（fail closed）。
+# 必须放在文件末尾 —— 工具由装饰器在**定义时**注册，提前跑等于什么都查不到，
+# 那正是「自检通过但什么都没检查」这种最坏的假安全。
+_audit_tool_gates()
 
 
 # 接力进程：把客户端既有会话视为已初始化，否则它会拒绝一切请求（约束②）。

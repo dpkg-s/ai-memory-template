@@ -82,6 +82,30 @@
 
 stdio（本机 `python server.py`）恒为 owner 且可写，行为与改动前完全一致。受限端点上越权读取返回的**与「条目不存在」逐字节同构**（不给 403、不说「权限不足」），图谱 / 索引 / 孤立清单也一并按标题过滤 —— 否则光列标题就泄了。
 
+**令牌从哪来、谁在管生命周期**（2026-11-05 复核）：MCP 上游（`transport_http`）只认**路径档位**，不持有任何 token —— 它假定自己在回环上、只被控制台反代。per-client 令牌的全部生命周期（签发、`expires_at`、`max_uses`/`uses`、`enabled` 停用、`revoke` 吊销、`last_used_at`、角色 → 视野 / 读写上限）在 **Web 控制台** `web-console/web_store.py` 的 `TokenStore` 里；`AuthMiddleware` 对 `/mcp` 与 `/api/*` 同一口径校验，再按该令牌的 `clearance` / `access` 把请求转发到对应档位端点（`resolve_mcp`）。
+
+因此**部署边界是安全边界**：MCP 上游若被容器网络内其它成员或外部直连，等于绕过令牌。保持它只在回环监听（或由控制台独占反代）是这条链成立的前提，不是可选优化。入口级回归见 `web-console/tests/test_web.py` 的 D20~D28（吊销 / 过期 / 停用 / 次数耗尽 / `?token=` 通道 / 视野落点）。
+
 写侧的拒绝语则**明说**「该端点为只读」：调用方本来就是从 `-ro` 端点进来的，这句话不泄露任何它尚未知道的信息，而且能让人一眼分清「选错了身份」还是「选错了端点」。
+
+### 工具门禁声明自检（2026-11-05）
+
+`@_owner_gate` 是**人工约定** —— 新增一只写工具忘了挂，代码照跑、既有测试照绿，直到有人从受限端点调到了它。这类退化不会自己暴露，只会随时间累积，是权限护栏最现实的失效路径。故把「哪些工具必须有门」写成声明表，在模块加载末尾（工具全部注册之后）反射校验：**漏挂即启动失败**，绝不让一个「表面隔离、实际全权」的端点上线。
+
+判据分三类，语义不同、不能合并：
+
+| 类别 | 工具 | 要求 |
+| --- | --- | --- |
+| 分级写 | `memory_write` / `memory_commit` | 函数体必须调用 `_readonly_endpoint`（`member` 可写普通条目，但不得抬高敏感度） |
+| 其余写 / 破坏性 | `delete` / `archive` / `restore` / `batch_*` / `archive_old` / `update_metadata` / `heat_suggest` / `config` / `restart` | 必须挂 `@_owner_gate` |
+| 只读但泄底 | `memory_doctor` / `memory_schema_diff` | 必须挂 `@_owner_gate`（返回值本身就是情报，没有「过滤后仍可用」的形态） |
+
+新增工具时：
+
+- 写 / 破坏性工具挂了 `@_owner_gate` 即自动通过，**不需要**改声明表。
+- 新增一只「只读但会吐出全库结构」的诊断工具，须同时挂 `@_owner_gate` 并加入 `_OWNER_ONLY_READ_TOOLS`，否则自检拒启（错误信息会点名该工具）。
+- 普通只读工具**不**做源码文本检查：过滤常经 `_filter_readable` / 索引候选剪枝等多条路径发生，按字符串判定只会制造假阳性；那类覆盖由 `tests/test_tool_gates.py` 的**行为**测试钉住（受限视野下 stats / orphans / graph 的输出逐项断言）。
+
+排障开关：`AI_MEMORY_TOOL_GATE_AUDIT=warn` 把自检降级为只告警 —— 仅用于第三方 `mcp` 版本差异导致的误判，不应长期设置。自检输出一律走 stderr（stdio 模式下 stdout 是 MCP 协议通道，任何 print 都会破坏会话）。
 
 ---

@@ -355,6 +355,97 @@ def main() -> int:
           probe_order == ["项目", "其他", "故障"], str(probe_order))
 
     # =================================================================
+    # L. 二级延伸（2026-10-29 方案 B）
+    # 背景：vault 实测 558 篇里 91 篇平铺在 `项目/` 根下，其中 11 篇标题写作
+    # `项目_记忆库v3.1_xxx`，语义上明确属于已存在的 `项目/记忆库v3.1/`。
+    # 规则只认**已存在的二级目录**（绝不创造新目录）：目录不存在就退回一级，
+    # 故落点永远不会比改动前更差 —— 最坏也只是停在语义正确的父目录内。
+    print("\n[L] 标题前缀的二级延伸（只认已存在子目录）")
+    (_ROOT / "项目").mkdir(exist_ok=True)
+    (_ROOT / "项目" / "记忆库v3.1").mkdir(exist_ok=True)
+    (_ROOT / "项目" / "A").mkdir(exist_ok=True)
+    (_ROOT / "项目" / "A_B").mkdir(exist_ok=True)
+
+    check("L1 二级存在时延伸（纯函数）",
+          server._subdir_extend("项目_记忆库v3.1_主题切换", "项目") == "项目/记忆库v3.1",
+          repr(server._subdir_extend("项目_记忆库v3.1_主题切换", "项目")))
+    check("L2 二级不存在时返回 None",
+          server._subdir_extend("项目_不存在的子目录_某条目", "项目") is None,
+          repr(server._subdir_extend("项目_不存在的子目录_某条目", "项目")))
+    check("L3 两段式不延伸（至少留一段作条目名）",
+          server._subdir_extend("项目_记忆库v3.1", "项目") is None,
+          repr(server._subdir_extend("项目_记忆库v3.1", "项目")))
+    check("L4 长匹配优先（A_B 存在时不被 A 抢先）",
+          server._subdir_extend("项目_A_B_条目", "项目") == "项目/A_B",
+          repr(server._subdir_extend("项目_A_B_条目", "项目")))
+    check("L5 一级不匹配则不做任何延伸（桶表推断的父目录不参与）",
+          server._subdir_extend("记忆库v3.1_某条目", "项目") is None,
+          repr(server._subdir_extend("记忆库v3.1_某条目", "项目")))
+    check("L6 核心页不延伸",
+          server._subdir_extend("记忆索引_副标题", "项目") is None,
+          repr(server._subdir_extend("记忆索引_副标题", "项目")))
+
+    title_l = "项目_记忆库v3.1_二级落点测试"
+    r = server.memory_write(title_l, "二级延伸落地测试。", tags=[])
+    check("L7 memory_write 落入二级目录",
+          _exists(f"项目/记忆库v3.1/{server._safe_filename(title_l)}"), repr(r))
+    check("L8 返回消息注明二级落点",
+          "已自动归类到 项目/记忆库v3.1/" in r, repr(r))
+    meta_l, _bl = server._load_memory(
+        _ROOT / "项目" / "记忆库v3.1" / server._safe_filename(title_l))
+    check("L9 frontmatter title 仍是裸标题（不含目录）",
+          meta_l.get("title") == title_l, repr(meta_l.get("title")))
+
+    title_l2 = "项目_无此子目录_兜底测试"
+    r = server.memory_write(title_l2, "子目录不存在应退回一级。", tags=[])
+    check("L10 子目录不存在 -> 退回一级 项目/",
+          _exists(f"项目/{server._safe_filename(title_l2)}"), repr(r))
+
+    check("L11 桶表推断的一级不外溢成二级",
+          server._suggest_dir("随便一个条目", ["project"]) == "项目",
+          repr(server._suggest_dir("随便一个条目", ["project"])))
+
+    draft = server.memory_index_draft()
+    seg = draft.split("## 项目", 1)[-1].split("\n## ", 1)[0] if "## 项目" in draft else ""
+    check("L12 二级落点仍归 项目 桶（索引分组不受落盘深度影响）",
+          title_l in seg, seg[:200])
+
+    # =================================================================
+    # M. 标题开头匹配 + TTS 主题桶（2026-10-29）
+    # 背景：`其他/` 里 13 篇 `AstrBot启动失败_…`、3 篇 `Windows_…`，首段带着
+    # 修饰语，永远不等于目录名 ⇒ 全沉在「其他」。放开为「标题以目录名开头」
+    # 后即可归位；同时用 GENERIC_DIRS 白名单挡住 `项目xxx`/`技术yyy` 这类误吸。
+    print("\n[M] 标题开头匹配、通用词白名单与 TTS 主题桶")
+    for d in ("AstrBot", "Windows", "TTS", "技术", "H29K", "H29K网络"):
+        (_ROOT / d).mkdir(exist_ok=True)
+
+    check("M1 标题以目录名开头即命中（首段带修饰语也认）",
+          server._dir_prefix_hit("AstrBot启动失败_端口保留段", server._known_dirs()) == "AstrBot",
+          repr(server._dir_prefix_hit("AstrBot启动失败_端口保留段", server._known_dirs())))
+    check("M2 首段等于目录名仍优先（原有行为不变）",
+          server._dir_prefix_hit("Windows_异常关机排查", server._known_dirs()) == "Windows",
+          repr(server._dir_prefix_hit("Windows_异常关机排查", server._known_dirs())))
+    check("M3 通用词目录不参与开头匹配（技术选型记录 不落 技术/）",
+          server._suggest_dir("技术选型记录", []) != "技术",
+          repr(server._suggest_dir("技术选型记录", [])))
+    check("M4 多目录命中取最长（H29K网络 优先于 H29K）",
+          server._dir_prefix_hit("H29K网络设备调试", server._known_dirs()) == "H29K网络",
+          repr(server._dir_prefix_hit("H29K网络设备调试", server._known_dirs())))
+    check("M5 TTS 关键词归 TTS 桶（GPT-SoVITS）",
+          server._suggest_dir("GPT-SoVITS本机部署评估", []) == "TTS",
+          repr(server._suggest_dir("GPT-SoVITS本机部署评估", [])))
+    check("M6 目录前缀优先于 TTS 关键词（AstrBot关闭TTS 归 AstrBot/）",
+          server._suggest_dir("AstrBot关闭TTS_纯文字", []) == "AstrBot",
+          repr(server._suggest_dir("AstrBot关闭TTS_纯文字", [])))
+    check("M7 TTS 桶不在 BUCKET_DIRS 里（走桶名即目录名路径）",
+          "TTS" not in server.BUCKET_DIRS, str(sorted(server.BUCKET_DIRS)))
+
+    title_m = "AstrBot发言层三项修复"
+    r = server.memory_write(title_m, "开头匹配落地测试。", tags=["fix"])
+    check("M8 memory_write 落入 AstrBot/（fix 标签不抢）",
+          _exists(f"AstrBot/{server._safe_filename(title_m)}"), repr(r))
+
+    # =================================================================
     # 汇总
     # ⚠️ 措辞刻意避开裸 "FAIL" 字样：run_all_tests.py 会 grep 各套件输出统计断言数，
     # 若这里打印 "FAIL=0" 会被它当成一条失败断言重复计入。

@@ -908,6 +908,15 @@ def _core_variant(title: str) -> str:
     return title.replace("_", " ").strip()
 
 
+# 通用词目录白名单（2026-10-29）：这些目录名过于宽泛，`项目xxx`、`工具yyy`、
+# `技术zzz` 这类标题会被「开头匹配」漫天吸走，故只允许「首段恰好等于」命中。
+# 用**白名单外置**而非在函数里硬编码，是为了将来新增主题目录时无需改逻辑。
+GENERIC_DIRS = frozenset({
+    "项目", "工具", "运维", "修复", "规则", "其他", "技术", "环境",
+    "素材", "需求", "偏好", "方案", "实施", "决策", "事实", "图片", "技能",
+})
+
+
 def _dir_prefix_hit(title: str, dirs: frozenset[str]) -> str | None:
     """标题前缀命中**同名既有目录**时返回该目录名，否则 ``None``。
 
@@ -915,17 +924,34 @@ def _dir_prefix_hit(title: str, dirs: frozenset[str]) -> str | None:
     写死的规范目录表（11 个桶），本函数让 vault 里**既有**的分类目录自动成为
     归类目标，不必逐个登记；传空集 ``dirs`` 时恒不命中。
 
+    两段判定（2026-10-29 起，第二段为新增）：
+      ① **首段等于**目录名 —— 要求标题含 `_` 且第一个 `_` 之前那段就是目录名；
+      ② **标题以目录名开头** —— 但只对"具体主题目录"生效，
+         ``GENERIC_DIRS`` 里的宽泛词（项目/工具/运维/技术…）不参与，
+         否则 `项目xxx`、`工具yyy` 会被漫天吸走。
+
+    第 ② 段的动因：`其他/` 里有 13 篇 `AstrBot启动失败_…`、3 篇 `Windows_…`，
+    首段是「AstrBot启动失败」这种带修饰的长串，第 ① 段永远匹配不上，
+    于是全部沉在 `其他/`。放开为「开头包含」后即可归位，且因为要求目录
+    **真实存在**、并排除通用词，误判面极小（实测现有 559 篇零变化）。
+
     三条边界：
-      1. 只取第一个 `_` 之前的一段 —— 无 `_`、或该段不是目录名即不命中；
+      1. 同一标题命中多个目录时取**最长**者（`H29K网络` 优先于 `H29K`）；
       2. 核心页（含 `_`/空格变体）一律豁免，避免 `Codex_身份档案` 被送进 `Codex/`；
       3. 目录存在性来自调用方传入的 ``dirs``，本函数**不做任何 IO**（便于测试）。
     """
     if title in CORE_PAGES or _core_variant(title) in CORE_PAGES:
         return None
     stem = title.split("_", 1)[0].strip()
-    if not stem or stem == title or stem not in dirs:
-        return None
-    return stem
+    if stem and stem != title and stem in dirs:
+        return stem
+    best: str | None = None
+    for d in dirs:
+        if d in GENERIC_DIRS or d in RESERVED_DIRS or d.startswith("."):
+            continue
+        if title.startswith(d) and (best is None or len(d) > len(best)):
+            best = d
+    return best
 
 
 
@@ -939,6 +965,45 @@ def _dir_policy() -> str:
     return raw if raw in DIR_POLICIES else DEFAULT_DIR_POLICY
 
 
+SUBDIR_MAX_SEGMENTS = 2   # 二级目录名最多由 2 个 `_` 段拼成（`项目/A_B_条目`）
+
+
+def _subdir_extend(title: str, parent: str) -> str | None:
+    """标题形如 `一级_二级_条目` 且 ``parent/二级`` **已存在**时返回 `一级/二级`。
+
+    2026-10-29 方案 B：把自动归类从「一级」延伸到「已存在的二级」。
+
+    背景：vault 实测 558 篇里 91 篇平铺在 `项目/` 根下，其中 11 篇标题写作
+    `项目_记忆库v3.1_xxx`，语义上明确属于已存在的 `项目/记忆库v3.1/`。
+    只认**已存在的子目录**（绝不创造新目录），故错判率极低：目录不存在就
+    退回一级，落点永远停在语义正确的父目录内，不会比改动前更差。
+
+    五条边界：
+      1. 一级目录必须已由**前缀命中**确定（``parts[0] == parent``）；由桶表
+         推断出的父目录不参与 —— 那时标题里没有二级信息，无从推断；
+      2. 子目录必须**真实存在**（``is_dir()``）。本函数是唯一做 IO 的归类判定，
+         批量调用方应复用 ``dirs`` 并接受每篇一次 stat 的代价；
+      3. 至少留一段作条目名 ⇒ 子目录名最多由 ``len(parts) - 2`` 段拼成；
+         `项目_记忆库v3.1`（两段）不会被当成「目录 v3.1 下的空条目」；
+      4. **长匹配优先**：``项目/A_B`` 存在时不会被 ``项目/A`` 抢先；
+      5. 核心页豁免与保留目录/点目录排除照常生效。
+    """
+    if title in CORE_PAGES or _core_variant(title) in CORE_PAGES:
+        return None
+    parts = [p.strip() for p in title.split("_")]
+    if len(parts) < 3 or parts[0] != parent:
+        return None
+    base = MEMORY_DIR / parent
+    max_k = min(SUBDIR_MAX_SEGMENTS, len(parts) - 2)
+    for k in range(max_k, 0, -1):
+        cand = "_".join(parts[1:1 + k])
+        if not cand or cand in RESERVED_DIRS or cand.startswith("."):
+            continue
+        if (base / cand).is_dir():
+            return f"{parent}/{cand}"
+    return None
+
+
 def _suggest_dir(title: str, tags: list[str],
                  dirs: frozenset[str] | None = None) -> str | None:
     """推断条目的规范存放目录；``None`` 表示应留在 vault 根。
@@ -946,10 +1011,13 @@ def _suggest_dir(title: str, tags: list[str],
     核心页（``CORE_PAGES``）一律留根 —— 它们是全库导航入口，散进子目录会让
     「根目录 = 书架第一层」这个约定失效，而历史双链多以根路径书写。
 
-    判定顺序（2026-10-09 起）：
+    判定顺序（2026-10-29 起）：
       ① 核心页豁免（含 `_`/空格变体）；
-      ② `_entry_bucket` 内的**标题前缀命中既有目录**（`故障_XX` → `故障/`）；
+      ② `_entry_bucket` 内的**标题前缀命中既有目录**（`故障_XX` → `故障/`），
+         命中后再尝试**二级延伸**（`项目_记忆库v3.1_X` → `项目/记忆库v3.1/`），
+         仅在 ``parent/二级`` 已存在时生效（见 ``_subdir_extend``）；
       ③ 语义桶表 ``BUCKET_DIRS`` 兜底。
+    返回串可能含一个 ``/``（二级），写入侧 ``f"{suggest}/{title}"`` 天然支持多级。
     ``dirs`` 省略时内部取一次 ``_known_dirs()``；批量调用方应传入复用。
     """
     if title in CORE_PAGES or _core_variant(title) in CORE_PAGES:
@@ -959,7 +1027,7 @@ def _suggest_dir(title: str, tags: list[str],
                                     Path(_safe_filename(title)), dirs)
     # 前缀命中时桶名**就是**目录名；否则按桶表映射（索引桶 -> None 即留根）。
     if bucket in dirs:
-        return bucket
+        return _subdir_extend(title, bucket) or bucket
     return BUCKET_DIRS.get(bucket)
 
 
@@ -1236,6 +1304,12 @@ def _entry_bucket(meta: dict[str, Any], path: Path,
         hit = _dir_prefix_hit(title, dirs)
         if hit:
             return hit, f"标题前缀命中既有目录 {hit}/"
+
+    # 语音/TTS 主题（2026-10-29）—— 位置刻意排在**前缀命中之后**、泛化判定之前：
+    # 前者保证 `AstrBot关闭TTS_…` 仍归 AstrBot/ 而不是被 TTS 抢走；后者是因为
+    # 这批笔记的 tags 常带 tool/mcp，按通用规则会散进 工具/ 或 其他/。
+    if any(kw in title_lower for kw in ("tts", "sovits", "voxcpm", "minimax")):
+        return "TTS", "语音合成与 TTS 相关"
 
     if (
         title == "近期工作动态"

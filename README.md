@@ -24,7 +24,7 @@ uvx --from ai-memory-mcp-dpkg-s ai-memory-mcp
 
 默认记忆库目录为 `~/ai-memory`。连接已有目录时传入 `--vault`，例如 `uvx --from ai-memory-mcp-dpkg-s ai-memory-mcp --vault "D:/Notes/ai-memory"`。也可通过 `AI_MEMORY_DIR` 环境变量设置路径。
 
-DSH 用户可安装配套的 [DSH bundle](integrations/dsh/README.md)，它会用本机 stdio 启动同一 MCP Server。
+DSH 用户可安装配套的 [DSH bundle](integrations/dsh/README.zh-CN.md)，它会用本机 stdio 启动同一 MCP Server。
 
 需要 Python 3.10 或更高版本。运行安装脚本前，建议先阅读脚本内容。
 

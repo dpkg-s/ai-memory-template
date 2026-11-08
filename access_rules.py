@@ -99,17 +99,23 @@ _PII_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # ---- 三、关键词：分「触发」与「提示」两类 ---------------------------------
 # 为什么不能只有一张词表：两者误报代价完全不同。
 #
-#   * ``_TRIGGER_KEYWORDS``：词本身就意味着**持有**敏感物（私钥路径、设备 IMEI）。
+#   * ``_TRIGGER_PATTERNS``：**形态**本身就意味着持有敏感物（私钥 + 具体文件路径）。
 #     正常工程文档不会无指代地成篇出现，命中即 +2（达到阈值）。
 #   * ``_HINT_KEYWORDS``：常见于**策略/治理讨论**（「避免隐私泄露」「凭据盘点」「明文
 #     密码治理」「权限门禁」「排期」）。早期把它们计分，实测云端 761 条里有 22 条纯
 #     治理笔记被误升为 sensitive —— 代价是只读端读不到正常运维笔记。现在它们只进
 #     ``reasons`` 供人复核，**不计分**。
-_TRIGGER_KEYWORDS = ("私钥",)
+# 触发词：只认**指向持有物**的形态，不认「私钥」这个抽象词。
+# 线上实测：「PEM 私钥，只报种类与行号」「（amt_/sk-/Bearer/口令/私钥）0 命中」这类
+# 方法论句子会把 3 条工程笔记误升为 sensitive。真正该升的是「私钥 `keys/age.key`」
+# 这种带文件路径的写法 —— 它指向一个真实存在的密钥文件。
+_TRIGGER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"私钥[^\n。；]{0,20}?[\w./\\-]+\.(?:key|pem)\b"), "私钥文件路径"),
+)
 _HINT_KEYWORDS = ("明文密码", "明文口令", "凭据盘点", "弱口令", "账号密码清单",
                   "私密", "隐私", "不雅", "身份证", "护照", "银行卡", "病历",
                   "诊断", "体检", "工资", "薪资", "社保", "家庭住址", "门禁",
-                  "行程", "排期", "泄露", "裸")
+                  "行程", "排期", "泄露", "裸", "私钥")
 # 标签命中即 sensitive（写入方显式声明比任何正则都可靠）
 _SENSITIVE_TAGS = frozenset({
     "privacy", "private", "pii", "sensitive", "secret", "私密", "隐私",
@@ -197,10 +203,10 @@ def _scan_keywords(text: str) -> tuple[int, list[str], list[str]]:
     score = 0
     triggers: list[str] = []
     hints: list[str] = []
-    for word in _TRIGGER_KEYWORDS:
-        if word in text:
+    for pattern, label in _TRIGGER_PATTERNS:
+        if pattern.search(text):
             score += 2
-            triggers.append(f"关键词「{word}」")
+            triggers.append(f"命中{label}")
     for word in _HINT_KEYWORDS:
         if word in text:
             hints.append(f"提示词「{word}」")
@@ -228,7 +234,7 @@ def classify_access(title: str, content: str, tags: Sequence[str] | None = None,
     规则顺序（先严后宽，命中即返回）：
         1. 核心页 → internal / reader
         2. 凭据实值 → secret / owner
-        3. PII 实值 / 敏感标签 / 触发词（私钥、凭据盘点、明文口令…）→ sensitive / member
+        3. PII 实值 / 敏感标签 / 私钥文件路径 → sensitive / member
            提示词（私密、隐私、门禁、泄露、排期…）只进 reasons，**不计分**
         4. 公开标签 / 公开标题线索且无敏感证据 → public / guest
         5. 其余 → internal / reader

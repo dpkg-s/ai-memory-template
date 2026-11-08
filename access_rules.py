@@ -64,10 +64,18 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 # 赋值型凭据：`password=xxx` / `token: xxx`。值必须**像真值**才算 —— 文档里
 # 满屏 `password: <YOUR_PASSWORD>` / `token=xxx` / `sk-test`，那些是占位符。
+#
+# 2026-11-08 云端实测补充：键名决定长度门槛。「token / api_key / secret / access_key」
+# 这类真实值几乎必然 ≥20 字符；文档示例却常写 `token=abc123`（7~15 字符）。一刀切
+# 用「≥8 字符」把 3 条纯文档误判成 secret（owner 才能读），代价太大。
+#
+# 值的字符集刻意**排除 `(` `)` `.` `[` `]` `;`**：`token = localStorage.getItem('token')`
+# 这类代码片段否则会被当成「值 = localStorage.getItem(」而误判 secret（真实踩过）。
 _ASSIGN_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\b"
-    r"\s*[:=：]\s*([\"']?)([^\s\"',;，。；]{6,})\2"
+    r"\s*[:=：]\s*([\"']?)([A-Za-z0-9_\-+/=]{6,})\2"
 )
+_LONG_CRED_KEYS = {"secret", "token", "api_key", "api-key", "apikey", "access_key", "access-key"}
 
 # 占位值指纹（小写比较）。命中即**不**算凭据实值。
 _PLACEHOLDER_MARKERS = (
@@ -84,21 +92,22 @@ _PII_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?<![0-9A-Za-z])[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
                 r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![0-9A-Za-z])"), "身份证号"),
     (re.compile(r"(?<!\d)(?:62\d{14,17}|4\d{15}|5[1-5]\d{14})(?!\d)"), "银行卡号"),
+    # IMEI 只在**带 15 位数字**时算实值；仅出现「IMEI」是脱敏/治理记录，不算。
+    (re.compile(r"(?i)\bIMEI\b[^\n]{0,40}?(?<!\d)\d{15}(?!\d)"), "IMEI"),
 )
 
 # ---- 三、关键词：分「触发」与「提示」两类 ---------------------------------
 # 为什么不能只有一张词表：两者误报代价完全不同。
 #
-#   * ``_TRIGGER_KEYWORDS``：词本身就意味着**持有**敏感物（私钥、凭据盘点、明文口令）。
+#   * ``_TRIGGER_KEYWORDS``：词本身就意味着**持有**敏感物（私钥路径、设备 IMEI）。
 #     正常工程文档不会无指代地成篇出现，命中即 +2（达到阈值）。
-#   * ``_HINT_KEYWORDS``：常见于**策略讨论**（「避免隐私泄露」「权限门禁」「排期」）。
-#     早期把它们计分，实测 762 条里有 8 条纯工程文档被误升为 sensitive —— 代价是
-#     只读端读不到正常运维笔记。现在它们只进 ``reasons`` 供人复核，**不计分**。
-#
-# 阈值：PII 实值本身 2 分；单个触发词 2 分；敏感标签 2 分。
-_TRIGGER_KEYWORDS = ("明文密码", "明文口令", "凭据盘点", "弱口令", "账号密码清单",
-                     "私钥", "IMEI")
-_HINT_KEYWORDS = ("私密", "隐私", "不雅", "身份证", "护照", "银行卡", "病历",
+#   * ``_HINT_KEYWORDS``：常见于**策略/治理讨论**（「避免隐私泄露」「凭据盘点」「明文
+#     密码治理」「权限门禁」「排期」）。早期把它们计分，实测云端 761 条里有 22 条纯
+#     治理笔记被误升为 sensitive —— 代价是只读端读不到正常运维笔记。现在它们只进
+#     ``reasons`` 供人复核，**不计分**。
+_TRIGGER_KEYWORDS = ("私钥",)
+_HINT_KEYWORDS = ("明文密码", "明文口令", "凭据盘点", "弱口令", "账号密码清单",
+                  "私密", "隐私", "不雅", "身份证", "护照", "银行卡", "病历",
                   "诊断", "体检", "工资", "薪资", "社保", "家庭住址", "门禁",
                   "行程", "排期", "泄露", "裸")
 # 标签命中即 sensitive（写入方显式声明比任何正则都可靠）
@@ -158,11 +167,14 @@ def _scan_secret_values(text: str) -> list[str]:
         if pattern.search(text):
             hits.append(label)
     for match in _ASSIGN_RE.finditer(text):
+        key = match.group(1).lower().replace("-", "_")
         value = match.group(3)
         if _contains_placeholder(value):
             continue
-        # 值要足够「随机」：至少 8 字符且含字母或数字，纯中文短语不算
-        if len(value) < 8 or not re.search(r"[A-Za-z0-9]", value):
+        # 键名决定长度门槛：token / secret / api_key 的真实值几乎必然 ≥20 字符，
+        # 文档示例却常写 `token=abc123`。password 类可以是短口令（≥8）。
+        need = 20 if key in {k.replace("-", "_") for k in _LONG_CRED_KEYS} else 8
+        if len(value) < need or not re.search(r"[A-Za-z0-9]", value):
             continue
         hits.append(f"赋值型凭据（{match.group(1)}）")
         break  # 同一类只报一次，避免理由刷屏

@@ -19,7 +19,7 @@
 流水线调整 = 修 bug（+0.0.1）。拿不准时按 +0.0.1 走 —— 少给一个 minor 没有代价，
 多给一个会让人误以为有迁移成本。
 
-## [Unreleased]
+## [3.4.0] - 2026-11-08
 
 > 主题：**敏感度判定从「靠记得填」变成「写入时自动判」**。v3 给了 `security` / `clearance`
 > 两字段，但不填就落到默认 `internal / reader` —— 该保护的（手机号、私密排期、明文口令）
@@ -29,12 +29,14 @@
 ### Added
 
 - **`access_rules.py`：四档判定规则引擎**。凭据实值（`sk-…` / `ghp_…` / `AKIA…` / PEM 私钥
-  / JWT / `password=真值`）→ `secret`；PII 实值（手机号 / 身份证 / 银行卡）、敏感标签、
-  触发词（`私钥` / `凭据盘点` / `明文口令`…）→ `sensitive`；公开标签或示例标题且无敏感
-  证据 → `public`；其余 `internal`。关键词分**触发词**与**提示词**两档：「私密/隐私/
-  泄露/排期/门禁」只进理由不计分 —— 它们多半出现在策略讨论里，计分会把「讨论隐私」
-  误判成「持有隐私」（实测能把 8 条纯工程文档误升为 sensitive）。每条判定带 `reasons` /
-  `evidence`，可审计也可回归；核心页固定 `internal / reader`。
+  / JWT / `password=真值`）→ `secret`；PII 实值（手机号 / 身份证 / 银行卡 / IMEI 带 15 位
+  数字）、敏感标签、持有型触发词（`私钥`）→ `sensitive`；公开标签或示例标题且无敏感证据 →
+  `public`；其余 `internal`。关键词分**触发词**与**提示词**两档：「私密/隐私/泄露/排期/
+  门禁/明文密码/凭据盘点」只进理由不计分 —— 它们多半出现在策略/治理讨论里（线上实测：
+  计分版本把 22 条治理笔记误升为 sensitive）。赋值型凭据按**键名**分档：`token/secret/
+  api_key` 要求值 ≥20 字符且字符集不含 `( ) . [ ] ;`（文档示例 `token=abc123` 与代码
+  `token = localStorage.getItem('token')` 都不算），`password` 类 ≥8。每条判定带
+  `reasons` / `evidence`，可审计也可回归；核心页固定 `internal / reader`。
 - **写入时自动分级**：`memory_write` / `memory_commit` 未显式传 `security` 时按规则判定。
   三条约束：显式传参优先；条目已有档位只提示不改（避免反复拉扯）；受限写入方（非 owner）
   不参与。总开关 `AI_MEMORY_AUTO_ACCESS=off`。

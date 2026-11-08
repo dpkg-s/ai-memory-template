@@ -602,10 +602,9 @@ async def _stdio_e2e() -> tuple[bool, str]:
                 await session.initialize()
                 tools = await session.list_tools()
                 n = len(tools.tools)
-                # 26 = 既有工具集（含 memory_commit）。这里的判据不是「数字是几」，
-                # 而是「HTTP 装配有没有偷偷改掉 stdio 的工具面」—— 数字跟着工具集
-                # 一起走，改工具时同步这一处即可。
-                return n == 26, f"stdio 工具数={n}（期望 26）"
+                # 27 = 既有工具集（含 memory_commit / memory_access_suggest）。判据
+                # 不是「数字是几」，而是「HTTP 装配有没有偷偷改掉 stdio 的工具面」。
+                return n == 27, f"stdio 工具数={n}（期望 27）"
 
 
 try:

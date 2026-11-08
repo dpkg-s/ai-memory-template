@@ -19,6 +19,43 @@
 流水线调整 = 修 bug（+0.0.1）。拿不准时按 +0.0.1 走 —— 少给一个 minor 没有代价，
 多给一个会让人误以为有迁移成本。
 
+## [Unreleased]
+
+> 主题：**敏感度判定从「靠记得填」变成「写入时自动判」**。v3 给了 `security` / `clearance`
+> 两字段，但不填就落到默认 `internal / reader` —— 该保护的（手机号、私密排期、明文口令）
+> 没保护；反过来把「令牌签发」这类**词**当敏感，又会让 reader 端读不到正常运维笔记。
+> 这版把判定收敛成可执行规则：只在**实值证据**上收紧，且只收紧不放宽。
+
+### Added
+
+- **`access_rules.py`：四档判定规则引擎**。凭据实值（`sk-…` / `ghp_…` / `AKIA…` / PEM 私钥
+  / JWT / `password=真值`）→ `secret`；PII 实值（手机号 / 身份证 / 银行卡）、敏感标签、
+  触发词（`私钥` / `凭据盘点` / `明文口令`…）→ `sensitive`；公开标签或示例标题且无敏感
+  证据 → `public`；其余 `internal`。关键词分**触发词**与**提示词**两档：「私密/隐私/
+  泄露/排期/门禁」只进理由不计分 —— 它们多半出现在策略讨论里，计分会把「讨论隐私」
+  误判成「持有隐私」（实测能把 8 条纯工程文档误升为 sensitive）。每条判定带 `reasons` /
+  `evidence`，可审计也可回归；核心页固定 `internal / reader`。
+- **写入时自动分级**：`memory_write` / `memory_commit` 未显式传 `security` 时按规则判定。
+  三条约束：显式传参优先；条目已有档位只提示不改（避免反复拉扯）；受限写入方（非 owner）
+  不参与。总开关 `AI_MEMORY_AUTO_ACCESS=off`。
+- **`memory_access_suggest(apply=False, limit=20)`**：全库档位审计，默认只预览；`apply=True`
+  才把「需收紧」的条目写盘（只升不降，核心页豁免）。Web 控制台归入「库维护」分组。
+- 测试：`tests/test_access_rules.py`（35 项）—— 规则命中与不命中、显式优先、已有档位只
+  提示、核心页豁免、预览不写盘、总开关。
+
+### Changed
+
+- `memory_write` 文档串补「security 缺省自动判定」与 `reader` 档说明；工具面 26 → 27、
+  写/破坏性工具 12 → 13（`test_tools_smoke.py` / `test_tool_gates.py` / `test_transport.py`
+  同步）。
+- `rules/记忆写入格式规范.md` 增「security / clearance（自动判定）」章节；
+  `docs/configuration.md` / `docs/tools.md` / `docs/architecture.md` 同步。
+
+### Note
+
+- 默认不写盘：`memory_access_suggest()` 不带参数绝不改库；`apply=True` 也只收紧。
+- 关键词只做加权、单个不触发 —— 「令牌」「密钥」在库里是讨论对象，不是持有凭据。
+
 ## [3.3.1] - 2026-11-05
 
 > 主题：**权限声明从「人工约定」变成「启动即校验」**。3.3.0 把写操作与底层诊断逐个挂了 `@_owner_gate`，但那只是纪律 —— 新增工具忘了挂，代码照跑、既有测试照绿，直到有人从受限端点调到了它。这一版给护栏本身加一道自检：漏挂即启动失败（fail closed）。

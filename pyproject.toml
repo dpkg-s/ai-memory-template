@@ -36,6 +36,7 @@ ai-memory-mcp = "cli:main"
 
 [tool.setuptools]
 py-modules = [
+  "access_rules",
   "cli",
   "server",
   "memory_config",

@@ -54,7 +54,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 AGGREGATOR = "server"
-LEAF_MODULES = {"locks", "memory_config", "memory_index", "metrics",
+LEAF_MODULES = {"access_rules", "locks", "memory_config", "memory_index", "metrics",
                 "text_utils", "yaml_io"}
 # 装配/入口层（v3 阶段 1，2026-10-13）：**不被 server import**，而是反过来 import
 # server（serve_http = HTTP 入口）或只 import mcp（transport_http = 纯装配）。
@@ -90,6 +90,9 @@ TOOL_MODULES |= {"ai_memory_gui", "build_exe", "setup_link", "setup_vault"}
 ALLOWED_LEAF_EDGES = {
     ("locks", "memory_config"): "锁的陈旧超时可配（B5）",
     ("text_utils", "memory_config"): "热度衰减系数可配（B5）",
+    # 2026-11-08：判定结果要查 security⇒clearance 下限与档位序，那两张表只存在于
+    # yaml_io（单一事实源）。access_rules 不复制它们，否则两处规则必然分叉。
+    ("access_rules", "yaml_io"): "查 SECURITY_MIN_CLEARANCE / CLEARANCE_RANK",
 }
 
 # 装配层被允许直连**叶子**的边（默认禁止，见 I9b）。同样必须显式登记并写明理由，

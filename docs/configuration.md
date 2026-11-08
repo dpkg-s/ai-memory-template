@@ -101,4 +101,20 @@ HTTP 相关变量的用途与安全约束见 [远程访问（可选 Streamable H
 
 `memory_archive_old(days=90)` 可按时间批量归档，自动跳过 `CORE_PAGES` 保护名单（`记忆索引`、`近期工作动态`、`用户画像` 等 13 个核心页）。`memory_heat_suggest()` 会依据实际访问频次与陈旧度给出升降建议；加 `apply=True` 即可让它**直接落地** —— 先跑一次预览确认名单，再带 `apply=True` 执行，两个模式共用同一判据函数，不会出现「预览说升、执行说降」。
 
+### 访问档位自动判定（security / clearance，v3.4）
+
+写入时服务端按 `access_rules.py` 的规则自动判定条目敏感度，**只看实值证据**：真凭据串
+（`sk-…` / PEM 私钥 / JWT / `password=真值`）→ `secret`；手机号 / 身份证 / 银行卡等 PII
+实值、敏感标签 → `sensitive`；公开标签或示例标题（且无敏感证据）→ `public`；其余
+`internal`。判定结果随写入返回值告知（「🔒 已自动分级」）。
+
+- **显式传参优先**：`memory_write(security=...)` 一给，自动判定完全退场。
+- **已有档位不被自动改**：条目已写 `security` 时不会在每次更新时被篡改，只在规则更严时
+  提示；避免「手工降级 → 下次更新又被悄悄抬回」这类最难查的漂移。
+- **核心页豁免**：`记忆索引` / `近期工作动态` 等固定 `internal / reader`。
+- **受限写入方不参与**：member / reader / guest 端点不做自动判定 —— 它们写不了
+  `sensitive`，自动命中会直接把普通笔记变成「拒绝写入」。
+- `memory_access_suggest()`：默认只预览；`apply=True` 才把「需收紧」的条目写盘（只升不降）。
+- `AI_MEMORY_AUTO_ACCESS=off` 可整体关闭自动判定。
+
 ---

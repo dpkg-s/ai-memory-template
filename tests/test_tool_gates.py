@@ -91,8 +91,8 @@ print("== A. 现有注册表的声明自检 ==")
 # ============================================================
 _tools = server._registered_tools()
 _names = {getattr(t, "name", None) for t in _tools}
-check("A1 注册表可枚举且非空", len(_tools) >= 26, f"实际 {len(_tools)} 只")
-check("A2 全部 26 只工具声明自检通过（0 违规）",
+check("A1 注册表可枚举且非空", len(_tools) >= 27, f"实际 {len(_tools)} 只")
+check("A2 全部 27 只工具声明自检通过（0 违规）",
       server._audit_tool_gates() == [], str(server._audit_tool_gates()))
 check("A3 每只工具都带 annotations（否则分类无从谈起）",
       all(getattr(t, "annotations", None) is not None for t in _tools))
@@ -102,8 +102,8 @@ check("A4 豁免表里的工具名都真实存在（防止改名后表腐化）"
       f"owner-only 缺 {sorted(server._OWNER_ONLY_READ_TOOLS - _names)}")
 _write_tools = [t for t in _tools
                 if getattr(getattr(t, "annotations", None), "readOnlyHint", None) is False]
-check("A5 写/破坏性工具共 12 只，且逐只通过门禁判定",
-      len(_write_tools) == 12 and
+check("A5 写/破坏性工具共 13 只，且逐只通过门禁判定",
+      len(_write_tools) == 13 and
       all(server._gate_violation(getattr(t, "name", None),
                                  getattr(t, "annotations", None),
                                  getattr(t, "fn", None)) is None for t in _write_tools),

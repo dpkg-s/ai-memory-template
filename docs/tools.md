@@ -1,6 +1,6 @@
 > 本页由仓库主页拆分而来，内容与拆分前逐字一致。返回 [主页](../README.md)。
 
-# 26 个工具速查
+# 27 个工具速查
 
 > 带 `output_format` 的四个只读工具（`memory_read` / `memory_list` / `memory_recent` / `memory_orphans`）可传 `output_format="json"` 拿到结构化输出，详见[脚本化调用](#脚本化调用可选-json-输出)。
 
@@ -38,6 +38,7 @@
 | `memory_batch_tier(target_tier, min_score?, max_score?)` | 按热度分数批量调整 tier |
 | `memory_config(action="get", values?, output_format?)` | **运行时阈值的 MCP 通道**（第 25 个工具，2026-10-16 起）。`get` 返回当前生效值 / 每键来源（`env`/`file`/`default`）/ 中文名与作用说明 / 类型 / 默认值 / 配置文件路径 / 解析错误；`set` 是**整状态写**（须提交全部 8 个键，缺键即拒），写前备份为同目录 `memory.toml.bak.<时间戳>`（保留最近 10 份）、写前自解析、原子替换。**只写 `memory.toml`，绝不触碰任何 `*.md`**。Web 控制台的阈值面板走的就是它 |
 | `memory_heat_suggest(apply=False)` | 按访问频次与陈旧度给出 tier 升降建议。默认 `apply=False` **只预览不写盘**；`apply=True` 才真正批量落地（核心页豁免，预览与执行共用同一判据函数，不会漂移） |
+| `memory_access_suggest(apply=False, limit=20)` | **访问档位审计（v3.4.0）**：按内置规则核对全库 `security` / `clearance`，默认只预览。判定标准：凭据实值（`sk-…` / PEM 私钥 / JWT / `password=真值`）→ `secret`；手机号/身份证/银行卡等 PII 实值、敏感标签或弱信号 ≥2 分 → `sensitive`；公开标签/示例标题且无敏感证据 → `public`；其余 `internal`。**只收紧不放宽**，核心页固定 `internal/reader`；`apply=True` 只落「需收紧」项。写入时同一规则自动运行（显式传参优先；已有档位只提示不改；受限写入方不参与） |
 | `memory_restart(delay?)` | **原地热重启**：改完 `server.py` 或任一模块后让新代码立刻生效，不必重连客户端、不必重启应用。`os.execv` 替换进程映像并保留 stdin/stdout，会话不断；重启前先在子进程**预检**新代码可导入、会话恢复补丁装得上，失败即放弃。⚠️ 换进程后 **pid 会变**；接力链上限 5 次防重启风暴 |
 
 ### 审计

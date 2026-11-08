@@ -25,7 +25,7 @@
   └─ Cursor / 任何支持 MCP stdio 的客户端
         │
         ▼  MCP 协议 · stdio（默认）· JSON-RPC 2.0
-  server.py —— 24 个 MCP 工具
+  server.py —— 27 个 MCP 工具
   ↑ 可选远程入口：serve_http.py → transport_http.py（同一份 server，不改主程序）
   ├─ 读写：write / read / delete / update_metadata / recent
   ├─ 查询：search / smart_search / list / graph / context / orphans / stats
@@ -53,7 +53,7 @@ ai-memory-template/
 ├── CHANGELOG.md             # 版本变更记录
 ├── LICENSE                  # MIT
 │
-├── server.py                # MCP 服务端：26 个工具注册 + 存储层 + 业务逻辑（stdio 入口）
+├── server.py                # MCP 服务端：27 个工具注册 + 存储层 + 业务逻辑（stdio 入口）
 ├── serve_http.py            # 可选：Streamable HTTP 入口（主程序零改动的 HTTP 装配）
 ├── transport_http.py        # HTTP 传输层：环境变量解析 + Host 校验 fail-fast（只依赖 mcp）
 ├── web-console/             # 🔗 submodule → ai-memory-web：Web 控制台（前端 + 后端一体）
@@ -150,7 +150,7 @@ ai-memory-template/
 
 ### 全工具冒烟 —— `tests/test_tools_smoke.py`（32 断言）
 
-- 24 个 MCP 工具逐一调用，验证不抛异常且返回正常
+- 27 个 MCP 工具逐一调用，验证不抛异常且返回正常
 - 工具注册完整性：数量为 20 且集合与预期完全一致（防重构时漏注册或误覆盖）
 
 ### 记忆可信度 —— `tests/test_p0_credentials.py`（24 断言）

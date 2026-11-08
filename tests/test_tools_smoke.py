@@ -161,6 +161,9 @@ EXPECTED_TOOLS = {
     # 2026-10-25：统一写入口（core 侧后加）—— 带当日时间线条目与项目状态行同步，
     # 语义上属内容读写；此前本表未同步，导致「工具总数 = 25」恒红。
     "memory_commit",
+    # 2026-11-08：访问档位审计（只收紧、默认只预览）。它是写工具（apply=True 落盘），
+    # 故不在 EXPECTED_READONLY 里。
+    "memory_access_suggest",
 }
 # A1 (2026-09-17) 行为标注：MCP 规范里 destructiveHint / openWorldHint 默认都是
 # True，漏标会让客户端把普通 upsert 也当成需二次确认的破坏性操作，并误以为工具
@@ -184,7 +187,7 @@ EXPECTED_NONIDEM = {"memory_restore", "memory_restart", "memory_commit"}
 try:
     tools = asyncio.run(server.mcp.list_tools())
     registered = {t.name for t in tools}
-    check("工具总数 = 26", len(registered) == 26, f"实际 {len(registered)}: {sorted(registered)}")
+    check("工具总数 = 27", len(registered) == 27, f"实际 {len(registered)}: {sorted(registered)}")
     check("工具集合与预期一致", registered == EXPECTED_TOOLS,
           f"缺失={sorted(EXPECTED_TOOLS - registered)} 多余={sorted(registered - EXPECTED_TOOLS)}")
 

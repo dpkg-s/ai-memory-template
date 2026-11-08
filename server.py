@@ -8,10 +8,11 @@ Storage:
 - Frontmatter written as YAML (Obsidian-native), legacy JSON still readable
 
 Features:
-- 24 MCP tools: read/write/search/smart_search/list/recent/graph/context/
+- 27 MCP tools: read/write/search/smart_search/list/recent/graph/context/
   orphans/stats, audit/doctor/schema_diff/index_draft/rebuild_links, batch tag &
-  tier, heat-based tier suggestions, archive/restore/delete, in-place hot restart
-  (memory_restart), auto-generated MOC index (记忆索引.md, visible since v2.4.2)
+  tier, heat-based tier suggestions, access-tier audit (memory_access_suggest),
+  archive/restore/delete, in-place hot restart (memory_restart),
+  auto-generated MOC index (记忆索引.md, visible since v2.4.2)
 - YAML frontmatter, Obsidian wikilinks, automatic link extraction,
   title-based dedup upsert, file locking, cross-process cache invalidation,
   SQLite metadata index for O(1) title lookup
@@ -48,6 +49,7 @@ logger.setLevel(logging.INFO)
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+import access_rules
 import memory_index as midx
 import locks
 import memory_config
@@ -83,6 +85,7 @@ from yaml_io import (
     SCHEMA_VERSION,
     SECURITY_LEVELS,
     SECURITY_MIN_CLEARANCE,
+    SECURITY_RANK,
     SCOPES,
     clearance_allows as _clearance_allows,
     normalize_access as _normalize_access,
@@ -1461,6 +1464,56 @@ def _filter_readable(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+# ---- v3.4（2026-11-08）：写入时自动分级 ---------------------------------
+# 判定标准与实现见 access_rules.py；本区只负责「什么时候用、怎么合并、怎么提示」。
+#
+# 三条硬约束，都是为了不让「自动」变成「失控」：
+#   1. **显式传参永远优先** —— 调用方给了 security/clearance 就按它写，规则不插嘴；
+#   2. **已有 security 字段 ⇒ 不自动改档**，只在规则更严时提示。否则主人手工把
+#      一条降回 internal，下次正文更新又会被悄悄抬回去 —— 那才是最难查的故障；
+#   3. **受限写入方不做自动判定** —— member 端点写不了 sensitive/secret，若自动
+#      判定恰好命中，一条普通笔记会直接变成「拒绝写入」，安全措施就变成了故障。
+AUTO_ACCESS_ENV = "AI_MEMORY_AUTO_ACCESS"
+
+
+def _auto_access_enabled() -> bool:
+    """自动分级总开关（环境变量，默认开）。``off``/``0``/``false`` 关闭。"""
+    return os.environ.get(AUTO_ACCESS_ENV, "on").strip().lower() not in {
+        "0", "off", "false", "no", "disable", "disabled"}
+
+
+def _auto_access_for_write(title: str, tags: list[str], content: str,
+                           existing_meta: dict[str, Any]) -> tuple[str | None, str | None, str]:
+    """给一次写入算自动分级，返回 ``(security, clearance, notice)``。
+
+    返回的 security/clearance 为 None 表示「不干预」，交给 ``_write_memory`` 的
+    继承/默认逻辑；notice 是要拼进返回值的提示（可能是空串）。
+
+    判定与 ``memory_access_suggest`` 共用 ``access_rules.classify_access``，
+    所以「预览里说会收紧的」与「写入时真收紧的」必然一致。
+    """
+    if not _auto_access_enabled() or current_clearance() != "owner":
+        return None, None, ""
+    verdict = access_rules.classify_access(title, content, tags, core_pages=CORE_PAGES)
+    cur_sec = existing_meta.get("security") if isinstance(existing_meta, dict) else None
+    cur_clr = existing_meta.get("clearance") if isinstance(existing_meta, dict) else None
+    sec, clr, tightened = access_rules.merge_with_current(verdict, cur_sec, cur_clr)
+    reasons = "；".join(verdict.reasons)
+
+    if cur_sec in SECURITY_LEVELS:
+        if tightened:
+            return None, None, (
+                f"\n\n⚠️ 自动判定建议收紧到 security={sec} / clearance={clr}"
+                f"（依据：{reasons}）。本条已有显式档位，**未自动改动**；"
+                f"如认可请调 memory_update_metadata(security=..., clearance=...)。")
+        return None, None, ""
+    if sec == DEFAULT_SECURITY and clr == DEFAULT_CLEARANCE:
+        # 与默认档一致：不多写噪音提示，也不打扰调用方
+        return None, None, ""
+    return sec, clr, f"\n\n🔒 已自动分级：security={sec} / clearance={clr}（依据：{reasons}）"
+
+
+
 def _owner_only(tool: str) -> str | None:
     """写操作与底层诊断的权级守卫；owner 返回 None（放行）。
 
@@ -2314,14 +2367,20 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         来源标识（可含会话/设备信息），source_context 是「哪类客户端写入」的粗分类，
         便于按来源统计与追溯。
 
-    security (optional): 内容安全等级 public / internal / sensitive / secret，
-        默认 internal。它描述「这条内容被读出去的后果有多重」，用于审计与展示。
+    security (optional): 内容安全等级 public / internal / sensitive / secret。
+        它描述「这条内容被读出去的后果有多重」，用于审计与展示。
+        **省略时由服务端自动判定**（规则见 ``access_rules.py`` 与
+        ``memory_access_suggest``）：凭据实值 → secret；手机号/身份证/银行卡等
+        PII 实值或敏感标签 → sensitive；公开标签/示例标题 → public；其余 internal。
+        显式传参永远优先；条目已有 security 字段时自动判定不会改档，只会在规则
+        更严时于返回值里提示。
 
-    clearance (optional): 读取该条目所需的最低权级 guest / member / owner，默认由
-        security 推导（public→guest、internal/sensitive→member、secret→owner）。
-        两者**只收紧不放宽**：传 security=secret 却要求 clearance=guest 时会被
-        自动抬到 owner（宁可多拦，不能把绝密标成公开）。受限端点（如 /mcp/member）
-        只能写 internal 及以下。省略时更新保留原值。
+    clearance (optional): 读取该条目所需的最低权级 guest / reader / member / owner。
+        省略时由 security 的下限推导（public→guest、internal→reader、
+        sensitive→member、secret→owner）；两者**只收紧不放宽**：传 security=secret
+        却要求 clearance=guest 时会被自动抬到 owner（宁可多拦，不能把绝密标成
+        公开）。受限端点（如 /mcp/member）只能写 internal 及以下。更新时省略则
+        保留原值（不让一次正文更新把档位重置）。
 
     expected_version (optional): optimistic concurrency check. If provided and the
     entry's current on-disk version does not match, the write is rejected to prevent
@@ -2460,6 +2519,20 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         elif expected_version is not None:
             return f"错误：版本冲突（记忆 '{title}' 不存在，期望 version={expected_version}）。"
 
+        # v3.4 自动分级：必须**在锁内、existing_meta 就绪之后**算 —— 否则
+        # 「按标题命中的老条目」用的是锁外读到的旧元数据，可能与刚被别人改过的
+        # 档位打架，把一条刚被降级的条目又抬回去。显式传参优先，见约束 1。
+        _auto_sec, _auto_clr, _auto_notice = _auto_access_for_write(
+            title, tags, content, existing_meta)
+        if security is None:
+            security = _auto_sec
+            if clearance is None:
+                clearance = _auto_clr
+        else:
+            # 显式指定安全等级 ⇒ 自动判定完全退场：既不采用它推的门槛，也不
+            # 假装「已自动分级」—— 提示必须与实际写入一致，否则就是谎报。
+            _auto_notice = ""
+
         # 改进#6：source 默认值；改进#10：version 递增（基于锁内最新值）
         effective_source = source or (existing_meta.get("source") if existing_path else None) or "unknown"
         old_version = existing_meta.get("version", 0)
@@ -2545,6 +2618,8 @@ def memory_write(title: str, content: str, tags: list[str] | None = None, source
         if dup_hints:
             result_msg += "\n\n⚠️ 疑似重复/冲突（未阻断，供你判断是否合并或标注 supersedes/conflicts）：\n- " + \
                           "\n- ".join(dup_hints)
+        if _auto_notice:
+            result_msg += _auto_notice
         return result_msg
     finally:
         _flush_access_counts()
@@ -4406,6 +4481,162 @@ def memory_heat_suggest(apply: bool = False) -> str:
     finally:
         if locked:
             _release_lock()
+
+def _access_report(apply: bool, limit: int = 20) -> str:
+    """敏感度分级审计主体；apply=True 时把「需收紧」的判定真正写盘。
+
+    与 ``_heat_report`` 同构的三点：
+      * 预览与执行走**同一套判据**（``classify_access`` + ``merge_with_current``），
+        所以「预览里说要收紧的」就是「执行时真收紧的」；
+      * 默认不写盘，`apply=True` 才动数据；
+      * 核心页豁免发生在判据内部（``classify_access`` 收到 ``CORE_PAGES``），
+        预览与执行不会出现「清单里有、执行时却跳过」的不一致。
+
+    刻意**不自动放宽**：规则判 internal 而条目现值 sensitive，只列进「仅供参考」，
+    不写盘。放宽是「让更多设备能读到」，误伤的后果比收紧大一个量级。
+    """
+    _invalidate_cache()
+    rows: list[tuple[Path, str, dict[str, Any], access_rules.Verdict, str, str, bool]] = []
+    now_dist: Counter[str] = Counter()
+    tightened_dist: Counter[str] = Counter()
+    core_skipped = 0
+    hidden = 0
+
+    for f in sorted(_iter_md_files(), reverse=True):
+        try:
+            meta, body = _load_memory(f)
+        except Exception:                       # 单条解析失败不影响整批
+            continue
+        if not _can_read(meta):
+            hidden += 1
+            continue
+        title = _entry_title(meta, f)
+        if title in CORE_PAGES:
+            core_skipped += 1
+        now_sec, now_clr = _meta_access(meta)
+        now_dist[now_sec] += 1
+
+        verdict = access_rules.classify_access(title, body, _entry_tags(meta),
+                                               core_pages=CORE_PAGES)
+        # 合并要用**磁盘原值**而非补过默认的现档：老条目缺 security 字段时，
+        # 补默认会造出「已有显式值」的假象，自动判定就永远升不上去。
+        raw_sec = meta.get("security") if meta.get("security") in SECURITY_LEVELS else None
+        raw_clr = meta.get("clearance") if meta.get("clearance") in CLEARANCE_LEVELS else None
+        sec, clr, tightened = access_rules.merge_with_current(verdict, raw_sec, raw_clr)
+        if tightened:
+            tightened_dist[sec] += 1
+        rows.append((f, title, meta, verdict, sec, clr, tightened))
+
+    pending = [row for row in rows if row[6]]
+    # 收紧类排在前面；同档内按目标档位从高到低（secret > sensitive），便于先看最该看的
+    pending.sort(key=lambda row: (-SECURITY_RANK[row[4]], row[1]))
+
+    lines: list[str] = ["# 敏感度分级审计" if not apply else "# 敏感度分级审计（已执行）", ""]
+    lines.append(f"共扫描 {len(rows)} 条可读记忆（核心页豁免 {core_skipped} 条"
+                 f"；当前视野外 {hidden} 条未参与）")
+    lines.append("")
+    lines.append("## 现状分布（security）")
+    for level in SECURITY_LEVELS:
+        if now_dist.get(level):
+            lines.append(f"- {level}: {now_dist[level]} 条")
+    lines.append("")
+
+    if not pending:
+        lines.append("## 收紧建议")
+        lines.append("- 无：所有条目的档位已不低于自动判定结果")
+    elif apply:
+        applied = 0
+        for path, title, meta, verdict, sec, clr, _tight in pending:
+            try:
+                em, ebody = _load_memory(path)
+            except Exception as e:              # noqa: BLE001
+                logger.warning("access_apply load failed title=%s: %s", title, e)
+                continue
+            old_version = em.get("version", 0)
+            try:
+                _write_memory(path, title=title, tags=_entry_tags(em), source=em.get("source"),
+                              content=ebody, created=str(em.get("created", "")) or None,
+                              summary=em.get("summary"), tier=em.get("tier"),
+                              access_count=em.get("access_count", 0),
+                              version=(old_version + 1) if isinstance(old_version, int) else 1,
+                              security=sec, clearance=clr)
+            except Exception as e:              # noqa: BLE001
+                logger.warning("access_apply write failed title=%s: %s", title, e)
+                continue
+            applied += 1
+        if applied:
+            _refresh_index()
+        logger.info("ACCESS_APPLY applied=%d scanned=%d", applied, len(rows))
+        lines.append(f"## 已执行（{applied} 条）")
+        for _path, title, _meta, verdict, sec, clr, _tight in pending[:limit]:
+            lines.append(f"- {title} → {sec}/{clr}（依据：{'；'.join(verdict.reasons)}）")
+        if len(pending) > limit:
+            lines.append(f"- …另有 {len(pending) - limit} 条同类调整")
+        lines.append("")
+        lines.append("档位已写盘，记忆索引已重建。")
+        return "\n".join(lines)
+    else:
+        lines.append(f"## 收紧建议（未执行，共 {len(pending)} 条）")
+        for _path, title, _meta, verdict, sec, clr, _tight in pending[:limit]:
+            lines.append(f"- {title} → {sec}/{clr}（依据：{'；'.join(verdict.reasons)}）")
+        if len(pending) > limit:
+            lines.append(f"- …另有 {len(pending) - limit} 条，传 limit={len(pending)} 可全看")
+        lines.append("")
+        lines.append("以上仅为预览，**未改动任何数据**。确认无误后传 `apply=True` 执行。")
+
+    # 仅供参考：规则没看出敏感证据、但条目现值更高。**不自动放宽**，只列给人看。
+    relaxable = [row for row in rows
+                 if row[6] is False and row[2].get("security") in ("sensitive", "secret")
+                 and SECURITY_RANK[row[2]["security"]] > SECURITY_RANK[row[3].security]]
+    if relaxable:
+        lines.append("")
+        lines.append(f"## 可能标高了（仅供参考，未改动，共 {len(relaxable)} 条）")
+        for _path, title, meta, verdict, _sec, _clr, _tight in relaxable[:limit]:
+            lines.append(f"- {title}（现 {meta.get('security')}，规则未发现敏感证据）")
+        if len(relaxable) > limit:
+            lines.append(f"- …另有 {len(relaxable) - limit} 条")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=_WRITE)
+@_owner_gate
+def memory_access_suggest(apply: bool = False, limit: int = 20) -> str:
+    """Audit ``security`` / ``clearance`` tiers against the built-in rules.
+
+    **默认只预览，不改任何数据**；``apply=True`` 才把「需收紧」的判定写盘
+    （只收紧，绝不放宽）。
+
+    判定标准（详见 ``access_rules.py``，这里是行为摘要）：
+
+    - ``secret``：正文出现**真凭据实值** —— ``sk-…`` / ``ghp_…`` / ``AKIA…`` /
+      PEM 私钥块 / JWT 串 / ``password=真值``。仅出现「密钥」「令牌」这类**词**
+      不算（库里 100+ 条运维笔记在讨论令牌签发，把词当证据会让半个库变绝密）。
+    - ``sensitive``：出现 PII 实值（手机号 / 身份证号 / 银行卡号）、命中敏感标签
+      （``privacy`` / ``pii`` / ``私密`` …），或命中**触发词**（``私钥`` / ``凭据盘点`` /
+      ``明文口令`` —— 词本身即意味着持有敏感物）。``私密`` / ``隐私`` / ``泄露`` /
+      ``排期`` / ``门禁`` 这类**提示词**只写进理由、不参与判定：它们多半出现在策略讨论
+      里，计分会把「讨论隐私」误判成「持有隐私」。
+    - ``public``：命中公开标签（``public`` / ``demo`` / ``template`` …）或标题含
+      「连通性测试 / 示例 / 模板」，且无任何敏感证据。
+    - 其余一律 ``internal``。
+    - 核心页（``记忆索引`` / ``近期工作动态`` 等）固定 ``internal / reader``：
+      它们内容天然混杂，一条误判会把整库导航对只读端藏掉。
+
+    写入时（``memory_write`` / ``memory_commit``）同一套规则会自动运行，但有三条
+    约束：显式传参优先；条目已有 ``security`` 字段时不自动改档（只在规则更严时
+    提示）；受限写入方（非 owner）不参与自动判定。
+    """
+    if not apply:
+        return _access_report(apply=False, limit=limit)
+    # 仅实际写盘时加锁：默认预览是纯读，不该为它引入锁开销
+    locked = _acquire_lock()
+    try:
+        return _access_report(apply=True, limit=limit)
+    finally:
+        if locked:
+            _release_lock()
+
 
 @mcp.tool(annotations=_RO)
 def memory_graph(title: str, limit: int = 10, include_all: bool = False) -> str:
